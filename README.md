@@ -1,4 +1,3 @@
-cuma
-====
+#  CUMA
 
-Common Unknown Management Assets
+## Cloud Unified Modeling Architecture
