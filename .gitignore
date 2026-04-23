@@ -1,0 +1,5 @@
+bin/
+cuma.db
+*.db
+.env
+coverage.out
