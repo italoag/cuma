@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cuma
+  namespace: cuma
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cuma
+  template:
+    metadata:
+      labels:
+        app: cuma
+    spec:
+      # Required: access the LAN for ARP/mDNS/SSDP
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: cuma
+          image: registry.example.com/cuma:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          securityContext:
+            capabilities:
+              add:
+                - NET_RAW
+                - NET_ADMIN
+            runAsNonRoot: false
+            runAsUser: 0
+          env:
+            - name: CUMA_AUTH_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: cuma-secrets
+                  key: api-keys
+            - name: CUMA_AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cuma-secrets
+                  key: jwt-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/cuma
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: cuma-data
+        - name: config
+          configMap:
+            name: cuma-config

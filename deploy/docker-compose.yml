@@ -1,0 +1,20 @@
+version: '3.9'
+
+services:
+  cuma:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    # network_mode: host is required for ARP sweep and mDNS/SSDP multicast
+    network_mode: host
+    volumes:
+      - ./data:/data
+    environment:
+      CUMA_LOG_LEVEL: debug
+      CUMA_DATABASE_DSN: /data/cuma.db
+      CUMA_AUTH_API_KEYS: ${CUMA_AUTH_API_KEYS:-dev-key}
+      CUMA_AUTH_JWT_SECRET: ${CUMA_AUTH_JWT_SECRET:-change-me-in-dev}
+    restart: unless-stopped
