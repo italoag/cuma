@@ -56,14 +56,17 @@ func Fingerprint(input FingerprintInput) FingerprintResult {
 		}
 	}
 
-	// UPnP device type rules
+	// UPnP device type rules (from SSDP device description XML)
 	if input.UPnPDevice != "" {
 		dev := strings.ToLower(input.UPnPDevice)
+		model := strings.ToLower(input.UPnPModel)
 		switch {
 		case strings.Contains(dev, "mediarenderer"):
 			return FingerprintResult{"media_renderer", manufacturer, 0.95}
 		case strings.Contains(dev, "mediaserver"):
 			return FingerprintResult{"media_server", manufacturer, 0.95}
+		case strings.Contains(dev, "basicdevice") && strings.Contains(model, "hue"):
+			return FingerprintResult{"smart_light", "Philips Lighting BV", 0.95}
 		case strings.Contains(dev, "basicdevice"):
 			return FingerprintResult{"smart_device", manufacturer, 0.7}
 		case strings.Contains(dev, "wfadevice"):

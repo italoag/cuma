@@ -109,11 +109,39 @@ func (m *MemoryStore) GetDeviceByMAC(_ context.Context, mac string) (*models.Dev
 	return nil, gorm.ErrRecordNotFound
 }
 
+// UpsertDevice mirrors SQLiteStore: lookup by MAC (preferred) or IP, preserve
+// FirstSeen/UserLabel/Tags from existing record on update.
 func (m *MemoryStore) UpsertDevice(_ context.Context, device *models.Device) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Find existing entry by MAC, then by IP
+	var existing *models.Device
+	for _, d := range m.devices {
+		if device.MAC != "" && d.MAC == device.MAC {
+			existing = d
+			break
+		}
+		if device.IP != "" && d.IP == device.IP && existing == nil {
+			existing = d
+		}
+	}
+
+	if existing == nil {
+		// New device
+		cp := *device
+		m.devices[device.ID] = &cp
+		return nil
+	}
+
+	// Update existing: preserve immutable / user fields; update LastSeen
+	device.ID = existing.ID
+	device.FirstSeen = existing.FirstSeen
+	device.UserLabel = existing.UserLabel
+	device.Tags = existing.Tags
+
 	cp := *device
-	m.devices[device.ID] = &cp
+	m.devices[existing.ID] = &cp
 	return nil
 }
 

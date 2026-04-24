@@ -130,9 +130,10 @@ func (s *SQLiteStore) UpsertDevice(_ context.Context, device *models.Device) err
 	}
 
 	device.ID = existing.ID
-	device.FirstSeen = existing.FirstSeen
+	device.FirstSeen = existing.FirstSeen // preserve original discovery time
 	device.UserLabel = existing.UserLabel
 	device.Tags = existing.Tags
+	// device.LastSeen comes from the caller (scanner sets it to time.Now())
 
 	if err := s.db.Where("device_id = ?", existing.ID).Delete(&models.Service{}).Error; err != nil {
 		return err

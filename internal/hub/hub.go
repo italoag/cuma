@@ -42,7 +42,7 @@ type Hub struct {
 func New() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan Event, 256),
+		broadcast:  make(chan Event, 512),
 		register:   make(chan *Client, 16),
 		unregister: make(chan *Client, 16),
 	}
@@ -69,25 +69,42 @@ func (h *Hub) Run() {
 			if err != nil {
 				continue
 			}
+			// Collect slow clients to unregister outside the hot loop
+			var slow []*Client
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
 				case client.send <- payload:
 				default:
-					// slow client: disconnect
-					go func(c *Client) { h.unregister <- c }(client)
+					slow = append(slow, client)
 				}
 			}
 			h.mu.RUnlock()
+
+			// Unregister slow clients without spawning goroutines
+			for _, c := range slow {
+				h.mu.Lock()
+				if _, ok := h.clients[c]; ok {
+					delete(h.clients, c)
+					close(c.send)
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
 
+// Broadcast sends an event to all connected WebSocket clients.
+// It is non-blocking: if the internal channel is full, the event is dropped.
 func (h *Hub) Broadcast(eventType EventType, payload interface{}) {
-	h.broadcast <- Event{
+	select {
+	case h.broadcast <- Event{
 		Type:      eventType,
 		Timestamp: time.Now().UTC(),
 		Payload:   payload,
+	}:
+	default:
+		// channel full: drop event rather than blocking the scanner pipeline
 	}
 }
 
@@ -108,9 +125,10 @@ func (h *Hub) RegisterClient(conn *websocket.Conn) <-chan struct{} {
 }
 
 const (
-	writeWait  = 10 * time.Second
-	pingPeriod = 30 * time.Second
-	maxMsgSize = 512
+	writeWait      = 10 * time.Second
+	pingPeriod     = 30 * time.Second
+	pongWait       = 60 * time.Second
+	maxMsgSize     = 512
 )
 
 func (c *Client) writePump(h *Hub, done chan struct{}) {
@@ -145,9 +163,10 @@ func (c *Client) writePump(h *Hub, done chan struct{}) {
 func (c *Client) readPump(h *Hub) {
 	defer func() { h.unregister <- c }()
 	c.conn.SetReadLimit(maxMsgSize)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// Renew read deadline on every pong received from client
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 	for {

@@ -19,6 +19,7 @@ type rateLimiter struct {
 	mu       sync.RWMutex
 	rate     float64 // tokens per second
 	capacity float64
+	idleTTL  time.Duration // remove buckets idle longer than this
 }
 
 func newRateLimiter(rps float64) *rateLimiter {
@@ -26,16 +27,27 @@ func newRateLimiter(rps float64) *rateLimiter {
 		buckets:  make(map[string]*bucket),
 		rate:     rps,
 		capacity: rps * 5,
+		idleTTL:  10 * time.Minute,
 	}
-	// Cleanup goroutine
-	go func() {
-		for range time.Tick(5 * time.Minute) {
-			rl.mu.Lock()
-			rl.buckets = make(map[string]*bucket)
-			rl.mu.Unlock()
-		}
-	}()
+	go rl.cleanup()
 	return rl
+}
+
+// cleanup removes stale buckets (IPs not seen for idleTTL) every 5 minutes.
+func (rl *rateLimiter) cleanup() {
+	for range time.Tick(5 * time.Minute) {
+		cutoff := time.Now().Add(-rl.idleTTL)
+		rl.mu.Lock()
+		for ip, b := range rl.buckets {
+			b.mu.Lock()
+			idle := b.lastTime.Before(cutoff)
+			b.mu.Unlock()
+			if idle {
+				delete(rl.buckets, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
 }
 
 func (rl *rateLimiter) allow(ip string) bool {
@@ -45,8 +57,12 @@ func (rl *rateLimiter) allow(ip string) bool {
 
 	if !ok {
 		rl.mu.Lock()
-		b = &bucket{tokens: rl.capacity, lastTime: time.Now()}
-		rl.buckets[ip] = b
+		// double-check after upgrading to write lock
+		b, ok = rl.buckets[ip]
+		if !ok {
+			b = &bucket{tokens: rl.capacity, lastTime: time.Now()}
+			rl.buckets[ip] = b
+		}
 		rl.mu.Unlock()
 	}
 
@@ -55,8 +71,10 @@ func (rl *rateLimiter) allow(ip string) bool {
 
 	now := time.Now()
 	elapsed := now.Sub(b.lastTime).Seconds()
-	b.tokens = min(rl.capacity, b.tokens+elapsed*rl.rate)
-	b.lastTime = now
+	if elapsed > 0 {
+		b.tokens = minF(rl.capacity, b.tokens+elapsed*rl.rate)
+		b.lastTime = now
+	}
 
 	if b.tokens < 1 {
 		return false
@@ -65,7 +83,7 @@ func (rl *rateLimiter) allow(ip string) bool {
 	return true
 }
 
-func min(a, b float64) float64 {
+func minF(a, b float64) float64 {
 	if a < b {
 		return a
 	}

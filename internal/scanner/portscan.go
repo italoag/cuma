@@ -74,7 +74,7 @@ func (s *PortScanner) ScanIPs(ctx context.Context, ips []string, ports []int) <-
 			var services []models.Service
 			for _, p := range ports {
 				services = append(services, models.Service{
-					DeviceID: ip,
+					// DeviceID is intentionally empty here; UpsertDevice assigns it
 					Type:     portToServiceType(p),
 					Port:     p,
 					Protocol: "tcp",

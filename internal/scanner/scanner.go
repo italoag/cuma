@@ -130,6 +130,12 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 		merge(r)
 	}
 
+	if ctx.Err() != nil {
+		job.Status = models.ScanStatusFailed
+		job.Error = ctx.Err().Error()
+		return
+	}
+
 	// Phase 2: mDNS + SSDP concurrent
 	job.Progress = 25
 	job.CurrentPhase = "mdns_ssdp"
@@ -154,6 +160,12 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 	}()
 	wg2.Wait()
 
+	if ctx.Err() != nil {
+		job.Status = models.ScanStatusFailed
+		job.Error = ctx.Err().Error()
+		return
+	}
+
 	// Phase 3: Port scan
 	job.Progress = 50
 	job.CurrentPhase = "port_scan"
@@ -171,6 +183,12 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 		merge(r)
 	}
 
+	if ctx.Err() != nil {
+		job.Status = models.ScanStatusFailed
+		job.Error = ctx.Err().Error()
+		return
+	}
+
 	// Phase 4: Banner grabbing
 	job.Progress = 75
 	job.CurrentPhase = "banner"
@@ -181,9 +199,10 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 
 	mu.Lock()
 	bannerTargets := make(map[string]int)
+	httpPorts := map[int]bool{80: true, 443: true, 8080: true, 8443: true, 5000: true, 9000: true}
 	for ip, acc := range deviceMap {
 		for _, svc := range acc.services {
-			if svc.Port == 80 || svc.Port == 8080 || svc.Port == 8443 || svc.Port == 443 {
+			if httpPorts[svc.Port] {
 				bannerTargets[ip] = svc.Port
 				break
 			}
@@ -191,7 +210,12 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 	}
 	mu.Unlock()
 
+	cancelled := false
 	for ip, port := range bannerTargets {
+		if ctx.Err() != nil {
+			cancelled = true
+			break
+		}
 		sem <- struct{}{}
 		wgB.Add(1)
 		go func(ip string, port int) {
@@ -208,7 +232,14 @@ func (o *Orchestrator) runScan(ctx context.Context, job *models.ScanJob, _ model
 			mu.Unlock()
 		}(ip, port)
 	}
+	// Always wait for already-launched goroutines to avoid leaks
 	wgB.Wait()
+
+	if cancelled {
+		job.Status = models.ScanStatusFailed
+		job.Error = ctx.Err().Error()
+		return
+	}
 
 	// Finalize
 	job.Progress = 90
@@ -237,6 +268,7 @@ type deviceAccumulator struct {
 	hostname     string
 	mdnsServices []string
 	upnpDevice   string
+	upnpModel    string
 	httpBanner   string
 	services     []models.Service
 	methods      []string
@@ -263,6 +295,9 @@ func (a *deviceAccumulator) merge(r models.ScanResult) {
 		if dt, ok := r.RawMetadata["upnp_device_type"].(string); ok && dt != "" {
 			a.upnpDevice = dt
 		}
+		if m, ok := r.RawMetadata["upnp_model"].(string); ok && m != "" {
+			a.upnpModel = m
+		}
 	}
 }
 
@@ -273,6 +308,7 @@ func (a *deviceAccumulator) toDevice() *models.Device {
 		HTTPBanner:   a.httpBanner,
 		OpenPorts:    portList(a.services),
 		UPnPDevice:   a.upnpDevice,
+		UPnPModel:    a.upnpModel,
 	})
 
 	manufacturer := fp.Manufacturer

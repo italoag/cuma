@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -12,39 +13,38 @@ import (
 const claimsKey = "claims"
 
 // Auth returns a middleware that validates API Key or JWT based on auth mode.
+// It logs a warning at startup if API key mode is enabled but no keys are configured.
 func Auth(cfg config.AuthConfig) gin.HandlerFunc {
+	if (cfg.Mode == "apikey" || cfg.Mode == "both") && len(cfg.APIKeys) == 0 {
+		log.Println("[WARN] auth mode includes 'apikey' but CUMA_AUTH_API_KEYS is empty — API key auth will always fail")
+	}
+
 	return func(c *gin.Context) {
 		if cfg.Mode == "disabled" {
 			c.Next()
 			return
 		}
 
-		// Try API Key first
+		// Try API Key first (header, then query param for WebSocket)
 		if cfg.Mode == "apikey" || cfg.Mode == "both" {
-			if key := c.GetHeader("X-API-Key"); key != "" {
+			candidate := c.GetHeader("X-API-Key")
+			if candidate == "" {
+				candidate = c.Query("api_key")
+			}
+			if candidate != "" {
 				for _, valid := range cfg.APIKeys {
-					if key == valid {
+					if candidate == valid {
 						c.Next()
 						return
-					}
-				}
-				// Also check query param for WS connections
-				if qkey := c.Query("api_key"); qkey != "" {
-					for _, valid := range cfg.APIKeys {
-						if qkey == valid {
-							c.Next()
-							return
-						}
 					}
 				}
 			}
 		}
 
-		// Try JWT
+		// Try JWT (header, then query param for WebSocket)
 		if cfg.Mode == "jwt" || cfg.Mode == "both" {
 			token := extractBearerToken(c)
 			if token == "" {
-				// Allow ?token= for WebSocket
 				token = c.Query("token")
 			}
 			if token != "" {

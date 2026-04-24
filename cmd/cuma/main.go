@@ -42,6 +42,10 @@ func main() {
 	h := hub.New()
 	go h.Run()
 
+	// Root context cancelled on shutdown signal
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
 	// Scanner orchestrator
 	o := scanner.NewOrchestrator(cfg.Scanner, db, h)
 
@@ -56,15 +60,24 @@ func main() {
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
-	// Auto-scan on startup if configured
+	// Auto-scan loop: respects rootCtx for graceful shutdown
 	if cfg.Scanner.AutoScanInterval > 0 {
 		go func() {
-			time.Sleep(2 * time.Second) // wait for server to be ready
+			select {
+			case <-time.After(2 * time.Second): // wait for server to be ready
+			case <-rootCtx.Done():
+				return
+			}
 			for {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				_, _ = o.StartScan(ctx, models.ScanRequest{})
-				cancel()
-				time.Sleep(cfg.Scanner.AutoScanInterval)
+				scanCtx, scanCancel := context.WithTimeout(rootCtx, 5*time.Minute)
+				_, _ = o.StartScan(scanCtx, models.ScanRequest{})
+				scanCancel()
+
+				select {
+				case <-rootCtx.Done():
+					return
+				case <-time.After(cfg.Scanner.AutoScanInterval):
+				}
 			}
 		}()
 	}
@@ -83,10 +96,13 @@ func main() {
 	<-quit
 	log.Println("shutting down...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
-	defer cancel()
+	// Cancel root context first to stop auto-scan loop
+	rootCancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
 	}
 	log.Println("bye")
