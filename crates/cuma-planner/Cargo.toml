@@ -1,5 +1,6 @@
 [package]
 name = "cuma-planner"
+description = "Goal decomposition into an executable task DAG for CUMA"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cuma-core.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

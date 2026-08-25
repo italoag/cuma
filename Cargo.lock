@@ -115,6 +115,22 @@ version = "0.1.0"
 [[package]]
 name = "cuma-orchestrator"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cuma-config",
+ "cuma-core",
+ "cuma-planner",
+ "cuma-registry",
+ "cuma-resilience",
+ "cuma-router",
+ "cuma-testkit",
+ "cuma-usage",
+ "rand",
+ "serde",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cuma-persistence"
@@ -123,6 +139,13 @@ version = "0.1.0"
 [[package]]
 name = "cuma-planner"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cuma-core",
+ "serde",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cuma-protocol-a2a"
@@ -181,6 +204,12 @@ version = "0.1.0"
 [[package]]
 name = "cuma-testkit"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cuma-core",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cuma-tui"
@@ -189,6 +218,12 @@ version = "0.1.0"
 [[package]]
 name = "cuma-usage"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cuma-core",
+ "serde",
+ "tracing",
+]
 
 [[package]]
 name = "dirs"

@@ -1,5 +1,6 @@
 [package]
 name = "cuma-testkit"
+description = "Mock agents and fixtures for testing CUMA without spending tokens"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cuma-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
