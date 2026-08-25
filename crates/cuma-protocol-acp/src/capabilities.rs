@@ -75,7 +75,11 @@ mod tests {
                 .unwrap()
                 .contains("claude-agent-acp")
         );
-        assert!(well_known_agent_command("Codex").unwrap().contains("codex-acp"));
+        assert!(
+            well_known_agent_command("Codex")
+                .unwrap()
+                .contains("codex-acp")
+        );
     }
 
     #[test]

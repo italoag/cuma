@@ -26,10 +26,7 @@ impl RuntimeStore {
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|err| {
-                MetaAgentError::Persistence(format!(
-                    "cannot create {}: {err}",
-                    parent.display()
-                ))
+                MetaAgentError::Persistence(format!("cannot create {}: {err}", parent.display()))
             })?;
         }
 
@@ -37,8 +34,9 @@ impl RuntimeStore {
             MetaAgentError::Persistence(format!("cannot open {}: {err}", path.display()))
         })?;
 
-        schema::migrate(&connection)
-            .map_err(|err| MetaAgentError::Persistence(format!("schema migration failed: {err}")))?;
+        schema::migrate(&connection).map_err(|err| {
+            MetaAgentError::Persistence(format!("schema migration failed: {err}"))
+        })?;
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -51,8 +49,9 @@ impl RuntimeStore {
             MetaAgentError::Persistence(format!("cannot open an in-memory database: {err}"))
         })?;
 
-        schema::migrate(&connection)
-            .map_err(|err| MetaAgentError::Persistence(format!("schema migration failed: {err}")))?;
+        schema::migrate(&connection).map_err(|err| {
+            MetaAgentError::Persistence(format!("schema migration failed: {err}"))
+        })?;
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -64,7 +63,10 @@ impl RuntimeStore {
     /// A poisoned mutex is reported as a persistence error rather than a
     /// panic: losing the ability to record history degrades routing quality,
     /// but it must not take the harness down mid-session.
-    fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T> {
         let guard = self
             .connection
             .lock()
@@ -85,7 +87,12 @@ impl RuntimeStore {
     }
 
     /// Record the end of a session.
-    pub fn finish_session(&self, session_id: &SessionId, success: bool, summary: &str) -> Result<()> {
+    pub fn finish_session(
+        &self,
+        session_id: &SessionId,
+        success: bool,
+        summary: &str,
+    ) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute(
                 "UPDATE sessions SET finished_at = ?2, success = ?3, summary = ?4 WHERE id = ?1",
@@ -266,15 +273,26 @@ impl RuntimeStore {
                 // A task type this build does not recognize came from a newer
                 // version. Skipping it loses one bucket; guessing would put
                 // the wrong evidence behind a routing decision.
-                tracing::debug!(task_type, "skipping a routing-history bucket of unknown type");
+                tracing::debug!(
+                    task_type,
+                    "skipping a routing-history bucket of unknown type"
+                );
                 continue;
             };
 
             let stats = AdaptiveStats {
                 attempts,
                 successes,
-                mean_latency_ms: if attempts == 0 { 0 } else { total_latency / u64::from(attempts) },
-                mean_tokens: if successes == 0 { 0 } else { total_tokens / u64::from(successes) },
+                mean_latency_ms: if attempts == 0 {
+                    0
+                } else {
+                    total_latency / u64::from(attempts)
+                },
+                mean_tokens: if successes == 0 {
+                    0
+                } else {
+                    total_tokens / u64::from(successes)
+                },
             };
 
             history.restore(
@@ -444,9 +462,7 @@ mod tests {
     #[test]
     fn migration_is_idempotent() {
         let store = RuntimeStore::in_memory().unwrap();
-        store
-            .with_connection(|connection| schema::migrate(connection))
-            .unwrap();
+        store.with_connection(schema::migrate).unwrap();
         assert_eq!(store.session_count().unwrap(), 0);
     }
 
@@ -466,8 +482,12 @@ mod tests {
     fn attempts_are_recorded_with_their_cost() {
         let store = store_with_session();
 
-        store.record_attempt(&record("claude", true, Some(0.25))).unwrap();
-        store.record_attempt(&record("claude", false, Some(0.10))).unwrap();
+        store
+            .record_attempt(&record("claude", true, Some(0.25)))
+            .unwrap();
+        store
+            .record_attempt(&record("claude", false, Some(0.10)))
+            .unwrap();
 
         assert_eq!(store.attempt_count().unwrap(), 2);
         assert!((store.total_spend_usd().unwrap() - 0.35).abs() < 1e-9);
@@ -477,7 +497,9 @@ mod tests {
     fn an_unpriced_attempt_does_not_inflate_total_spend() {
         let store = store_with_session();
 
-        store.record_attempt(&record("claude", true, Some(0.25))).unwrap();
+        store
+            .record_attempt(&record("claude", true, Some(0.25)))
+            .unwrap();
         store.record_attempt(&record("claude", true, None)).unwrap();
 
         assert_eq!(store.attempt_count().unwrap(), 2);
@@ -492,10 +514,14 @@ mod tests {
         let store = store_with_session();
 
         for _ in 0..8 {
-            store.record_attempt(&record("claude", true, Some(0.1))).unwrap();
+            store
+                .record_attempt(&record("claude", true, Some(0.1)))
+                .unwrap();
         }
         for _ in 0..2 {
-            store.record_attempt(&record("claude", false, Some(0.1))).unwrap();
+            store
+                .record_attempt(&record("claude", false, Some(0.1)))
+                .unwrap();
         }
 
         // A fresh process reloads what previous sessions learned.
@@ -573,21 +599,36 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(store.routing_explanation(&task).unwrap().unwrap().contains("second"));
+        assert!(
+            store
+                .routing_explanation(&task)
+                .unwrap()
+                .unwrap()
+                .contains("second")
+        );
     }
 
     #[test]
     fn a_task_with_no_recorded_decision_has_no_explanation() {
         let store = RuntimeStore::in_memory().unwrap();
-        assert!(store.routing_explanation(&TaskId::new("never")).unwrap().is_none());
+        assert!(
+            store
+                .routing_explanation(&TaskId::new("never"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn usage_groups_by_agent_and_by_model() {
         let store = store_with_session();
 
-        store.record_attempt(&record("claude", true, Some(0.10))).unwrap();
-        store.record_attempt(&record("claude", false, Some(0.05))).unwrap();
+        store
+            .record_attempt(&record("claude", true, Some(0.10)))
+            .unwrap();
+        store
+            .record_attempt(&record("claude", false, Some(0.05)))
+            .unwrap();
         store.record_attempt(&record("codex", true, None)).unwrap();
 
         let by_agent = store.usage_by_agent().unwrap();
@@ -624,7 +665,9 @@ mod tests {
     #[test]
     fn deleting_a_session_cascades_to_its_tasks_and_attempts() {
         let store = store_with_session();
-        store.record_attempt(&record("claude", true, Some(0.1))).unwrap();
+        store
+            .record_attempt(&record("claude", true, Some(0.1)))
+            .unwrap();
 
         store
             .with_connection(|connection| {

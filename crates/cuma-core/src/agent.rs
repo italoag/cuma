@@ -31,7 +31,7 @@ pub enum AgentProtocol {
 /// every agent. Modelling that as `0.0` would make an agent that reports no
 /// cost look free, and modelling it as `Option` alone loses the distinction
 /// between "we asked and it said nothing" and "we estimated it ourselves".
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum Known<T> {
     /// The agent or provider reported this value directly.
@@ -39,6 +39,7 @@ pub enum Known<T> {
     /// We derived this value from heuristics or history. Not ground truth.
     Estimated(T),
     /// No value is available and we will not pretend otherwise.
+    #[default]
     Unknown,
 }
 
@@ -59,12 +60,6 @@ impl<T: Copy> Known<T> {
     /// Whether this value came from the agent itself.
     pub fn is_reported(&self) -> bool {
         matches!(self, Self::Reported(_))
-    }
-}
-
-impl<T> Default for Known<T> {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 
@@ -145,13 +140,10 @@ impl CostProfile {
         let cost = (input_tokens as f64 / 1_000_000.0) * input_price
             + (output_tokens as f64 / 1_000_000.0) * output_price;
 
-        // Provenance is inherited: an estimate built from reported prices is
-        // still an estimate, because the token counts feeding it are.
-        if self.input_per_mtok.is_reported() && self.output_per_mtok.is_reported() {
-            Known::Estimated(cost)
-        } else {
-            Known::Estimated(cost)
-        }
+        // Always `Estimated`, even when both prices were reported: the token
+        // counts feeding this may not have been, and a cost derived from a
+        // guessed token count is a guess however exact the price was.
+        Known::Estimated(cost)
     }
 }
 

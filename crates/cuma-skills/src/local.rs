@@ -38,7 +38,7 @@ impl LocalSkillRegistry {
     /// A malformed manifest is skipped with a warning rather than failing the
     /// whole listing: one bad file in a skills directory should not make every
     /// other skill invisible.
-    async fn from_directory(&self) -> Vec<SkillManifest> {
+    async fn read_directory(&self) -> Vec<SkillManifest> {
         let Some(directory) = &self.directory else {
             return Vec::new();
         };
@@ -80,7 +80,7 @@ impl LocalSkillRegistry {
     /// Every skill this registry knows about.
     pub async fn all(&self) -> Vec<SkillManifest> {
         let mut all = self.builtin.clone();
-        all.extend(self.from_directory().await);
+        all.extend(self.read_directory().await);
         all
     }
 }
@@ -278,7 +278,13 @@ mod tests {
     #[tokio::test]
     async fn searching_for_something_absent_returns_nothing_rather_than_erroring() {
         let registry = LocalSkillRegistry::new();
-        assert!(registry.search("quantum-annealing").await.unwrap().is_empty());
+        assert!(
+            registry
+                .search("quantum-annealing")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -294,7 +300,10 @@ mod tests {
     #[tokio::test]
     async fn installing_a_builtin_skill_succeeds_and_runs_no_code() {
         let registry = LocalSkillRegistry::new();
-        let installed = registry.install(&SkillId::new("git-workflow")).await.unwrap();
+        let installed = registry
+            .install(&SkillId::new("git-workflow"))
+            .await
+            .unwrap();
         assert_eq!(installed.trust, TrustLevel::Trusted);
     }
 

@@ -203,7 +203,11 @@ impl CircuitBreakerRegistry {
     /// A poisoned mutex is treated as "no breaker information available"
     /// rather than a panic: losing circuit-breaker state degrades routing
     /// quality, but panicking here would take down the whole harness.
-    fn with_breaker<T>(&self, key: BreakerKey, f: impl FnOnce(&mut CircuitBreaker) -> T) -> Option<T> {
+    fn with_breaker<T>(
+        &self,
+        key: BreakerKey,
+        f: impl FnOnce(&mut CircuitBreaker) -> T,
+    ) -> Option<T> {
         let mut guard = self.breakers.lock().ok()?;
         let breaker = guard
             .entry(key)
@@ -242,7 +246,10 @@ impl CircuitBreakerRegistry {
 
     /// Record a successful attempt.
     pub fn record_success(&self, agent: &AgentId, model: Option<&ModelId>) {
-        self.with_breaker(BreakerKey::Agent(agent.clone()), CircuitBreaker::record_success);
+        self.with_breaker(
+            BreakerKey::Agent(agent.clone()),
+            CircuitBreaker::record_success,
+        );
         if let Some(model) = model {
             self.with_breaker(
                 BreakerKey::Model(agent.clone(), model.clone()),
@@ -439,7 +446,12 @@ mod tests {
         let good = ModelId::new("fine");
 
         for _ in 0..3 {
-            registry.record_failure(&agent, Some(&bad), ErrorClass::ModelUnavailable, "overloaded");
+            registry.record_failure(
+                &agent,
+                Some(&bad),
+                ErrorClass::ModelUnavailable,
+                "overloaded",
+            );
         }
 
         assert!(!registry.allows(&agent, Some(&bad)), "the bad model is out");

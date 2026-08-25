@@ -314,7 +314,11 @@ mod tests {
         registry.register(agent("bad")).await;
 
         registry
-            .set_health(&AgentId::new("bad"), HealthState::Unavailable, Some("x".into()))
+            .set_health(
+                &AgentId::new("bad"),
+                HealthState::Unavailable,
+                Some("x".into()),
+            )
             .await;
 
         let snapshot = registry.snapshot().await;
@@ -368,7 +372,13 @@ mod tests {
         registry.register(agent("off")).await;
         registry.set_enabled(&AgentId::new("off"), false).await;
 
-        assert!(registry.snapshot().await.available_capabilities().is_empty());
+        assert!(
+            registry
+                .snapshot()
+                .await
+                .available_capabilities()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -54,17 +54,50 @@ fn shape_of(goal: &str) -> GoalShape {
     let changes_code = contains_any(
         &g,
         &[
-            "implement", "implementa", "add ", "adicion", "create", "cri", "write", "escrev",
-            "fix", "corrig", "conserta", "refactor", "refator", "update", "atualiz", "migrate",
-            "migra", "rename", "renome", "remove", "remov", "delete", "port ", "upgrade",
+            "implement",
+            "implementa",
+            "add ",
+            "adicion",
+            "create",
+            "cri",
+            "write",
+            "escrev",
+            "fix",
+            "corrig",
+            "conserta",
+            "refactor",
+            "refator",
+            "update",
+            "atualiz",
+            "migrate",
+            "migra",
+            "rename",
+            "renome",
+            "remove",
+            "remov",
+            "delete",
+            "port ",
+            "upgrade",
         ],
     );
 
     let is_investigation = contains_any(
         &g,
         &[
-            "why", "por que", "porque", "investigate", "investig", "debug", "diagnos",
-            "understand", "entend", "explain", "explic", "analyz", "analis", "audit",
+            "why",
+            "por que",
+            "porque",
+            "investigate",
+            "investig",
+            "debug",
+            "diagnos",
+            "understand",
+            "entend",
+            "explain",
+            "explic",
+            "analyz",
+            "analis",
+            "audit",
         ],
     );
 
@@ -79,17 +112,40 @@ fn shape_of(goal: &str) -> GoalShape {
     let needs_research = contains_any(
         &g,
         &[
-            "research", "pesquis", "how to", "como ", "best practice", "boas prátic",
-            "compare", "compar", "evaluate", "oauth", "protocol", "protocolo", "spec",
-            "library", "bibliotec", "sdk",
+            "research",
+            "pesquis",
+            "how to",
+            "como ",
+            "best practice",
+            "boas prátic",
+            "compare",
+            "compar",
+            "evaluate",
+            "oauth",
+            "protocol",
+            "protocolo",
+            "spec",
+            "library",
+            "bibliotec",
+            "sdk",
         ],
     );
 
     let is_design_heavy = contains_any(
         &g,
         &[
-            "architect", "arquitet", "design", "desenh", "redesign", "restructure",
-            "reestrutur", "rewrite", "reescrev", "migrate", "strategy", "estratégia",
+            "architect",
+            "arquitet",
+            "design",
+            "desenh",
+            "redesign",
+            "restructure",
+            "reestrutur",
+            "rewrite",
+            "reescrev",
+            "migrate",
+            "strategy",
+            "estratégia",
         ],
     );
 
@@ -127,8 +183,10 @@ impl Planner for HeuristicPlanner {
 
         // Every plan starts by looking at the repository. Without it, the
         // executing agent has to rediscover the project on every task.
-        let mut inspect_spec =
-            TaskSpec::new(format!("Inspect the repository to understand: {goal}"), TaskType::Inspection);
+        let mut inspect_spec = TaskSpec::new(
+            format!("Inspect the repository to understand: {goal}"),
+            TaskType::Inspection,
+        );
         inspect_spec.priority = 9;
         let inspect = graph.add(Task::new(inspect_spec));
 
@@ -144,7 +202,7 @@ impl Planner for HeuristicPlanner {
                     TaskType::Research,
                 )
                 .requiring(Capability::Research),
-                &[inspect.clone()],
+                std::slice::from_ref(&inspect),
             );
             prerequisites.push(research);
         }
@@ -154,7 +212,7 @@ impl Planner for HeuristicPlanner {
                 &mut graph,
                 TaskSpec::new(format!("Design the approach for: {goal}"), TaskType::Design)
                     .with_complexity(0.85),
-                &[inspect.clone()],
+                std::slice::from_ref(&inspect),
             );
             prerequisites.push(design);
         }
@@ -189,8 +247,11 @@ impl Planner for HeuristicPlanner {
         if shape.is_documentation && !shape.changes_code {
             push(
                 &mut graph,
-                TaskSpec::new(format!("Write documentation for: {goal}"), TaskType::Documentation)
-                    .with_risk(Risk::Low),
+                TaskSpec::new(
+                    format!("Write documentation for: {goal}"),
+                    TaskType::Documentation,
+                )
+                .with_risk(Risk::Low),
                 &prerequisites,
             );
             graph.validate()?;
@@ -214,9 +275,12 @@ impl Planner for HeuristicPlanner {
         if shape.mentions_tests {
             let tests = push(
                 &mut graph,
-                TaskSpec::new(format!("Write or update tests for: {goal}"), TaskType::Testing)
-                    .with_risk(Risk::Low),
-                &[implement.clone()],
+                TaskSpec::new(
+                    format!("Write or update tests for: {goal}"),
+                    TaskType::Testing,
+                )
+                .with_risk(Risk::Low),
+                std::slice::from_ref(&implement),
             );
             validation_deps.push(tests);
         }
@@ -235,8 +299,11 @@ impl Planner for HeuristicPlanner {
 
             push(
                 &mut graph,
-                TaskSpec::new(format!("Review the changes made for: {goal}"), TaskType::Review)
-                    .with_risk(Risk::ReadOnly),
+                TaskSpec::new(
+                    format!("Review the changes made for: {goal}"),
+                    TaskType::Review,
+                )
+                .with_risk(Risk::ReadOnly),
                 &[validate],
             );
         }
@@ -293,8 +360,14 @@ impl Planner for HeuristicPlanner {
 
         let base = failed.spec.clone();
         let halves = [
-            format!("{} (part 1 of 2: narrow the scope to the smallest change)", base.description),
-            format!("{} (part 2 of 2: complete the remaining work)", base.description),
+            format!(
+                "{} (part 1 of 2: narrow the scope to the smallest change)",
+                base.description
+            ),
+            format!(
+                "{} (part 2 of 2: complete the remaining work)",
+                base.description
+            ),
         ];
 
         let mut previous: Option<TaskId> = None;
@@ -344,7 +417,10 @@ mod tests {
     #[tokio::test]
     async fn every_plan_starts_by_inspecting_the_repository() {
         let graph = plan("fix the login bug").await;
-        assert_eq!(graph.iter().next().unwrap().spec.task_type, TaskType::Inspection);
+        assert_eq!(
+            graph.iter().next().unwrap().spec.task_type,
+            TaskType::Inspection
+        );
     }
 
     #[tokio::test]
@@ -372,8 +448,14 @@ mod tests {
         assert!(types.contains(&TaskType::Inspection));
         assert!(types.contains(&TaskType::Research), "OAuth needs research");
         assert!(types.contains(&TaskType::Implementation));
-        assert!(types.contains(&TaskType::Testing), "the goal mentions tests");
-        assert!(types.contains(&TaskType::Validation), "and they must be run");
+        assert!(
+            types.contains(&TaskType::Testing),
+            "the goal mentions tests"
+        );
+        assert!(
+            types.contains(&TaskType::Validation),
+            "and they must be run"
+        );
         assert!(types.contains(&TaskType::Review));
     }
 
@@ -398,7 +480,10 @@ mod tests {
         let graph = plan("why is the test suite flaky").await;
         let types = types(&graph);
 
-        assert!(!types.contains(&TaskType::Implementation), "the user asked a question");
+        assert!(
+            !types.contains(&TaskType::Implementation),
+            "the user asked a question"
+        );
         assert!(graph.iter().all(|t| t.spec.risk == Risk::ReadOnly));
     }
 
@@ -491,6 +576,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_none(), "rerouting, not replanning, handles a rate limit");
+        assert!(
+            result.is_none(),
+            "rerouting, not replanning, handles a rate limit"
+        );
     }
 }

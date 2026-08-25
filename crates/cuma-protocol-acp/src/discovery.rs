@@ -134,10 +134,9 @@ mod tests {
 
     #[test]
     fn an_unknown_agent_without_a_command_is_skipped_rather_than_guessed_at() {
-        let discovery = AcpConfigDiscovery::new(config(
-            "[agents.mystery-agent]\nprotocol = \"acp\"\n",
-        ))
-        .allowing_unlaunchable();
+        let discovery =
+            AcpConfigDiscovery::new(config("[agents.mystery-agent]\nprotocol = \"acp\"\n"))
+                .allowing_unlaunchable();
 
         assert!(discovery.adapters().is_empty());
     }

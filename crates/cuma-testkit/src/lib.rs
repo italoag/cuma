@@ -337,9 +337,19 @@ mod tests {
     #[tokio::test]
     async fn each_failure_mode_produces_the_class_the_policy_expects() {
         let cases = [
-            (Behaviour::RateLimit { retry_after_ms: Some(1000) }, ErrorClass::RateLimit),
+            (
+                Behaviour::RateLimit {
+                    retry_after_ms: Some(1000),
+                },
+                ErrorClass::RateLimit,
+            ),
             (Behaviour::QuotaExceeded, ErrorClass::QuotaExceeded),
-            (Behaviour::Crash { message: "boom".into() }, ErrorClass::AgentCrash),
+            (
+                Behaviour::Crash {
+                    message: "boom".into(),
+                },
+                ErrorClass::AgentCrash,
+            ),
             (Behaviour::InvalidResponse, ErrorClass::InvalidResponse),
             (Behaviour::AuthFailure, ErrorClass::AuthenticationFailure),
             (Behaviour::ContextOverflow, ErrorClass::ContextOverflow),
@@ -420,7 +430,9 @@ mod tests {
         let agent = MockAgent::scripted(
             "flaky",
             vec![
-                Behaviour::RateLimit { retry_after_ms: None },
+                Behaviour::RateLimit {
+                    retry_after_ms: None,
+                },
                 Behaviour::ok("succeeded on the retry"),
             ],
         );
@@ -434,7 +446,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_script_that_runs_out_repeats_its_last_behaviour() {
-        let agent = MockAgent::always("broken", Behaviour::Crash { message: "boom".into() });
+        let agent = MockAgent::always(
+            "broken",
+            Behaviour::Crash {
+                message: "boom".into(),
+            },
+        );
         let t = task();
 
         for _ in 0..5 {
@@ -463,8 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mock_is_usable_behind_the_adapter_trait() {
-        let agent: Arc<dyn AgentAdapter> =
-            Arc::new(MockAgent::always("m", Behaviour::ok("fine")));
+        let agent: Arc<dyn AgentAdapter> = Arc::new(MockAgent::always("m", Behaviour::ok("fine")));
         assert_eq!(agent.agent_id(), &AgentId::new("m"));
         assert!(agent.health_check().await.is_ok());
         assert!(agent.describe().await.is_ok());

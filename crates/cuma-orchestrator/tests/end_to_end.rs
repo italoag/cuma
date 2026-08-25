@@ -40,8 +40,8 @@ fn all_capabilities() -> CapabilitySet {
 }
 
 fn descriptor(id: &str, input_price: f64, output_price: f64) -> AgentDescriptor {
-    let mut agent = AgentDescriptor::new(id, id, AgentProtocol::Native)
-        .with_capabilities(all_capabilities());
+    let mut agent =
+        AgentDescriptor::new(id, id, AgentProtocol::Native).with_capabilities(all_capabilities());
 
     let mut model = ModelDescriptor::minimal(agent.id.clone(), format!("{id}-model"), id);
     model.context_window = Known::Reported(200_000);
@@ -89,9 +89,7 @@ async fn orchestrator_with(agents: Vec<MockAgent>) -> Orchestrator {
 }
 
 /// Drain the event bus into a vector while a session runs.
-fn collect_events(
-    orchestrator: &Orchestrator,
-) -> tokio::task::JoinHandle<Vec<cuma_core::Event>> {
+fn collect_events(orchestrator: &Orchestrator) -> tokio::task::JoinHandle<Vec<cuma_core::Event>> {
     let mut rx = orchestrator.events().subscribe();
     tokio::spawn(async move {
         let mut events = Vec::new();
@@ -156,7 +154,10 @@ async fn a_goal_runs_end_to_end_through_plan_route_execute_and_record() {
         "usage_recorded",
         "session_completed",
     ] {
-        assert!(kinds.contains(&expected), "no {expected} event in {kinds:?}");
+        assert!(
+            kinds.contains(&expected),
+            "no {expected} event in {kinds:?}"
+        );
     }
 }
 
@@ -342,7 +343,10 @@ async fn a_failed_task_cascades_to_the_tasks_that_depend_on_it() {
         result.skipped_tasks() > 0,
         "its dependents should be skipped, not attempted"
     );
-    assert!(result.graph.is_complete(), "the session must still terminate");
+    assert!(
+        result.graph.is_complete(),
+        "the session must still terminate"
+    );
 
     assert!(
         events
@@ -366,8 +370,8 @@ async fn a_session_with_no_reachable_agent_fails_cleanly_rather_than_hanging() {
 
 #[tokio::test]
 async fn a_hung_agent_is_cut_off_at_its_deadline() {
-    let hung = MockAgent::always("hung", Behaviour::Timeout)
-        .with_descriptor(descriptor("hung", 0.1, 0.5));
+    let hung =
+        MockAgent::always("hung", Behaviour::Timeout).with_descriptor(descriptor("hung", 0.1, 0.5));
 
     let mut config = config();
     config.limits.task_timeout_secs = 1;
@@ -448,7 +452,10 @@ async fn a_session_budget_stops_spending_rather_than_running_to_completion() {
 
     let result = orchestrator.run("add a health endpoint").await.unwrap();
 
-    assert!(!result.success, "the budget should have stopped the session");
+    assert!(
+        !result.success,
+        "the budget should have stopped the session"
+    );
     assert!(
         result.completed_tasks() < result.graph.len(),
         "not every task should have run"
@@ -482,7 +489,10 @@ async fn usage_is_broken_down_by_agent_and_task_type() {
 
     let usage = orchestrator.usage_snapshot().await;
     assert_eq!(usage.by_agent().len(), 1);
-    assert!(usage.by_task_type().len() > 1, "a plan spans several task types");
+    assert!(
+        usage.by_task_type().len() > 1,
+        "a plan spans several task types"
+    );
     assert!(usage.by_model().len() == 1);
 }
 
@@ -501,10 +511,7 @@ async fn a_task_the_agent_reports_as_failed_is_not_marked_completed() {
 
     assert!(!result.success);
     assert!(
-        result
-            .graph
-            .iter()
-            .any(|t| t.status == TaskStatus::Failed),
+        result.graph.iter().any(|t| t.status == TaskStatus::Failed),
         "an agent that says it failed must be believed"
     );
 }

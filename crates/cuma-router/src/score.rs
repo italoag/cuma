@@ -264,7 +264,10 @@ mod tests {
         let (score, known) = cost(&a, None);
         assert_eq!(score, UNKNOWN);
         assert!(!known);
-        assert!(score < 1.0, "silence must not be rewarded as if it were free");
+        assert!(
+            score < 1.0,
+            "silence must not be rewarded as if it were free"
+        );
     }
 
     #[test]
@@ -290,7 +293,10 @@ mod tests {
         let (degraded, _) = reliability(&a, None);
 
         assert!(degraded < healthy);
-        assert!(degraded > 0.0, "exclusion is the breaker's job, not scoring's");
+        assert!(
+            degraded > 0.0,
+            "exclusion is the breaker's job, not scoring's"
+        );
     }
 
     #[test]

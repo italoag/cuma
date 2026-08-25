@@ -171,8 +171,8 @@ mod tests {
 
     #[test]
     fn an_allowlist_restricts_what_a_server_may_expose() {
-        let config = McpServerConfig::new("git-mcp")
-            .allowing(vec!["git_status".into(), "git_diff".into()]);
+        let config =
+            McpServerConfig::new("git-mcp").allowing(vec!["git_status".into(), "git_diff".into()]);
 
         assert!(config.permits("git_status"));
         assert!(
@@ -186,7 +186,10 @@ mod tests {
         let mut config = McpServerConfig::new("srv");
         config.env.insert("LOG_LEVEL".into(), "debug".into());
 
-        assert_eq!(config.resolved_env().get("LOG_LEVEL").map(String::as_str), Some("debug"));
+        assert_eq!(
+            config.resolved_env().get("LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
     }
 
     #[test]

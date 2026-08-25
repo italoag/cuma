@@ -40,7 +40,11 @@ impl ValidationReport {
         let mut out = String::new();
         out.push_str(&format!(
             "Verdict: {} (trust: {:?})\n",
-            if self.permitted { "may install" } else { "REFUSED" },
+            if self.permitted {
+                "may install"
+            } else {
+                "REFUSED"
+            },
             self.trust
         ));
 
@@ -113,7 +117,10 @@ pub fn validate(manifest: &SkillManifest) -> ValidationReport {
     }
 
     // --- integrity --------------------------------------------------------
-    let has_checksum = manifest.checksum.as_ref().is_some_and(|c| !c.trim().is_empty());
+    let has_checksum = manifest
+        .checksum
+        .as_ref()
+        .is_some_and(|c| !c.trim().is_empty());
     let has_signature = manifest
         .signature
         .as_ref()
@@ -291,17 +298,17 @@ mod tests {
             let mut m = manifest("builtin:x");
             m.requested_permissions = vec![escape.into()];
 
-            assert!(!validate(&m).permitted, "{escape:?} should have been refused");
+            assert!(
+                !validate(&m).permitted,
+                "{escape:?} should have been refused"
+            );
         }
     }
 
     #[test]
     fn an_ordinary_scoped_permission_is_fine() {
         let mut m = manifest("builtin:x");
-        m.requested_permissions = vec![
-            "filesystem:read:./src".into(),
-            "shell:run:cargo".into(),
-        ];
+        m.requested_permissions = vec!["filesystem:read:./src".into(), "shell:run:cargo".into()];
         assert!(validate(&m).permitted);
     }
 

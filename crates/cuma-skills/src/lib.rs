@@ -15,8 +15,8 @@
 //! declared permissions, origin, integrity and the shape of the manifest
 //! itself, and it downgrades trust on anything it cannot verify.
 
-mod manager;
 mod local;
+mod manager;
 mod validation;
 
 pub use local::LocalSkillRegistry;

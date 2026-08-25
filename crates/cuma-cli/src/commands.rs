@@ -80,7 +80,8 @@ pub async fn run_goal(
         ));
     }
 
-    let (orchestrator, warnings) = harness::build_orchestrator(config.clone(), workspace.clone()).await?;
+    let (orchestrator, warnings) =
+        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
 
     for warning in &warnings {
         eprintln!("warning: {warning}");
@@ -107,14 +108,25 @@ pub async fn run_goal(
                 EventKind::TaskPlanned { task_count } => {
                     eprintln!("planned {task_count} tasks");
                 }
-                EventKind::AgentSelected { agent, model, score, .. } => {
+                EventKind::AgentSelected {
+                    agent,
+                    model,
+                    score,
+                    ..
+                } => {
                     let model = model.as_ref().map_or(String::new(), |m| format!("/{m}"));
                     eprintln!("  -> {agent}{model} (score {score:.3})");
                 }
-                EventKind::AgentFailed { agent, class, message } => {
+                EventKind::AgentFailed {
+                    agent,
+                    class,
+                    message,
+                } => {
                     eprintln!("  !! {agent} failed ({class:?}): {message}");
                 }
-                EventKind::RetryScheduled { attempt, delay_ms, .. } => {
+                EventKind::RetryScheduled {
+                    attempt, delay_ms, ..
+                } => {
                     eprintln!("  .. retrying (attempt {attempt}) in {delay_ms}ms");
                 }
                 EventKind::FallbackSelected { from, reason, .. } => {
@@ -154,7 +166,10 @@ pub async fn run_goal(
                 "cost_is_complete": result.usage.is_complete(),
             },
         });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     } else {
         println!("\n{}", result.summary);
 
@@ -230,7 +245,11 @@ async fn explain_plan(
             (index + 1).to_string(),
             format!("{:?}", task.spec.task_type),
             format!("{:?}", task.spec.risk),
-            if depends.is_empty() { "-".to_owned() } else { depends.join(",") },
+            if depends.is_empty() {
+                "-".to_owned()
+            } else {
+                depends.join(",")
+            },
             task.spec.description.clone(),
         ]);
     }
@@ -406,7 +425,9 @@ pub async fn models(config: Config, action: ModelAction, json: bool) -> Result<(
 
     for model in all {
         let render_price = |price: cuma_core::Known<f64>| {
-            price.value().map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
+            price
+                .value()
+                .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
         };
 
         table.row(vec![
@@ -436,7 +457,10 @@ pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<(
             let found = manager.search(&query).await;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&found).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&found).unwrap_or_default()
+                );
                 return Ok(());
             }
 
@@ -491,10 +515,7 @@ pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<(
 
         SkillAction::Install { id } => {
             let installed = manager.install(&SkillId::new(id)).await?;
-            println!(
-                "installed {} ({:?} trust)",
-                installed.id, installed.trust
-            );
+            println!("installed {} ({:?} trust)", installed.id, installed.trust);
             Ok(())
         }
 
@@ -647,7 +668,14 @@ pub async fn usage(config: Config, workspace: PathBuf, by_model: bool, json: boo
         return Ok(());
     }
 
-    println!("{}", if by_model { "MODEL USAGE" } else { "AGENT USAGE" });
+    println!(
+        "{}",
+        if by_model {
+            "MODEL USAGE"
+        } else {
+            "AGENT USAGE"
+        }
+    );
 
     let mut table = Table::new(USAGE_HEADERS);
     for (label, totals) in &grouped {

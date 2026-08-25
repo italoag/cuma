@@ -216,7 +216,10 @@ impl A2aAdapter {
         let body = self.read_bounded(response).await?;
 
         let envelope: JsonRpcResponse = serde_json::from_str(&body).map_err(|err| {
-            MetaAgentError::protocol_msg("a2a", format!("{method} returned invalid JSON-RPC: {err}"))
+            MetaAgentError::protocol_msg(
+                "a2a",
+                format!("{method} returned invalid JSON-RPC: {err}"),
+            )
         })?;
 
         if let Some(error) = envelope.error {
@@ -228,7 +231,10 @@ impl A2aAdapter {
         }
 
         envelope.result.ok_or_else(|| {
-            MetaAgentError::protocol_msg("a2a", format!("{method} returned neither result nor error"))
+            MetaAgentError::protocol_msg(
+                "a2a",
+                format!("{method} returned neither result nor error"),
+            )
         })
     }
 }

@@ -168,20 +168,18 @@ mod tests {
 
     #[test]
     fn a_minimal_card_parses() {
-        let card: AgentCard = serde_json::from_str(
-            r#"{"name":"architect","url":"https://example.invalid/a2a"}"#,
-        )
-        .unwrap();
+        let card: AgentCard =
+            serde_json::from_str(r#"{"name":"architect","url":"https://example.invalid/a2a"}"#)
+                .unwrap();
         assert_eq!(card.name, "architect");
         assert!(card.skills.is_empty());
     }
 
     #[test]
     fn unknown_fields_on_a_card_are_ignored_rather_than_fatal() {
-        let card: AgentCard = serde_json::from_str(
-            r#"{"name":"a","url":"u","somethingBrandNew":{"nested":true}}"#,
-        )
-        .unwrap();
+        let card: AgentCard =
+            serde_json::from_str(r#"{"name":"a","url":"u","somethingBrandNew":{"nested":true}}"#)
+                .unwrap();
         assert_eq!(card.name, "a");
     }
 

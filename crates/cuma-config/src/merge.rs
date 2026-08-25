@@ -46,7 +46,11 @@ impl Config {
         let d = Config::default();
 
         // --- router -------------------------------------------------------
-        merge_field!(self.router.strategy, other.router.strategy, d.router.strategy);
+        merge_field!(
+            self.router.strategy,
+            other.router.strategy,
+            d.router.strategy
+        );
 
         // Weights are merged only when the layer wrote a non-default block.
         // Otherwise a layer that sets `strategy` alone would clobber the
@@ -111,8 +115,15 @@ impl Config {
         );
 
         // --- security -----------------------------------------------------
-        merge_field!(self.security.sandbox, other.security.sandbox, d.security.sandbox);
-        merge_option!(self.security.sandbox_command, other.security.sandbox_command);
+        merge_field!(
+            self.security.sandbox,
+            other.security.sandbox,
+            d.security.sandbox
+        );
+        merge_option!(
+            self.security.sandbox_command,
+            other.security.sandbox_command
+        );
         merge_field!(
             self.security.allow_destructive_operations,
             other.security.allow_destructive_operations,

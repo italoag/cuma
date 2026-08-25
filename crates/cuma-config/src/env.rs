@@ -144,9 +144,9 @@ fn parse_strategy(raw: &str) -> Result<RoutingStrategy> {
 }
 
 fn parse_num<T: std::str::FromStr>(raw: &str, key: &str) -> Result<T> {
-    raw.trim().parse().map_err(|_| {
-        MetaAgentError::Configuration(format!("{key} must be a number, got {raw:?}"))
-    })
+    raw.trim()
+        .parse()
+        .map_err(|_| MetaAgentError::Configuration(format!("{key} must be a number, got {raw:?}")))
 }
 
 fn parse_bool(raw: &str, key: &str) -> Result<bool> {
@@ -166,8 +166,14 @@ mod tests {
 
     #[test]
     fn known_strategies_parse_in_any_casing_or_separator() {
-        assert_eq!(parse_strategy("Cost_First").unwrap(), RoutingStrategy::CostFirst);
-        assert_eq!(parse_strategy(" balanced ").unwrap(), RoutingStrategy::Balanced);
+        assert_eq!(
+            parse_strategy("Cost_First").unwrap(),
+            RoutingStrategy::CostFirst
+        );
+        assert_eq!(
+            parse_strategy(" balanced ").unwrap(),
+            RoutingStrategy::Balanced
+        );
     }
 
     #[test]

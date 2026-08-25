@@ -18,8 +18,8 @@
 
 mod adaptive;
 mod explain;
-mod score;
 mod router;
+mod score;
 
 pub use adaptive::{AdaptiveStats, OutcomeRecord, RoutingHistory};
 pub use explain::{Candidate, RoutingDecision, ScoreBreakdown};

@@ -54,9 +54,9 @@ impl Table {
         out.push('\n');
 
         for row in &self.rows {
-            for index in 0..column_count {
+            for (index, width) in widths.iter().enumerate() {
                 let cell = row.get(index).map(String::as_str).unwrap_or("");
-                out.push_str(&pad(cell, widths[index]));
+                out.push_str(&pad(cell, *width));
                 if index + 1 < column_count {
                     out.push_str("  ");
                 }
@@ -173,10 +173,12 @@ mod tests {
 
     #[test]
     fn a_usage_row_marks_an_unpriced_total_as_unknown() {
-        let mut totals = UsageTotals::default();
-        totals.attempts = 3;
-        totals.successes = 3;
-        totals.attempts_without_pricing = 3;
+        let totals = UsageTotals {
+            attempts: 3,
+            successes: 3,
+            attempts_without_pricing: 3,
+            ..UsageTotals::default()
+        };
 
         let row = usage_row("mystery-agent", &totals);
         assert_eq!(row[4], "unknown", "row was {row:?}");
@@ -184,10 +186,12 @@ mod tests {
 
     #[test]
     fn a_usage_row_marks_a_partly_priced_total_as_a_lower_bound() {
-        let mut totals = UsageTotals::default();
-        totals.attempts = 3;
-        totals.estimated_cost_usd = 1.25;
-        totals.attempts_without_pricing = 1;
+        let totals = UsageTotals {
+            attempts: 3,
+            estimated_cost_usd: 1.25,
+            attempts_without_pricing: 1,
+            ..UsageTotals::default()
+        };
 
         assert!(usage_row("agent", &totals)[4].starts_with('≥'));
     }

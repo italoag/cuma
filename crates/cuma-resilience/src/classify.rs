@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn auth_failures_are_recognised_from_status_codes_and_prose() {
-        assert_eq!(classify_message("401 Unauthorized"), ErrorClass::AuthenticationFailure);
+        assert_eq!(
+            classify_message("401 Unauthorized"),
+            ErrorClass::AuthenticationFailure
+        );
         assert_eq!(
             classify_message("Invalid API key provided"),
             ErrorClass::AuthenticationFailure

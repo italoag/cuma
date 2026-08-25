@@ -121,7 +121,10 @@ mod tests {
     fn a_capability_maps_to_every_agent_that_provides_it() {
         let index = CapabilityIndex::build(&snapshot());
         assert_eq!(index.providers(&Capability::Debugging).len(), 2);
-        assert_eq!(index.providers(&Capability::Research), vec![AgentId::new("researcher")]);
+        assert_eq!(
+            index.providers(&Capability::Research),
+            vec![AgentId::new("researcher")]
+        );
     }
 
     #[test]
@@ -131,7 +134,10 @@ mod tests {
             .with(Capability::CodeEditing)
             .with(Capability::Debugging);
 
-        assert_eq!(index.providers_of_all(&required), vec![AgentId::new("coder")]);
+        assert_eq!(
+            index.providers_of_all(&required),
+            vec![AgentId::new("coder")]
+        );
     }
 
     #[test]
@@ -169,13 +175,13 @@ mod tests {
     #[test]
     fn an_unknown_capability_from_discovery_is_indexed_like_any_other() {
         let agent = AgentDescriptor::new("exotic", "exotic", AgentProtocol::A2A)
-            .with_capabilities(
-                CapabilitySet::new().with(Capability::parse("formal-verification")),
-            );
+            .with_capabilities(CapabilitySet::new().with(Capability::parse("formal-verification")));
         let index = CapabilityIndex::build(&RegistrySnapshot::new(vec![agent]));
 
         assert_eq!(
-            index.providers(&Capability::Custom("formal_verification".into())).len(),
+            index
+                .providers(&Capability::Custom("formal_verification".into()))
+                .len(),
             1
         );
     }

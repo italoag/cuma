@@ -233,9 +233,12 @@ impl AppState {
                     task.model = model.clone();
                 });
 
-                self.log(format!("routed to {} (score {score:.3})", self.current_agent
-                    .as_ref()
-                    .map_or_else(String::new, ToString::to_string)));
+                self.log(format!(
+                    "routed to {} (score {score:.3})",
+                    self.current_agent
+                        .as_ref()
+                        .map_or_else(String::new, ToString::to_string)
+                ));
             }
 
             EventKind::RoutingFailed { reason } => {
@@ -253,11 +256,17 @@ impl AppState {
                 self.transcript.push_str(chunk);
             }
 
-            EventKind::AgentFailed { agent, class, message } => {
+            EventKind::AgentFailed {
+                agent,
+                class,
+                message,
+            } => {
                 self.log(format!("{agent} failed ({class:?}): {message}"));
             }
 
-            EventKind::RetryScheduled { attempt, delay_ms, .. } => {
+            EventKind::RetryScheduled {
+                attempt, delay_ms, ..
+            } => {
                 self.log(format!("retry {attempt} scheduled in {delay_ms}ms"));
             }
 
@@ -318,7 +327,10 @@ impl AppState {
     /// The cost, formatted so an incomplete total cannot be read as a complete one.
     pub fn render_cost(&self) -> String {
         if self.unpriced_attempts > 0 {
-            format!("≥${:.4} ({} unpriced)", self.spent_usd, self.unpriced_attempts)
+            format!(
+                "≥${:.4} ({} unpriced)",
+                self.spent_usd, self.unpriced_attempts
+            )
         } else {
             format!("~${:.4}", self.spent_usd)
         }
@@ -389,7 +401,12 @@ mod tests {
         state.transcript.push_str("old output");
         state.finished = Some(false);
 
-        apply(&mut state, EventKind::SessionStarted { goal: "new goal".into() });
+        apply(
+            &mut state,
+            EventKind::SessionStarted {
+                goal: "new goal".into(),
+            },
+        );
 
         assert_eq!(state.goal, "new goal");
         assert!(state.running);
@@ -405,7 +422,9 @@ mod tests {
         apply_to_task(
             &mut state,
             &task,
-            EventKind::TaskCreated { description: "do it".into() },
+            EventKind::TaskCreated {
+                description: "do it".into(),
+            },
         );
         assert_eq!(state.tasks[0].status, TaskStatus::Pending);
         assert_eq!(state.tasks[0].marker(), "○");
@@ -413,7 +432,9 @@ mod tests {
         apply_to_task(
             &mut state,
             &task,
-            EventKind::AgentStarted { agent: AgentId::new("claude") },
+            EventKind::AgentStarted {
+                agent: AgentId::new("claude"),
+            },
         );
         assert_eq!(state.tasks[0].status, TaskStatus::Running);
         assert_eq!(state.tasks[0].marker(), "●");
@@ -421,7 +442,9 @@ mod tests {
         apply_to_task(
             &mut state,
             &task,
-            EventKind::TaskCompleted { tokens: TokenUsage::reported(100, 50) },
+            EventKind::TaskCompleted {
+                tokens: TokenUsage::reported(100, 50),
+            },
         );
         assert_eq!(state.tasks[0].status, TaskStatus::Completed);
         assert_eq!(state.tasks[0].marker(), "✓");
@@ -436,7 +459,9 @@ mod tests {
         apply_to_task(
             &mut state,
             &task,
-            EventKind::TaskCreated { description: "do it".into() },
+            EventKind::TaskCreated {
+                description: "do it".into(),
+            },
         );
         apply_to_task(
             &mut state,
@@ -461,7 +486,9 @@ mod tests {
         for chunk in ["Hello", ", ", "world"] {
             apply(
                 &mut state,
-                EventKind::AgentOutputReceived { chunk: chunk.into() },
+                EventKind::AgentOutputReceived {
+                    chunk: chunk.into(),
+                },
             );
         }
         assert_eq!(state.transcript, "Hello, world");
@@ -530,7 +557,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.agent_health.get(&AgentId::new("flaky")).map(String::as_str),
+            state
+                .agent_health
+                .get(&AgentId::new("flaky"))
+                .map(String::as_str),
             Some("Open")
         );
     }
@@ -542,13 +572,19 @@ mod tests {
         for i in 0..(MAX_LOG_LINES + 250) {
             apply(
                 &mut state,
-                EventKind::TaskFailed { reason: format!("failure {i}") },
+                EventKind::TaskFailed {
+                    reason: format!("failure {i}"),
+                },
             );
         }
 
         assert_eq!(state.logs.len(), MAX_LOG_LINES);
         assert!(
-            state.logs.last().unwrap().contains(&(MAX_LOG_LINES + 249).to_string()),
+            state
+                .logs
+                .last()
+                .unwrap()
+                .contains(&(MAX_LOG_LINES + 249).to_string()),
             "the newest lines must be the ones kept"
         );
     }
@@ -559,7 +595,9 @@ mod tests {
         apply_to_task(
             &mut state,
             &TaskId::new("never-created"),
-            EventKind::TaskCompleted { tokens: TokenUsage::default() },
+            EventKind::TaskCompleted {
+                tokens: TokenUsage::default(),
+            },
         );
         assert!(state.tasks.is_empty());
     }

@@ -415,11 +415,8 @@ impl TaskGraph {
         }
 
         // Kahn's algorithm: if we cannot drain every node, what remains is a cycle.
-        let mut indegree: BTreeMap<&TaskId, usize> = self
-            .tasks
-            .keys()
-            .map(|id| (id, 0usize))
-            .collect();
+        let mut indegree: BTreeMap<&TaskId, usize> =
+            self.tasks.keys().map(|id| (id, 0usize)).collect();
         for task in self.iter() {
             for dep in &task.spec.dependencies {
                 if self.tasks.contains_key(dep) {
@@ -679,6 +676,9 @@ mod tests {
     #[test]
     fn estimated_usage_taints_a_merged_total() {
         let merged = TokenUsage::reported(10, 10).merge(TokenUsage::estimated(10, 10));
-        assert!(!merged.reported, "a total built on an estimate is an estimate");
+        assert!(
+            !merged.reported,
+            "a total built on an estimate is an estimate"
+        );
     }
 }

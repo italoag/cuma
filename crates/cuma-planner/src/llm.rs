@@ -157,7 +157,9 @@ pub(crate) fn parse_plan(reply: &str, available: &CapabilitySet) -> Option<TaskG
 
         // Never plan a task nothing can execute.
         if !available.is_empty()
-            && !available.match_against(&spec.required_capabilities).is_complete()
+            && !available
+                .match_against(&spec.required_capabilities)
+                .is_complete()
         {
             continue;
         }
@@ -264,7 +266,9 @@ mod tests {
 
         fn failing() -> Arc<Self> {
             Arc::new(Self {
-                reply: Mutex::new(Err(cuma_core::MetaAgentError::Other("provider down".into()))),
+                reply: Mutex::new(Err(cuma_core::MetaAgentError::Other(
+                    "provider down".into(),
+                ))),
             })
         }
     }
@@ -280,9 +284,11 @@ mod tests {
         }
 
         async fn complete(&self, _: &str, _: &str, _: Option<&ModelId>) -> Result<String> {
-            match &*self.reply.lock().map_err(|_| {
-                cuma_core::MetaAgentError::Other("stub lock poisoned".into())
-            })? {
+            match &*self
+                .reply
+                .lock()
+                .map_err(|_| cuma_core::MetaAgentError::Other("stub lock poisoned".into()))?
+            {
                 Ok(reply) => Ok(reply.clone()),
                 Err(_) => Err(cuma_core::MetaAgentError::Other("provider down".into())),
             }
@@ -306,7 +312,11 @@ validation | 4 | Run the test suite";
 
         assert_eq!(graph.len(), 5);
         assert!(graph.validate().is_ok());
-        assert_eq!(graph.ready_tasks().len(), 1, "only the inspection is unblocked");
+        assert_eq!(
+            graph.ready_tasks().len(),
+            1,
+            "only the inspection is unblocked"
+        );
     }
 
     #[tokio::test]
@@ -315,18 +325,28 @@ validation | 4 | Run the test suite";
         let tasks: Vec<_> = graph.iter().collect();
 
         assert!(tasks[0].spec.dependencies.is_empty());
-        assert_eq!(tasks[2].spec.dependencies.len(), 2, "line 3 depends on 1 and 2");
+        assert_eq!(
+            tasks[2].spec.dependencies.len(),
+            2,
+            "line 3 depends on 1 and 2"
+        );
     }
 
     #[tokio::test]
     async fn a_provider_failure_falls_back_to_heuristics_rather_than_failing() {
         let planner = LlmPlanner::new(StubProvider::failing());
         let graph = planner
-            .plan("implement OAuth and fix the tests", &PlanningContext::default())
+            .plan(
+                "implement OAuth and fix the tests",
+                &PlanningContext::default(),
+            )
             .await
             .unwrap();
 
-        assert!(!graph.is_empty(), "the session must survive a dead provider");
+        assert!(
+            !graph.is_empty(),
+            "the session must survive a dead provider"
+        );
         assert!(graph.validate().is_ok());
     }
 
@@ -425,6 +445,10 @@ review | 1 | Review it";
         let first = graph.iter().next().unwrap();
 
         assert_eq!(first.spec.task_type, TaskType::Inspection);
-        assert_eq!(first.spec.risk, Risk::ReadOnly, "the declared type still governs risk");
+        assert_eq!(
+            first.spec.risk,
+            Risk::ReadOnly,
+            "the declared type still governs risk"
+        );
     }
 }

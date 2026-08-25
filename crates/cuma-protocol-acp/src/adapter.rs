@@ -130,10 +130,15 @@ fn translate_update(notification: &SessionNotification) -> Option<ExecutionUpdat
             name: call.title.clone(),
             status: format!("{:?}", call.status),
         }),
-        SessionUpdate::ToolCallUpdate(update) => update.fields.status.map(|status| ExecutionUpdate::ToolCall {
-            name: update.tool_call_id.to_string(),
-            status: format!("{status:?}"),
-        }),
+        SessionUpdate::ToolCallUpdate(update) => {
+            update
+                .fields
+                .status
+                .map(|status| ExecutionUpdate::ToolCall {
+                    name: update.tool_call_id.to_string(),
+                    status: format!("{status:?}"),
+                })
+        }
         SessionUpdate::Plan(plan) => Some(ExecutionUpdate::Plan {
             entries: plan
                 .entries
@@ -163,10 +168,7 @@ fn interpret_stop_reason(reason: StopReason) -> std::result::Result<(), (ErrorCl
             ErrorClass::TaskFailure,
             "the agent refused to continue".to_owned(),
         )),
-        StopReason::Cancelled => Err((
-            ErrorClass::Cancelled,
-            "the turn was cancelled".to_owned(),
-        )),
+        StopReason::Cancelled => Err((ErrorClass::Cancelled, "the turn was cancelled".to_owned())),
         // `StopReason` is `#[non_exhaustive]`: a newer agent may return a
         // reason this build has never heard of. Treating an unrecognized
         // reason as success would silently mark unfinished work as done.
@@ -280,10 +282,7 @@ impl AgentAdapter for AcpAdapter {
                 // An ACP-level error is a transport or protocol failure. The
                 // orchestrator re-classifies from the message when this comes
                 // back as a generic protocol error.
-                MetaAgentError::protocol_msg(
-                    "acp",
-                    format!("agent {agent_id} failed: {err}"),
-                )
+                MetaAgentError::protocol_msg("acp", format!("agent {agent_id} failed: {err}"))
             })?;
 
         let output = transcript.lock().await.clone();

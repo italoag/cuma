@@ -78,15 +78,11 @@ impl McpToolProvider {
 
         let transport = Self::transport(config)?;
 
-        let service = ()
-            .serve(transport)
-            .await
-            .map_err(|err| {
-                MetaAgentError::protocol_msg("mcp", format!("{name}: initialize failed: {err}"))
-            })?;
+        let service = ().serve(transport).await.map_err(|err| {
+            MetaAgentError::protocol_msg("mcp", format!("{name}: initialize failed: {err}"))
+        })?;
 
-        let result = operation(service).await;
-        result
+        operation(service).await
     }
 
     /// Enumerate one server's tools, honouring its allowlist.
@@ -316,7 +312,10 @@ mod tests {
     #[tokio::test]
     async fn an_unlaunchable_server_does_not_fail_the_whole_enumeration() {
         let mut registry = McpServerRegistry::new();
-        registry.add("broken", McpServerConfig::new("definitely-not-a-binary-a83f"));
+        registry.add(
+            "broken",
+            McpServerConfig::new("definitely-not-a-binary-a83f"),
+        );
         let provider = McpToolProvider::new(registry);
 
         // One dead server must not make every other server's tools disappear.

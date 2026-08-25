@@ -107,7 +107,9 @@ impl AiMemoryCli {
                 operation: format!("ai-memory {}", args.join(" ")),
                 elapsed_ms: OPERATION_TIMEOUT.as_millis() as u64,
             })?
-            .map_err(|err| MetaAgentError::Memory(format!("cannot run the memory backend: {err}")))?;
+            .map_err(|err| {
+                MetaAgentError::Memory(format!("cannot run the memory backend: {err}"))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -372,7 +374,7 @@ mod tests {
             ..cuma_config::MemoryConfig::default()
         };
         let store = crate::from_config(&config);
-        assert!(futures_block_on(store.is_available()) == false);
+        assert!(!futures_block_on(store.is_available()));
     }
 
     fn futures_block_on<F: Future>(future: F) -> F::Output {

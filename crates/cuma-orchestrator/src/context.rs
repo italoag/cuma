@@ -52,7 +52,10 @@ impl MinimalContextManager {
         }
 
         let kept: String = text.chars().take(max_chars).collect();
-        format!("{kept}\n[... truncated, {} chars omitted]", text.chars().count() - max_chars)
+        format!(
+            "{kept}\n[... truncated, {} chars omitted]",
+            text.chars().count() - max_chars
+        )
     }
 
     /// Approximate token count for a prompt.
@@ -153,9 +156,7 @@ impl ContextManager for MinimalContextManager {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use cuma_core::{
-        AgentId, AttemptId, ExecutionOutcome, TaskSpec, TaskType, TokenUsage,
-    };
+    use cuma_core::{AgentId, AttemptId, ExecutionOutcome, TaskSpec, TaskType, TokenUsage};
 
     fn completed_task(description: &str, output: &str) -> Task {
         let mut task = Task::new(TaskSpec::new(description, TaskType::Inspection));
@@ -206,7 +207,10 @@ mod tests {
             .unwrap();
 
         assert!(prompt.contains("the code uses axum"));
-        assert!(!prompt.contains("unrelated"), "a non-dependency must not leak in");
+        assert!(
+            !prompt.contains("unrelated"),
+            "a non-dependency must not leak in"
+        );
     }
 
     #[tokio::test]
@@ -214,9 +218,8 @@ mod tests {
         let mut graph = TaskGraph::new();
         let unfinished = graph.add(Task::new(TaskSpec::new("inspect", TaskType::Inspection)));
 
-        let task = Task::new(
-            TaskSpec::new("implement", TaskType::Implementation).depends_on(unfinished),
-        );
+        let task =
+            Task::new(TaskSpec::new("implement", TaskType::Implementation).depends_on(unfinished));
 
         let prompt = MinimalContextManager::new()
             .assemble(&task, &graph, None, 100_000)
@@ -232,15 +235,16 @@ mod tests {
         let huge = "x".repeat(50_000);
         let done = graph.add(completed_task("inspect", &huge));
 
-        let task = Task::new(
-            TaskSpec::new("implement", TaskType::Implementation).depends_on(done),
-        );
+        let task = Task::new(TaskSpec::new("implement", TaskType::Implementation).depends_on(done));
 
         let manager = MinimalContextManager {
             max_dependency_chars: 500,
             ..MinimalContextManager::new()
         };
-        let prompt = manager.assemble(&task, &graph, None, 100_000).await.unwrap();
+        let prompt = manager
+            .assemble(&task, &graph, None, 100_000)
+            .await
+            .unwrap();
 
         assert!(prompt.len() < 2_000, "got {} chars", prompt.len());
         assert!(prompt.contains("truncated"), "truncation must be visible");
@@ -291,16 +295,17 @@ mod tests {
             .unwrap();
 
         assert!(prompt.contains("Previous attempts"));
-        assert!(prompt.contains("PKCE"), "so the next agent does not repeat it");
+        assert!(
+            prompt.contains("PKCE"),
+            "so the next agent does not repeat it"
+        );
     }
 
     #[tokio::test]
     async fn the_prompt_is_trimmed_to_the_token_budget() {
         let mut graph = TaskGraph::new();
         let done = graph.add(completed_task("inspect", &"y".repeat(100_000)));
-        let task = Task::new(
-            TaskSpec::new("implement", TaskType::Implementation).depends_on(done),
-        );
+        let task = Task::new(TaskSpec::new("implement", TaskType::Implementation).depends_on(done));
 
         let manager = MinimalContextManager {
             max_dependency_chars: 100_000,

@@ -8,7 +8,9 @@
 //! Every aggregate therefore carries how much of it was reported, and cost is
 //! `None` rather than `$0.00` when pricing is unknown.
 
-use cuma_core::{AgentId, AttemptId, CostProfile, ErrorClass, ModelId, SessionId, TaskId, TaskType, TokenUsage};
+use cuma_core::{
+    AgentId, AttemptId, CostProfile, ErrorClass, ModelId, SessionId, TaskId, TaskType, TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -296,7 +298,11 @@ mod tests {
             },
             estimated_cost_usd: cost,
             success,
-            failure_class: if success { None } else { Some(ErrorClass::RateLimit) },
+            failure_class: if success {
+                None
+            } else {
+                Some(ErrorClass::RateLimit)
+            },
             retry_count: 0,
         }
     }
@@ -374,7 +380,10 @@ mod tests {
         assert_eq!(by_agent[&AgentId::new("claude")].attempts, 2);
         assert_eq!(by_agent[&AgentId::new("codex")].successes, 0);
         assert_eq!(tracker.by_model().len(), 2);
-        assert_eq!(tracker.by_task_type()[&TaskType::Implementation].attempts, 3);
+        assert_eq!(
+            tracker.by_task_type()[&TaskType::Implementation].attempts,
+            3
+        );
     }
 
     #[test]
@@ -394,7 +403,11 @@ mod tests {
 
         let breakdown = tracker.failure_breakdown();
         assert_eq!(breakdown["RateLimit"], 2);
-        assert_eq!(breakdown.values().sum::<u32>(), 2, "successes are not failures");
+        assert_eq!(
+            breakdown.values().sum::<u32>(),
+            2,
+            "successes are not failures"
+        );
     }
 
     #[test]

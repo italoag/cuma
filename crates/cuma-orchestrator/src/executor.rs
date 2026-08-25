@@ -3,7 +3,9 @@
 use crate::context::MinimalContextManager;
 use cuma_config::Config;
 use cuma_core::error::{MetaAgentError, Result};
-use cuma_core::ports::{AgentAdapter, ContextManager, ExecutionUpdate, MemoryStore, Planner, PlanningContext};
+use cuma_core::ports::{
+    AgentAdapter, ContextManager, ExecutionUpdate, MemoryStore, Planner, PlanningContext,
+};
 use cuma_core::{
     AgentHandoff, AgentId, AttemptId, Event, EventBus, EventKind, ExecutionOutcome, ModelId,
     SessionId, Task, TaskGraph, TaskId, TaskStatus, TokenUsage,
@@ -260,7 +262,11 @@ impl Orchestrator {
     }
 
     /// Walk the DAG until every task is terminal.
-    async fn execute_graph(&self, session_id: &SessionId, mut graph: TaskGraph) -> Result<TaskGraph> {
+    async fn execute_graph(
+        &self,
+        session_id: &SessionId,
+        mut graph: TaskGraph,
+    ) -> Result<TaskGraph> {
         // Each pass executes one wave of ready tasks. The loop is bounded by
         // the number of tasks because every pass drives at least one task to a
         // terminal state — a pass that cannot is treated as a stall and broken
@@ -809,8 +815,12 @@ impl Orchestrator {
 
     /// Summarize what a failing agent got done, for the agent taking over.
     fn build_handoff(task: &Task, from: &AgentId, reason: &str) -> AgentHandoff {
-        let mut handoff =
-            AgentHandoff::new(task.id.clone(), task.spec.description.clone(), from.clone(), reason);
+        let mut handoff = AgentHandoff::new(
+            task.id.clone(),
+            task.spec.description.clone(),
+            from.clone(),
+            reason,
+        );
 
         for attempt in &task.attempts {
             for file in &attempt.changed_files {
@@ -827,9 +837,7 @@ impl Orchestrator {
         }
 
         if handoff.completed_work.is_empty() {
-            handoff
-                .remaining_work
-                .push(task.spec.description.clone());
+            handoff.remaining_work.push(task.spec.description.clone());
         }
 
         handoff
@@ -881,13 +889,16 @@ impl Orchestrator {
             .iter()
             .filter(|t| t.status == TaskStatus::Completed)
             .count();
-        let failed = graph.iter().filter(|t| t.status == TaskStatus::Failed).count();
-        let skipped = graph.iter().filter(|t| t.status == TaskStatus::Skipped).count();
+        let failed = graph
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed)
+            .count();
+        let skipped = graph
+            .iter()
+            .filter(|t| t.status == TaskStatus::Skipped)
+            .count();
 
-        let mut summary = format!(
-            "{completed}/{} tasks completed",
-            graph.len()
-        );
+        let mut summary = format!("{completed}/{} tasks completed", graph.len());
         if failed > 0 {
             summary.push_str(&format!(", {failed} failed"));
         }

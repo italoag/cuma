@@ -214,9 +214,7 @@ impl RetryPolicy {
                 reason: if target_budget_left {
                     format!("{class:?} will not clear on this agent")
                 } else {
-                    format!(
-                        "{class:?} persisted for {attempts_on_target} attempts on this agent"
-                    )
+                    format!("{class:?} persisted for {attempts_on_target} attempts on this agent")
                 },
             };
         }
@@ -274,7 +272,11 @@ mod tests {
 
         assert!(samples.iter().all(|&d| (500..=1500).contains(&d)));
         assert!(
-            samples.iter().collect::<std::collections::BTreeSet<_>>().len() > 50,
+            samples
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 50,
             "jitter must actually vary"
         );
 

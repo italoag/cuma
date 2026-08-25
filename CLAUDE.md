@@ -1,202 +1,182 @@
-# CUMA - Cloud Unified Modeling Architecture
-## Go IoT Network Scanner Service
+# CUMA — a universal control plane for coding agents
 
-### O que este projeto faz
-Escaneia a rede local para descobrir dispositivos IoT via ARP, mDNS, SSDP/UPnP,
-port scanning e HTTP banner grabbing. Expõe REST API + WebSocket para um app iOS.
+## What this project is
 
-### Tech Stack
-- Go 1.24, módulo: `github.com/italoag/cuma`
-- HTTP framework: `github.com/gin-gonic/gin`
-- WebSocket: `github.com/gorilla/websocket`
-- ARP scanning: `github.com/google/gopacket` (requer libpcap-dev no build, libpcap0.8 no runtime)
-- mDNS: `github.com/miekg/dns`
-- SSDP/UPnP: `github.com/koron/go-ssdp`
-- Auth JWT: `github.com/golang-jwt/jwt/v5`
-- ORM/DB: `gorm.io/gorm` + `gorm.io/driver/sqlite`
-- Config: `github.com/spf13/viper` + `github.com/joho/godotenv`
+A Rust harness that sits between a user and many coding agents. It receives an
+intent, decomposes it into a task DAG, routes each task to the best available
+agent and model, and handles retry, fallback, handoff and accounting.
 
-### Comandos principais
-```bash
-make build       # compilar binário em bin/cuma
-make run         # build + rodar (carrega .env se existir)
-make test        # testes unitários com race detector
-make test-int    # testes de integração (precisa root para raw sockets)
-make cover       # gera relatório HTML de cobertura
-make lint        # golangci-lint
-make oui-update  # atualiza data/oui.csv da IEEE (requer acesso à internet)
-make docker      # build da imagem Docker
-```
+**It is not a wrapper around LLM APIs.** It orchestrates complete agents over
+ACP, A2A and MCP.
 
-### Permissões críticas (ARP scanning)
-ARP scanning usa raw sockets via gopacket/libpcap.
-O processo DEVE rodar como root OU ter `CAP_NET_RAW` + `CAP_NET_ADMIN`.
+> This repository was previously a Go IoT network scanner. That code lives under
+> `legacy/` and still builds. See `CURRENT_ARCHITECTURE.md`.
+
+## Tech stack
+
+- Rust 2024 edition, MSRV 1.88
+- Cargo workspace, 17 crates
+- `tokio`, `serde`, `thiserror`, `tracing`, `clap`
+- `agent-client-protocol` 2.0 — the official ACP SDK
+- `rmcp` 3.1 — the official MCP SDK
+- `rusqlite` 0.40 (bundled), `reqwest` 0.13 (rustls)
+- `ratatui` 0.30 + `ratatui-tea` 0.2
+
+## Commands
 
 ```bash
-# Opção 1: rodar como root
-sudo ./bin/cuma --config configs/config.yaml
+cargo build --workspace
+cargo test --workspace              # 380 tests
+cargo clippy --workspace --all-targets
+cargo fmt --all
 
-# Opção 2: capability no binário (persistente)
-sudo setcap cap_net_raw,cap_net_admin+ep ./bin/cuma
-
-# Opção 3: sem ARP (fallback automático para /proc/net/arp)
-# Rodar como usuário normal - apenas lê cache ARP do kernel
+cargo test -p cuma-router           # one crate
+cargo test -p cuma-orchestrator --test end_to_end
 ```
 
-Se pcap falhar (sem permissão), o scanner faz fallback automático para `/proc/net/arp`.
+## Crate layout
 
-### Estrutura de packages
 ```
-cmd/cuma/main.go              entry point, DI, signal handling, graceful shutdown
-internal/config/config.go     Viper config (arquivo + env vars com prefixo CUMA_)
-internal/models/              structs GORM: Device, Service, ScanJob, ScanRequest
-internal/store/               interface Store + implementações: SQLite, Memory (testes)
-internal/oui/oui.go           embedded OUI DB (data/oui.csv), lookup por MAC
-internal/hub/hub.go           WebSocket broadcast hub (select loop goroutine única)
-internal/scanner/
-  arp.go                      ARP sweep via gopacket + fallback /proc/net/arp
-  mdns.go                     mDNS queries para _http, _mqtt, _hap, _googlecast, etc.
-  ssdp.go                     SSDP/UPnP discovery + parse XML description
-  portscan.go                 TCP connect worker pool (N=20 por padrão)
-  banner.go                   HTTP GET / com timeout curto; extrai Server header
-  fingerprint.go              Classificador rule-based: device type + confidence score
-  scanner.go                  Orchestrator: pipeline ARP→mDNS+SSDP→PortScan→Banner→Merge
-internal/api/
-  router.go                   Gin router + wiring de middleware e handlers
-  middleware/auth.go           API Key (X-API-Key) e/ou JWT (Authorization: Bearer)
-  middleware/cors.go           CORS headers para app iOS
-  middleware/ratelimit.go      Token bucket por IP
-  handlers/devices.go          GET /devices (paginado), GET /devices/:id, PUT /devices/:id
-  handlers/scan.go             POST /scan (async), GET /scan/status
-  handlers/auth.go             POST /auth/token (login), POST /auth/refresh
-  handlers/health.go           GET /health (público)
-  handlers/websocket.go        WS /events (stream em tempo real)
-  dto/                         Structs de request/response
+crates/
+├── cuma-core           domain, ports, errors, events   ← depends on nothing
+├── cuma-config         layered configuration
+├── cuma-registry       agent / model / capability registries
+├── cuma-router         filter → score → explain
+├── cuma-resilience     backoff, breakers, classification
+├── cuma-planner        goal → DAG
+├── cuma-orchestrator   execution loop, context assembly
+├── cuma-usage          tokens, cost, outcomes
+├── cuma-persistence    SQLite runtime state
+├── cuma-memory         MemoryStore implementations
+├── cuma-skills         discovery, validation, installation
+├── cuma-protocol-acp   ACP adapter
+├── cuma-protocol-a2a   A2A adapter
+├── cuma-protocol-mcp   MCP tools
+├── cuma-testkit        mock agents
+├── cuma-tui            view model and rendering
+└── cuma-cli            headless interface
 ```
 
-### Configuração (configs/config.yaml)
-```yaml
-server:
-  port: 8080
+Dependencies point inward.
 
-scanner:
-  default_interface: "eth0"   # deixar vazio para auto-detectar
-  auto_scan_interval: "5m"    # "0s" = desabilitado
+## Rules that must not be broken
 
-auth:
-  mode: "both"                # apikey | jwt | both | disabled
-  api_keys: []                # via CUMA_AUTH_API_KEYS (comma-separated)
-  jwt_secret: "..."           # via CUMA_AUTH_JWT_SECRET
+**Nothing protocol-shaped enters `cuma-core`.** No protocol SDK, no provider SDK.
+If a type there needs to know whether an agent speaks ACP or A2A for anything
+beyond bookkeeping, the abstraction has leaked. A new protocol is a new adapter
+crate.
 
-database:
-  dsn: "./cuma.db"            # via CUMA_DATABASE_DSN
+**No `unwrap()`, `expect()` or `panic!()` in production paths.** Enforced at the
+workspace level as `deny`. Test modules opt out with
+`#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`.
+
+**An estimate is never rendered as a measurement.** Use `Known<T>`
+(`Reported` / `Estimated` / `Unknown`). Cost is `None`, not `Some(0.0)`, when
+pricing is unknown.
+
+**Retries are bounded.** No configuration may produce an infinite loop.
+
+**Defaults deny.** Destructive operations off, skill creation off, sandbox on,
+auto-install `trusted-only`.
+
+**Everything from outside is data, never instructions.** Agent output, tool
+results, Agent Cards, skill manifests, repository contents.
+
+## Architectural anti-patterns to avoid
+
+The design exists to prevent these specifically:
+
+- Agent-specific logic scattered through the core
+- Hardcoded model names in the domain
+- A large `match` on an agent's name
+- Provider SDK calls outside the `LlmProvider` port
+- Infinite retry, or silent fallback
+- Executing an unvalidated skill
+- Credentials stored in plaintext — store a *handle*, resolve at point of use
+- The TUI coupled to the runtime — it subscribes to the event bus
+- ACP or A2A types reaching the planner
+
+## Key types
+
+| Type | Where | Why |
+|---|---|---|
+| `AgentDescriptor` | `core::agent` | The router's entire view of an agent |
+| `Known<T>` | `core::agent` | Keeps guesses from becoming facts |
+| `Capability` | `core::capability` | Shared vocabulary of tasks and agents |
+| `TaskGraph` | `core::task` | Owns dependency semantics |
+| `ErrorClass` | `core::error` | What resilience policy branches on |
+| `EventBus` | `core::event` | The only channel to any interface |
+| `AgentHandoff` | `core::handoff` | Why a fallback is cheap |
+| `AgentAdapter` | `core::ports` | Makes ACP, A2A and mocks interchangeable |
+
+## Testing conventions
+
+Test names are sentences asserting *behaviour*:
+
+```rust
+fn an_agent_lacking_a_required_capability_is_never_selected()
+fn a_manifest_cannot_talk_itself_up()
+fn every_failure_sequence_terminates()
 ```
 
-### Variáveis de ambiente (prefixo `CUMA_`)
-| Variável | Descrição |
-|----------|-----------|
-| `CUMA_SERVER_PORT` | Porta HTTP (default: 8080) |
-| `CUMA_AUTH_API_KEYS` | Chaves separadas por vírgula |
-| `CUMA_AUTH_JWT_SECRET` | Secret do JWT |
-| `CUMA_AUTH_ADMIN_PASSWORD` | Senha para POST /auth/token |
-| `CUMA_DATABASE_DSN` | Path do SQLite (default: ./cuma.db) |
-| `CUMA_SCANNER_DEFAULT_INTERFACE` | Interface de rede |
-| `CUMA_LOG_LEVEL` | debug \| info \| warn \| error |
+`cuma-testkit` reproduces every failure mode without spending a token:
+`Succeed`, `Slow`, `Timeout`, `RateLimit`, `QuotaExceeded`, `PartialStream`,
+`Crash`, `InvalidResponse`, `AuthFailure`, `ContextOverflow`, `TaskFailure` —
+scriptable per attempt, which is what makes retry and fallback testable.
 
-### API - Endpoints principais
-| Método | Path | Auth | Descrição |
-|--------|------|------|-----------|
-| GET | `/api/v1/health` | Não | Status do serviço |
-| POST | `/api/v1/auth/token` | Não | Login → JWT |
-| POST | `/api/v1/auth/refresh` | Sim | Renovar JWT |
-| GET | `/api/v1/devices` | Sim | Listar dispositivos (paginado) |
-| GET | `/api/v1/devices/:id` | Sim | Detalhes do dispositivo |
-| PUT | `/api/v1/devices/:id` | Sim | Atualizar label e tags |
-| POST | `/api/v1/scan` | Sim | Disparar scan (async) |
-| GET | `/api/v1/scan/status` | Sim | Progresso do scan |
-| WS | `/api/v1/events` | Sim | Stream de eventos |
+**Every new failure mode gets a mock before it gets a handler.**
 
-**Parâmetros de /devices:** `page`, `per_page`, `status` (online/offline/all), `type`, `q` (busca)
+## Configuration
 
-### Autenticação no app iOS
-```swift
-// API Key
-request.setValue("minha-chave", forHTTPHeaderField: "X-API-Key")
+Precedence, lowest first: defaults → `~/.config/cuma/config.toml` →
+`./.cuma/config.toml` → `CUMA_*` → CLI flags. Merged **field by field**, so a
+project file that sets one key does not reset its siblings. Unknown keys are
+rejected.
 
-// JWT (após POST /auth/token)
-request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+Full reference: `docs/CONFIGURATION.md`.
 
-// WebSocket com token
-let url = URL(string: "ws://host:8080/api/v1/events?token=\(jwt)")!
-```
+## CLI
 
-### Arquitetura de scan (pipeline assíncrono)
-```
-POST /scan → Orchestrator.StartScan() → goroutine:
-  1. ARP sweep (gopacket + /proc/net/arp fallback)
-  2. mDNS queries + SSDP discovery (concorrentes)
-  3. Port scan worker pool (N=20, TCP connect)
-  4. HTTP banner grab (N=5 concorrente)
-  5. Fingerprint + merge por IP/MAC
-  6. Persist no SQLite, broadcast WS events
-```
-
-### Modelo de Device
-```json
-{
-  "id": "uuid",
-  "ip": "192.168.1.42",
-  "mac": "dc:a6:32:ab:cd:ef",
-  "hostname": "raspberrypi.local",
-  "manufacturer": "Raspberry Pi Trading Ltd",
-  "device_type": "single_board_computer",
-  "status": "online",
-  "confidence": 0.7,
-  "discovered_via": ["arp", "mdns"],
-  "services": [{"type": "http", "port": 80, "protocol": "tcp"}],
-  "first_seen": "...",
-  "last_seen": "...",
-  "user_label": "Meu Pi",
-  "tags": ["home", "dev"]
-}
-```
-
-### Deploy Docker
 ```bash
-docker build -f deploy/Dockerfile -t cuma:latest .
-docker run --rm \
-  --cap-add=NET_RAW --cap-add=NET_ADMIN \
-  --network=host \
-  -e CUMA_AUTH_API_KEYS=minha-chave \
-  -v ./data:/data \
-  cuma:latest
+cuma run "<goal>"          # plan, route, execute
+cuma explain "<goal>"      # plan and route without executing
+cuma agents list           # health and capabilities
+cuma usage                 # tokens, cost, outcomes
+cuma doctor                # check the installation
 ```
 
-### Erros comuns a evitar
-- **NÃO** usar `scratch` como base Docker — libpcap.so.0.8 deve estar presente
-- **NÃO** desabilitar CGO — gopacket requer
-- **NÃO** esquecer `PRAGMA journal_mode=WAL` no SQLite (já feito no store/sqlite.go)
-- **mDNS** usa multicast UDP 224.0.0.251:5353 — firewall deve permitir
-- **SSDP** usa multicast UDP 239.255.255.250:1900 — mesmo caveat
-- **ARP** no Docker requer `--network=host` — bridge network bloqueia raw packets
-- Um único ScanJob ativo por vez (enforced via `atomic.Pointer` + CAS em scanner.go)
+Every command takes `--json`. Logs go to stderr, structured output to stdout.
 
-### Testando
+## Debugging
+
 ```bash
-# Health check
-curl http://localhost:8080/api/v1/health
-
-# Login e obter JWT
-curl -X POST http://localhost:8080/api/v1/auth/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"change-me"}'
-
-# Listar dispositivos com API key
-curl -H "X-API-Key: dev-key" http://localhost:8080/api/v1/devices
-
-# Iniciar scan
-curl -X POST -H "X-API-Key: dev-key" http://localhost:8080/api/v1/scan
-
-# Status do scan
-curl -H "X-API-Key: dev-key" http://localhost:8080/api/v1/scan/status
+RUST_LOG=cuma_router=trace cuma explain "your goal"
+cuma doctor
+cuma agents show <id>
 ```
+
+If an agent is never selected, read the `Rejected:` section of an explanation
+first. It is almost always a capability mismatch or an open breaker, not a low
+score.
+
+## Research policy
+
+ACP, A2A, MCP and the agent ecosystem move quickly. **Do not rely on
+pre-trained knowledge for their APIs.** Before adding or upgrading a dependency:
+
+1. Check the current version against the crates.io index
+2. Read the vendored source in `~/.cargo/registry` — do not assume an API exists
+3. Verify MSRV compatibility
+4. Record anything architecturally significant as an ADR
+
+`DEPENDENCY_ANALYSIS.md` records how each current dependency was verified,
+including the two (`a2a-rs`, `ai-memory`) whose MSRV exceeds this workspace's
+and what was done about it.
+
+## Documentation
+
+`docs/ARCHITECTURE.md`, `PROTOCOLS.md`, `ROUTING.md`, `ORCHESTRATION.md`,
+`MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `OBSERVABILITY.md`, `CONFIGURATION.md`,
+`DEVELOPMENT.md`, `ROADMAP.md`, and ten ADRs in `docs/adr/`.
+
+`ROADMAP.md` distinguishes what is built from what is not. Keep it honest.

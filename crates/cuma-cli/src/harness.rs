@@ -196,7 +196,11 @@ mod tests {
         for alias in ["cost", "cost-first", "COST_FIRST"] {
             let mut config = Config::default();
             apply_cli_overrides(&mut config, Some(alias), None, None, None).unwrap();
-            assert_eq!(config.router.strategy, RoutingStrategy::CostFirst, "{alias}");
+            assert_eq!(
+                config.router.strategy,
+                RoutingStrategy::CostFirst,
+                "{alias}"
+            );
         }
     }
 

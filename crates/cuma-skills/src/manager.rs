@@ -191,7 +191,11 @@ impl SkillManager {
 
     /// Capabilities in `required` that neither the agents nor installed skills
     /// provide.
-    pub async fn gaps(&self, required: &CapabilitySet, available: &CapabilitySet) -> Vec<Capability> {
+    pub async fn gaps(
+        &self,
+        required: &CapabilitySet,
+        available: &CapabilitySet,
+    ) -> Vec<Capability> {
         let installed = self.installed_capabilities().await;
 
         required
@@ -281,7 +285,10 @@ mod tests {
         let manager = manager(SkillAutoInstall::TrustedOnly);
         assert!(manager.installed_capabilities().await.is_empty());
 
-        manager.install(&SkillId::new("git-workflow")).await.unwrap();
+        manager
+            .install(&SkillId::new("git-workflow"))
+            .await
+            .unwrap();
         assert!(
             manager
                 .installed_capabilities()
@@ -303,7 +310,10 @@ mod tests {
         // Before installing anything, two capabilities are missing.
         assert_eq!(manager.gaps(&required, &agents_provide).await.len(), 2);
 
-        manager.install(&SkillId::new("git-workflow")).await.unwrap();
+        manager
+            .install(&SkillId::new("git-workflow"))
+            .await
+            .unwrap();
 
         // The skill closes one of them.
         assert_eq!(
@@ -315,7 +325,10 @@ mod tests {
     #[tokio::test]
     async fn a_skill_can_be_removed() {
         let manager = manager(SkillAutoInstall::TrustedOnly);
-        manager.install(&SkillId::new("git-workflow")).await.unwrap();
+        manager
+            .install(&SkillId::new("git-workflow"))
+            .await
+            .unwrap();
 
         assert!(manager.remove(&SkillId::new("git-workflow")).await);
         assert!(manager.installed().await.is_empty());

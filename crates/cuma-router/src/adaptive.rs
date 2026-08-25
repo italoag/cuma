@@ -163,7 +163,10 @@ impl RoutingHistory {
             outcome.model_id.clone(),
             outcome.task_type,
         );
-        self.buckets.entry(key(&bucket)).or_default().record(outcome);
+        self.buckets
+            .entry(key(&bucket))
+            .or_default()
+            .record(outcome);
     }
 
     /// Statistics for one bucket.
@@ -261,7 +264,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    fn record_many(history: &mut RoutingHistory, agent: &str, task_type: TaskType, results: &[bool]) {
+    fn record_many(
+        history: &mut RoutingHistory,
+        agent: &str,
+        task_type: TaskType,
+        results: &[bool],
+    ) {
         for &success in results {
             let outcome = if success {
                 OutcomeRecord::success(AgentId::new(agent), None, task_type, 1000, 500)
@@ -281,7 +289,12 @@ mod tests {
     #[test]
     fn history_is_bucketed_by_task_type_not_just_by_agent() {
         let mut history = RoutingHistory::new();
-        record_many(&mut history, "claude", TaskType::BugFix, &[true, true, true, true]);
+        record_many(
+            &mut history,
+            "claude",
+            TaskType::BugFix,
+            &[true, true, true, true],
+        );
         record_many(
             &mut history,
             "claude",
@@ -422,8 +435,14 @@ mod tests {
     #[test]
     fn an_agent_with_no_history_is_left_at_its_prior() {
         let history = RoutingHistory::new();
-        let (blended, applied) =
-            history.blend(0.7, &AgentId::new("unseen"), None, TaskType::General, 1.0, 1);
+        let (blended, applied) = history.blend(
+            0.7,
+            &AgentId::new("unseen"),
+            None,
+            TaskType::General,
+            1.0,
+            1,
+        );
         assert!(!applied);
         assert_eq!(blended, 0.7);
     }

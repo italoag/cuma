@@ -179,7 +179,12 @@ impl Router {
             return;
         }
 
-        if self.config.exclude_agents.iter().any(|e| e == agent.id.as_str()) {
+        if self
+            .config
+            .exclude_agents
+            .iter()
+            .any(|e| e == agent.id.as_str())
+        {
             reject("excluded by router.exclude_agents".to_owned(), rejected);
             return;
         }
@@ -194,10 +199,7 @@ impl Router {
         }
 
         if !agent.health.state.is_routable() {
-            reject(
-                format!("health is {:?}", agent.health.state),
-                rejected,
-            );
+            reject(format!("health is {:?}", agent.health.state), rejected);
             return;
         }
 
@@ -317,9 +319,7 @@ impl Router {
                 && estimated > remaining
             {
                 reject(
-                    format!(
-                        "estimated ${estimated:.4} exceeds ${remaining:.4} remaining budget"
-                    ),
+                    format!("estimated ${estimated:.4} exceeds ${remaining:.4} remaining budget"),
                     rejected,
                 );
                 return;
@@ -405,7 +405,12 @@ mod tests {
             TaskType::Testing,
         ]
         .into_iter()
-        .flat_map(|t| t.baseline_capabilities().iter().cloned().collect::<Vec<_>>())
+        .flat_map(|t| {
+            t.baseline_capabilities()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .collect()
     }
 
@@ -459,7 +464,10 @@ mod tests {
 
         assert_eq!(decision.selected.agent_id, AgentId::new("capable"));
         assert!(
-            decision.rejected.iter().any(|r| r.reason.contains("missing required")),
+            decision
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("missing required")),
             "the incapable agent must be filtered, not just outscored"
         );
     }
@@ -487,12 +495,15 @@ mod tests {
         cheap.models.push(priced_model(&cheap, "small", 0.25, 1.25));
 
         let mut premium = agent("premium", AgentProtocol::Acp);
-        premium.models.push(priced_model(&premium, "big", 15.0, 75.0));
+        premium
+            .models
+            .push(priced_model(&premium, "big", 15.0, 75.0));
 
         let snapshot = RegistrySnapshot::new(vec![cheap, premium]);
         let router = Router::new(config(RoutingStrategy::CostFirst));
 
-        let t = Task::new(TaskSpec::new("rename a variable", TaskType::Refactor).with_complexity(0.1));
+        let t =
+            Task::new(TaskSpec::new("rename a variable", TaskType::Refactor).with_complexity(0.1));
         let decision = router.route(&RouteRequest::new(&t, &snapshot)).unwrap();
 
         assert_eq!(decision.selected.agent_id, AgentId::new("cheap"));
@@ -616,7 +627,10 @@ mod tests {
         let t = task();
 
         let first = router.route(&RouteRequest::new(&t, &snapshot)).unwrap();
-        let failed = [(first.selected.agent_id.clone(), first.selected.model_id.clone())];
+        let failed = [(
+            first.selected.agent_id.clone(),
+            first.selected.model_id.clone(),
+        )];
 
         let second = router
             .route(&RouteRequest::new(&t, &snapshot).excluding(&failed))
@@ -624,7 +638,10 @@ mod tests {
 
         assert_ne!(second.selected.agent_id, first.selected.agent_id);
         assert!(
-            second.rejected.iter().any(|r| r.reason.contains("already failed")),
+            second
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("already failed")),
             "the failed target must be filtered, with a reason"
         );
     }
@@ -692,7 +709,12 @@ mod tests {
         let decision = router.route(&RouteRequest::new(&t, &snapshot)).unwrap();
 
         assert_eq!(decision.selected.agent_id, AgentId::new("local"));
-        assert!(decision.rejected.iter().any(|r| r.reason.contains("remote")));
+        assert!(
+            decision
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("remote"))
+        );
     }
 
     // --- budget -----------------------------------------------------------
@@ -700,7 +722,9 @@ mod tests {
     #[test]
     fn a_candidate_that_would_blow_the_budget_is_filtered() {
         let mut expensive = agent("expensive", AgentProtocol::Acp);
-        expensive.models.push(priced_model(&expensive, "big", 15.0, 75.0));
+        expensive
+            .models
+            .push(priced_model(&expensive, "big", 15.0, 75.0));
         let mut cheap = agent("cheap", AgentProtocol::Acp);
         cheap.models.push(priced_model(&cheap, "small", 0.25, 1.25));
 
@@ -718,7 +742,10 @@ mod tests {
 
         assert_eq!(decision.selected.agent_id, AgentId::new("cheap"));
         assert!(
-            decision.rejected.iter().any(|r| r.reason.contains("budget")),
+            decision
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("budget")),
             "rejections were: {:?}",
             decision.rejected
         );
@@ -861,6 +888,9 @@ mod tests {
 
         assert_eq!(decision.selected.model_id, Some(ModelId::new("small")));
         assert_eq!(decision.alternatives.len(), 1);
-        assert_eq!(decision.alternatives[0].model_id, Some(ModelId::new("large")));
+        assert_eq!(
+            decision.alternatives[0].model_id,
+            Some(ModelId::new("large"))
+        );
     }
 }

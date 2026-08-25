@@ -531,7 +531,13 @@ mod tests {
             },
             ..Config::default()
         };
-        assert!(config.validate().unwrap_err().to_string().contains("bounded"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("bounded")
+        );
     }
 
     #[test]

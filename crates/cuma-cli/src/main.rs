@@ -168,6 +168,8 @@ async fn run() -> Result<()> {
         Some(Command::Usage { by_model }) => {
             commands::usage(config, workspace, by_model, cli.json).await
         }
-        Some(Command::Doctor) => commands::doctor(config, workspace, loaded.sources, cli.json).await,
+        Some(Command::Doctor) => {
+            commands::doctor(config, workspace, loaded.sources, cli.json).await
+        }
     }
 }
