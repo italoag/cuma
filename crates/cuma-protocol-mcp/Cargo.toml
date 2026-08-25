@@ -1,5 +1,6 @@
 [package]
 name = "cuma-protocol-mcp"
+description = "Model Context Protocol tool access for CUMA"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,18 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cuma-core.workspace = true
+cuma-config.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "process", "rt"] }
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shell-words.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

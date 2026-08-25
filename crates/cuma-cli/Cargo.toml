@@ -1,5 +1,6 @@
 [package]
 name = "cuma-cli"
+description = "The CUMA meta-agent harness command line interface"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +13,30 @@ name = "cuma"
 path = "src/main.rs"
 
 [dependencies]
+cuma-core.workspace = true
+cuma-config.workspace = true
+cuma-registry.workspace = true
+cuma-router.workspace = true
+cuma-resilience.workspace = true
+cuma-planner.workspace = true
+cuma-orchestrator.workspace = true
+cuma-usage.workspace = true
+cuma-persistence.workspace = true
+cuma-memory.workspace = true
+cuma-skills.workspace = true
+cuma-protocol-acp.workspace = true
+cuma-protocol-a2a.workspace = true
+cuma-protocol-mcp.workspace = true
+cuma-testkit.workspace = true
+cuma-tui.workspace = true
+
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "cuma-skills"
+description = "Skill discovery, installation and security validation for CUMA"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,17 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cuma-core.workspace = true
+cuma-config.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "fs"] }
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

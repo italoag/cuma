@@ -217,6 +217,19 @@ impl Orchestrator {
         })
     }
 
+    /// Produce a plan without executing it.
+    ///
+    /// Backs `cuma explain` and `cuma run --dry-run`: seeing what the harness
+    /// intends to do, and what it would cost, before it does any of it.
+    pub async fn plan_only(&self, goal: &str) -> Result<TaskGraph> {
+        self.plan(goal).await
+    }
+
+    /// Show how a task would route, without executing it.
+    pub async fn explain_routing(&self, task: &Task) -> Result<cuma_router::RoutingDecision> {
+        self.route(task, &[]).await
+    }
+
     /// Produce a plan, seeded with what the registry can do and what memory knows.
     async fn plan(&self, goal: &str) -> Result<TaskGraph> {
         let snapshot = self.agents.snapshot().await;

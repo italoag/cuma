@@ -224,6 +224,22 @@ impl RoutingHistory {
         )
     }
 
+    /// Restore a bucket wholesale, from persisted aggregates.
+    ///
+    /// Used at startup so a fresh process routes with what previous sessions
+    /// learned. This overwrites rather than merges: the caller is replaying a
+    /// stored total, not adding one more observation to it.
+    pub fn restore(
+        &mut self,
+        agent: AgentId,
+        model: Option<ModelId>,
+        task_type: TaskType,
+        stats: AdaptiveStats,
+    ) {
+        let bucket = (agent, model, task_type);
+        self.buckets.insert(key(&bucket), stats);
+    }
+
     /// Every bucket, for reporting.
     pub fn buckets(&self) -> impl Iterator<Item = (&String, &AdaptiveStats)> {
         self.buckets.iter()
