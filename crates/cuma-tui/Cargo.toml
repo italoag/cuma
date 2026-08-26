@@ -14,6 +14,8 @@ cuma-orchestrator.workspace = true
 cuma-usage.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tracing.workspace = true
 

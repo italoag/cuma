@@ -19,6 +19,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// How long to wait for an adapter's queued streaming updates to reach the
+/// event bus after the adapter returns.
+///
+/// Bounded so a stuck subscriber cannot hold up the next task.
+const UPDATE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a session produced.
 #[derive(Debug, Clone)]
 pub struct SessionResult {
@@ -722,7 +728,17 @@ impl Orchestrator {
         let deadline = std::time::Duration::from_millis(request.timeout_ms);
         let result = tokio::time::timeout(deadline, adapter.execute(request, tx)).await;
 
-        pump.abort();
+        // Let the pump drain rather than aborting it. The adapter dropped its
+        // sender when it returned, so the channel closes and the pump ends on
+        // its own; aborting here would discard updates a fast adapter had
+        // already queued but the pump had not yet been polled to forward.
+        // That is how streamed output silently disappears.
+        if tokio::time::timeout(UPDATE_DRAIN, pump).await.is_err() {
+            tracing::warn!(
+                agent = %agent_id,
+                "streamed updates did not drain before the deadline"
+            );
+        }
 
         match result {
             Ok(outcome) => outcome,

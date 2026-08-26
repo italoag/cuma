@@ -304,6 +304,36 @@ pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
     cuma_tui::run(orchestrator).await
 }
 
+/// Serve CUMA itself as an agent.
+pub async fn serve(config: Config, workspace: PathBuf, protocol: &str) -> Result<()> {
+    let (orchestrator, warnings) = harness::build_orchestrator(config, workspace).await?;
+
+    // Warnings go to stderr: stdout carries the protocol.
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    if orchestrator.agents().is_empty().await {
+        return Err(MetaAgentError::Configuration(
+            "refusing to serve with no agents registered; there would be nothing to route to"
+                .to_owned(),
+        ));
+    }
+
+    match protocol.to_ascii_lowercase().as_str() {
+        "acp" => {
+            eprintln!(
+                "serving {} agents over ACP on stdio",
+                orchestrator.agents().len().await
+            );
+            cuma_server_acp::serve_stdio(orchestrator).await
+        }
+        other => Err(MetaAgentError::Configuration(format!(
+            "cannot serve protocol {other:?}; only \"acp\" is supported"
+        ))),
+    }
+}
+
 /// Agent subcommands.
 pub async fn agents(config: Config, action: AgentAction, json: bool) -> Result<()> {
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

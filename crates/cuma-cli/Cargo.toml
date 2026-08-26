@@ -27,6 +27,7 @@ cuma-skills.workspace = true
 cuma-protocol-acp.workspace = true
 cuma-protocol-a2a.workspace = true
 cuma-protocol-mcp.workspace = true
+cuma-server-acp.workspace = true
 cuma-testkit.workspace = true
 cuma-tui.workspace = true
 

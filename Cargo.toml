@@ -17,6 +17,7 @@ members = [
     "crates/cuma-protocol-mcp",
     "crates/cuma-testkit",
     "crates/cuma-tui",
+    "crates/cuma-server-acp",
     "crates/cuma-cli",
 ]
 
@@ -46,10 +47,11 @@ cuma-protocol-a2a = { path = "crates/cuma-protocol-a2a", version = "0.1.0" }
 cuma-protocol-mcp = { path = "crates/cuma-protocol-mcp", version = "0.1.0" }
 cuma-testkit = { path = "crates/cuma-testkit", version = "0.1.0" }
 cuma-tui = { path = "crates/cuma-tui", version = "0.1.0" }
+cuma-server-acp = { path = "crates/cuma-server-acp", version = "0.1.0" }
 
 # --- runtime / async ---
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -87,7 +89,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # --- tui ---
 ratatui = "0.30"
 ratatui-tea = "0.2"
-crossterm = "0.29"
+# `event-stream` gives crossterm an async EventStream. Declared here rather
+# than relying on ratatui's re-export so the feature is actually enabled;
+# cargo unifies it with the copy ratatui-crossterm pulls in.
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio-stream = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -103,6 +103,16 @@ impl TaskRow {
     }
 }
 
+/// What keystrokes currently mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// Keys navigate. `i` or `/` starts editing.
+    #[default]
+    Navigating,
+    /// Keys append to the goal buffer. Enter submits, Esc cancels.
+    Editing,
+}
+
 /// How many log lines are retained.
 ///
 /// Bounded so a long session cannot grow the interface's memory without limit;
@@ -140,6 +150,18 @@ pub struct AppState {
     pub logs: Vec<String>,
     /// Whether the session finished successfully.
     pub finished: Option<bool>,
+    /// What keystrokes currently mean.
+    pub input_mode: InputMode,
+    /// The goal being typed.
+    pub input: String,
+    /// Vertical scroll offset for the active screen.
+    pub scroll: u16,
+    /// Set when the user asks to quit.
+    pub should_quit: bool,
+    /// A transient message shown in the status bar.
+    pub notice: Option<String>,
+    /// Agents, refreshed from the registry rather than from events.
+    pub agents: Vec<cuma_core::AgentDescriptor>,
 }
 
 impl AppState {
@@ -345,13 +367,90 @@ impl AppState {
     }
 
     /// Move to the next screen.
+    ///
+    /// Scroll resets: carrying one screen's offset onto another lands the user
+    /// somewhere arbitrary in a list of a different length.
     pub fn next_screen(&mut self) {
         self.screen = self.screen.next();
+        self.scroll = 0;
     }
 
     /// Move to the previous screen.
     pub fn previous_screen(&mut self) {
         self.screen = self.screen.previous();
+        self.scroll = 0;
+    }
+
+    /// Jump directly to a screen.
+    pub fn go_to(&mut self, screen: Screen) {
+        self.screen = screen;
+        self.scroll = 0;
+    }
+
+    /// Scroll down by `lines`.
+    pub fn scroll_down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+
+    /// Scroll up by `lines`.
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    /// Begin editing a goal.
+    ///
+    /// Refused while a session is running: submitting a second goal mid-run
+    /// would interleave two plans in one view model.
+    pub fn begin_editing(&mut self) {
+        if self.running {
+            self.notice = Some("a session is already running".to_owned());
+            return;
+        }
+        self.input_mode = InputMode::Editing;
+        self.notice = None;
+    }
+
+    /// Abandon the goal being typed.
+    pub fn cancel_editing(&mut self) {
+        self.input_mode = InputMode::Navigating;
+        self.input.clear();
+    }
+
+    /// Take the typed goal, if there is one, and return to navigating.
+    ///
+    /// Returns `None` for a blank goal rather than submitting one, since an
+    /// empty goal is rejected downstream anyway.
+    pub fn submit(&mut self) -> Option<String> {
+        let goal = self.input.trim().to_owned();
+        self.input_mode = InputMode::Navigating;
+        self.input.clear();
+
+        if goal.is_empty() {
+            return None;
+        }
+
+        self.notice = None;
+        Some(goal)
+    }
+
+    /// Append a typed character.
+    pub fn push_char(&mut self, character: char) {
+        self.input.push(character);
+    }
+
+    /// Delete the last typed character.
+    pub fn pop_char(&mut self) {
+        self.input.pop();
+    }
+
+    /// Ask the loop to exit.
+    pub fn quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// Replace the cached agent list.
+    pub fn set_agents(&mut self, agents: Vec<cuma_core::AgentDescriptor>) {
+        self.agents = agents;
     }
 }
 

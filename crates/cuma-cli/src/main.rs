@@ -63,6 +63,15 @@ enum Command {
     /// Start the interactive TUI.
     Chat,
 
+    /// Serve CUMA itself as an agent, so an editor sees one agent.
+    ///
+    /// Logs go to stderr; stdout is the protocol channel.
+    Serve {
+        /// Which protocol to serve.
+        #[arg(long, default_value = "acp")]
+        protocol: String,
+    },
+
     /// Inspect and manage agents.
     Agents {
         #[command(subcommand)]
@@ -161,6 +170,7 @@ async fn run() -> Result<()> {
             commands::run_goal(config, workspace, &goal, true, cli.json).await
         }
         Some(Command::Chat) | None => commands::chat(config, workspace).await,
+        Some(Command::Serve { protocol }) => commands::serve(config, workspace, &protocol).await,
         Some(Command::Agents { action }) => commands::agents(config, action, cli.json).await,
         Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
         Some(Command::Skills { action }) => commands::skills(config, action, cli.json).await,
