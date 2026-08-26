@@ -1,0 +1,34 @@
+[package]
+name = "cuma-orchestrator"
+description = "Task DAG execution, routing, retry, fallback and handoff for CUMA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cuma-core.workspace = true
+cuma-config.workspace = true
+cuma-registry.workspace = true
+cuma-router.workspace = true
+cuma-resilience.workspace = true
+cuma-planner.workspace = true
+cuma-usage.workspace = true
+cuma-workspace.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing.workspace = true
+chrono.workspace = true
+rand.workspace = true
+futures.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+cuma-testkit.workspace = true
+cuma-workspace.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

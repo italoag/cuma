@@ -1,0 +1,112 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cuma-core",
+    "crates/cuma-config",
+    "crates/cuma-registry",
+    "crates/cuma-router",
+    "crates/cuma-resilience",
+    "crates/cuma-planner",
+    "crates/cuma-orchestrator",
+    "crates/cuma-usage",
+    "crates/cuma-persistence",
+    "crates/cuma-memory",
+    "crates/cuma-skills",
+    "crates/cuma-protocol-acp",
+    "crates/cuma-protocol-a2a",
+    "crates/cuma-protocol-mcp",
+    "crates/cuma-testkit",
+    "crates/cuma-tui",
+    "crates/cuma-server-acp",
+    "crates/cuma-workspace",
+    "crates/cuma-providers",
+    "crates/cuma-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/italoag/cuma"
+authors = ["CUMA contributors"]
+
+[workspace.dependencies]
+# --- internal ---
+cuma-core = { path = "crates/cuma-core", version = "0.1.0" }
+cuma-config = { path = "crates/cuma-config", version = "0.1.0" }
+cuma-registry = { path = "crates/cuma-registry", version = "0.1.0" }
+cuma-router = { path = "crates/cuma-router", version = "0.1.0" }
+cuma-resilience = { path = "crates/cuma-resilience", version = "0.1.0" }
+cuma-planner = { path = "crates/cuma-planner", version = "0.1.0" }
+cuma-orchestrator = { path = "crates/cuma-orchestrator", version = "0.1.0" }
+cuma-usage = { path = "crates/cuma-usage", version = "0.1.0" }
+cuma-persistence = { path = "crates/cuma-persistence", version = "0.1.0" }
+cuma-memory = { path = "crates/cuma-memory", version = "0.1.0" }
+cuma-skills = { path = "crates/cuma-skills", version = "0.1.0" }
+cuma-protocol-acp = { path = "crates/cuma-protocol-acp", version = "0.1.0" }
+cuma-protocol-a2a = { path = "crates/cuma-protocol-a2a", version = "0.1.0" }
+cuma-protocol-mcp = { path = "crates/cuma-protocol-mcp", version = "0.1.0" }
+cuma-testkit = { path = "crates/cuma-testkit", version = "0.1.0" }
+cuma-tui = { path = "crates/cuma-tui", version = "0.1.0" }
+cuma-server-acp = { path = "crates/cuma-server-acp", version = "0.1.0" }
+cuma-workspace = { path = "crates/cuma-workspace", version = "0.1.0" }
+cuma-providers = { path = "crates/cuma-providers", version = "0.1.0" }
+
+# --- runtime / async ---
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+
+# --- errors / logging ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# --- utilities ---
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+petgraph = "0.8"
+rand = "0.9"
+dirs = "6"
+shell-words = "1"
+which = "8"
+# `tempdir` is deprecated; `tempfile` is its maintained successor.
+tempfile = "3.27"
+
+# --- protocol SDKs (validated against crates.io index, see DEPENDENCY_ANALYSIS.md) ---
+agent-client-protocol = "2.0"
+rmcp = "3.1"
+
+# --- storage ---
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+
+# --- http (A2A adapter and server) ---
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "charset", "http2"] }
+
+# --- tui ---
+ratatui = "0.30"
+ratatui-tea = "0.2"
+# `event-stream` gives crossterm an async EventStream. Declared here rather
+# than relying on ratatui's re-export so the feature is actually enabled;
+# cargo unifies it with the copy ratatui-crossterm pulls in.
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio-stream = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"

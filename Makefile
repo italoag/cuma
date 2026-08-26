@@ -1,51 +1,42 @@
-BINARY   := cuma
-MODULE   := github.com/italoag/cuma
-VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS  := -ldflags "-s -w -X main.Version=$(VERSION)"
-BINDIR   := bin
+BINARY := cuma
 
-.PHONY: all build run test test-int lint docker clean oui-update fmt
+.PHONY: all build release run test cover lint fmt fmt-check check clean doc install legacy-build
 
-all: build
+all: check
 
 build:
-	CGO_ENABLED=1 go build $(LDFLAGS) -o $(BINDIR)/$(BINARY) ./cmd/cuma
+	cargo build --workspace
+
+release:
+	cargo build --release --workspace
 
 run: build
-	@if [ -f .env ]; then set -a && . ./.env && set +a; fi && ./$(BINDIR)/$(BINARY) --config configs/config.yaml
+	./target/debug/$(BINARY) $(ARGS)
 
 test:
-	go test ./internal/... -v -race -coverprofile=coverage.out
-
-test-int:
-	sudo go test ./... -v -tags integration -race
-
-cover: test
-	go tool cover -html=coverage.out
+	cargo test --workspace
 
 lint:
-	golangci-lint run ./...
+	cargo clippy --workspace --all-targets -- -D warnings
 
 fmt:
-	gofmt -w .
+	cargo fmt --all
 
-docker:
-	docker build -f deploy/Dockerfile -t cuma:$(VERSION) .
+fmt-check:
+	cargo fmt --all -- --check
 
-docker-run: docker
-	docker run --rm \
-		--cap-add=NET_RAW \
-		--cap-add=NET_ADMIN \
-		--network=host \
-		-e CUMA_AUTH_API_KEYS=dev-key \
-		-v $(PWD)/data:/data \
-		cuma:$(VERSION)
+# What CI runs, and what to run before pushing.
+check: fmt-check lint test
+
+doc:
+	cargo doc --workspace --no-deps --document-private-items
+
+install:
+	cargo install --path crates/cuma-cli
 
 clean:
-	rm -rf $(BINDIR)/ coverage.out
+	cargo clean
 
-oui-update:
-	bash scripts/fetch-oui.sh
-
-$(BINDIR):
-	mkdir -p $(BINDIR)
+# The previous Go product, preserved under legacy/ and still buildable.
+legacy-build:
+	cd legacy && go build ./...

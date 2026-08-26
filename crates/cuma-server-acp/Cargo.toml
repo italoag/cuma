@@ -1,0 +1,31 @@
+[package]
+name = "cuma-server-acp"
+description = "Exposes CUMA itself as an ACP agent, so an editor sees one agent and CUMA routes behind it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cuma-core.workspace = true
+cuma-orchestrator.workspace = true
+agent-client-protocol.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true
+futures.workspace = true
+cuma-config.workspace = true
+cuma-planner.workspace = true
+cuma-testkit.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

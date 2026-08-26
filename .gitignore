@@ -1,5 +1,20 @@
-bin/
-cuma.db
-*.db
-.env
-coverage.out
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# CUMA runtime state
+/.cuma/*.db
+/.cuma/*.db-wal
+/.cuma/*.db-shm
+
+# Legacy Go project
+/legacy/bin/
+/legacy/coverage.out
+/legacy/*.db
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

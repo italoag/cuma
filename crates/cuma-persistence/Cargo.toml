@@ -1,0 +1,22 @@
+[package]
+name = "cuma-persistence"
+description = "SQLite persistence for CUMA runtime state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cuma-core.workspace = true
+cuma-router.workspace = true
+cuma-usage.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
