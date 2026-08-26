@@ -328,10 +328,19 @@ impl Orchestrator {
     }
 
     /// Whether the workspace is under version control.
+    ///
+    /// Detects on first call rather than relying on a session having run.
+    /// `cuma doctor` asks this without executing anything, and reporting
+    /// "not a repository" merely because nothing had populated the cache
+    /// would tell the operator their work is unprotected when it is not.
     pub async fn is_git_repository(&self) -> bool {
-        self.git
-            .lock()
-            .await
+        let mut cached = self.git.lock().await;
+
+        if cached.is_none() {
+            *cached = Some(cuma_workspace::GitWorkspace::detect(&self.workspace).await);
+        }
+
+        cached
             .as_ref()
             .is_some_and(cuma_workspace::GitWorkspace::is_repository)
     }
