@@ -15,10 +15,12 @@
 //! declared permissions, origin, integrity and the shape of the manifest
 //! itself, and it downgrades trust on anything it cannot verify.
 
+mod creation;
 mod local;
 mod manager;
 mod validation;
 
+pub use creation::{CreationRefusal, GeneratedSkill, SkillFactory};
 pub use local::LocalSkillRegistry;
 pub use manager::{SkillManager, SkillOutcome};
 pub use validation::{ValidationReport, validate};

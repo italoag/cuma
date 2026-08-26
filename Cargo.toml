@@ -19,6 +19,7 @@ members = [
     "crates/cuma-tui",
     "crates/cuma-server-acp",
     "crates/cuma-workspace",
+    "crates/cuma-providers",
     "crates/cuma-cli",
 ]
 
@@ -50,6 +51,7 @@ cuma-testkit = { path = "crates/cuma-testkit", version = "0.1.0" }
 cuma-tui = { path = "crates/cuma-tui", version = "0.1.0" }
 cuma-server-acp = { path = "crates/cuma-server-acp", version = "0.1.0" }
 cuma-workspace = { path = "crates/cuma-workspace", version = "0.1.0" }
+cuma-providers = { path = "crates/cuma-providers", version = "0.1.0" }
 
 # --- runtime / async ---
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
@@ -87,7 +89,8 @@ rmcp = "3.1"
 # --- storage ---
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 
-# --- http (A2A native adapter) ---
+# --- http (A2A adapter and server) ---
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "charset", "http2"] }
 
 # --- tui ---

@@ -23,6 +23,8 @@
 
 mod card;
 mod client;
+mod server;
 
-pub use card::{AgentCard, AgentSkill, capabilities_from_card};
+pub use card::{AgentCard, AgentCardCapabilities, AgentSkill, capabilities_from_card};
 pub use client::{A2aAdapter, A2aDiscovery};
+pub use server::{agent_card, goal_from_params, handle_rpc, serve};

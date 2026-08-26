@@ -1,6 +1,6 @@
 [package]
-name = "cuma-protocol-a2a"
-description = "Agent2Agent adapter for CUMA: Agent Card discovery and task delegation"
+name = "cuma-providers"
+description = "Direct model access behind the LlmProvider port, for the harness's own reasoning"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,12 +17,8 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
-uuid.workspace = true
-axum.workspace = true
-cuma-orchestrator.workspace = true
 
 [dev-dependencies]
-cuma-planner.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]

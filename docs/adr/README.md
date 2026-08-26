@@ -15,3 +15,5 @@ decision without a stated cost is a decision that has not been thought through.
 | [008](ADR-008-skill-security.md) | Trust derived from evidence, never from a claim | Accepted |
 | [009](ADR-009-agent-isolation.md) | A process per execution; parallelism gated on isolation | Accepted |
 | [010](ADR-010-event-driven-runtime.md) | An event bus between the runtime and every interface | Accepted |
+| [011](ADR-011-workspace-isolation.md) | File ownership, not dependency order, gates parallelism | Accepted |
+| [012](ADR-012-bidirectional-protocols.md) | CUMA serves the same protocols it consumes | Accepted |

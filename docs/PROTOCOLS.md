@@ -91,6 +91,23 @@ An allowlist is the difference between "the agent can read the repository" and
 Tool results are untrusted data, truncated at 32,000 characters, and never
 interpreted as instructions.
 
+## Serving, not just consuming
+
+CUMA implements the agent role of both protocols it consumes.
+
+```bash
+cuma serve --protocol acp                      # stdio; an editor selects CUMA
+cuma serve --protocol a2a --bind 0.0.0.0:8420  # HTTP; peers delegate to CUMA
+```
+
+Both under-claim deliberately — an unimplemented capability is advertised
+`false` rather than claimed, because an editor that relies on a capability CUMA
+does not have fails worse than one that never asked. See
+[ADR-012](adr/ADR-012-bidirectional-protocols.md).
+
+The A2A Agent Card's advertised skills are derived from what CUMA's *registered
+agents* can actually do, so a peer routing to CUMA is not misled.
+
 ## Adding a protocol
 
 1. New crate, `cuma-protocol-<name>`.

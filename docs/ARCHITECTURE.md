@@ -48,6 +48,9 @@ cuma run "implement OAuth and fix the tests"
 | `cuma-protocol-acp` | ACP adapter | core, config, ACP SDK |
 | `cuma-protocol-a2a` | A2A adapter | core, config |
 | `cuma-protocol-mcp` | MCP tools | core, config, rmcp |
+| `cuma-server-acp` | CUMA *as* an ACP agent | core, orchestrator, ACP SDK |
+| `cuma-workspace` | Ownership, checkpoints, worktrees, sandbox, RTK | core, config |
+| `cuma-providers` | `LlmProvider` implementations, secret stores | core, config |
 | `cuma-testkit` | Mock agents | core |
 | `cuma-tui` | View model and rendering | core, orchestrator |
 | `cuma-cli` | Headless interface | everything |
@@ -76,3 +79,5 @@ cuma run "implement OAuth and fix the tests"
 | How does a task actually run? | `crates/cuma-orchestrator/src/executor.rs` |
 | What does an agent receive? | `crates/cuma-orchestrator/src/context.rs` |
 | How is ACP spoken? | `crates/cuma-protocol-acp/src/adapter.rs` |
+| How is CUMA *served* as an agent? | `crates/cuma-server-acp/src/lib.rs` |
+| What makes parallelism safe? | `crates/cuma-workspace/src/ownership.rs` |

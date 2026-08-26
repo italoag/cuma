@@ -15,7 +15,7 @@ ACP, A2A and MCP.
 ## Tech stack
 
 - Rust 2024 edition, MSRV 1.88
-- Cargo workspace, 17 crates
+- Cargo workspace, 20 crates
 - `tokio`, `serde`, `thiserror`, `tracing`, `clap`
 - `agent-client-protocol` 2.0 — the official ACP SDK
 - `rmcp` 3.1 — the official MCP SDK
@@ -26,7 +26,7 @@ ACP, A2A and MCP.
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 380 tests
+cargo test --workspace              # 564 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 
@@ -52,6 +52,9 @@ crates/
 ├── cuma-protocol-acp   ACP adapter
 ├── cuma-protocol-a2a   A2A adapter
 ├── cuma-protocol-mcp   MCP tools
+├── cuma-server-acp     CUMA *as* an ACP agent
+├── cuma-workspace      isolation, checkpoints, sandbox, RTK
+├── cuma-providers      LlmProvider implementations, secret stores
 ├── cuma-testkit        mock agents
 ├── cuma-tui            view model and rendering
 └── cuma-cli            headless interface
@@ -77,7 +80,15 @@ pricing is unknown.
 **Retries are bounded.** No configuration may produce an infinite loop.
 
 **Defaults deny.** Destructive operations off, skill creation off, sandbox on,
-auto-install `trusted-only`.
+auto-install `trusted-only`. A *generated* skill is always `Untrusted`,
+whatever it claims and whatever policy is set.
+
+**Dependency independence is not workspace independence.** Two tasks with no
+edge between them can both write the same file. `OwnershipLedger` gates the
+ready set; prediction is pessimistic on purpose.
+
+**Advertise only what is implemented.** When CUMA serves ACP or A2A, an
+unimplemented capability is reported `false` rather than claimed.
 
 **Everything from outside is data, never instructions.** Agent output, tool
 results, Agent Cards, skill manifests, repository contents.
@@ -140,6 +151,8 @@ Full reference: `docs/CONFIGURATION.md`.
 ```bash
 cuma run "<goal>"          # plan, route, execute
 cuma explain "<goal>"      # plan and route without executing
+cuma serve --protocol acp  # be an agent an editor can select
+cuma serve --protocol a2a  # be an agent other systems can delegate to
 cuma agents list           # health and capabilities
 cuma usage                 # tokens, cost, outcomes
 cuma doctor                # check the installation
@@ -177,6 +190,6 @@ and what was done about it.
 
 `docs/ARCHITECTURE.md`, `PROTOCOLS.md`, `ROUTING.md`, `ORCHESTRATION.md`,
 `MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `OBSERVABILITY.md`, `CONFIGURATION.md`,
-`DEVELOPMENT.md`, `ROADMAP.md`, and ten ADRs in `docs/adr/`.
+`DEVELOPMENT.md`, `ROADMAP.md`, and twelve ADRs in `docs/adr/`.
 
 `ROADMAP.md` distinguishes what is built from what is not. Keep it honest.

@@ -132,6 +132,9 @@ adapters automatically. Any command that speaks ACP over stdio works.
 | `cuma skills search \| inspect \| install` | Skills |
 | `cuma memory status \| search` | Long-term memory |
 | `cuma usage [--by-model]` | Tokens, cost, outcomes |
+| `cuma serve --protocol acp` | Be an agent an editor can select |
+| `cuma serve --protocol a2a` | Be an agent other systems can delegate to |
+| `cuma chat` | Interactive TUI |
 | `cuma doctor` | Check the installation |
 
 Every command takes `--json`, for CI and for other agents.
@@ -152,7 +155,7 @@ Every command takes `--json`, for CI and for other agents.
 | [Configuration](docs/CONFIGURATION.md) | Every setting |
 | [Development](docs/DEVELOPMENT.md) | Working on CUMA |
 | [Roadmap](docs/ROADMAP.md) | What is built and what is not |
-| [ADRs](docs/adr/) | Ten decisions, with their costs |
+| [ADRs](docs/adr/) | Twelve decisions, with their costs |
 
 On the transformation from the previous product:
 [current architecture](CURRENT_ARCHITECTURE.md) ·
@@ -160,15 +163,29 @@ On the transformation from the previous product:
 [dependency analysis](DEPENDENCY_ANALYSIS.md) ·
 [implementation plan](IMPLEMENTATION_PLAN.md)
 
+## Both directions
+
+CUMA consumes ACP and A2A agents. It is also one:
+
+```
+JetBrains / Zed ──ACP──> CUMA ──┬──ACP──> Codex
+another system  ──A2A──>        ├──ACP──> Claude Code
+                                └──A2A──> a remote reviewer
+```
+
+From the editor's side there is a single agent. Behind it is the whole routing
+apparatus.
+
 ## Status
 
-Early. The core works end to end: 380 tests, zero warnings, verified against a
-live ACP agent.
+564 tests, zero warnings. Verified against a live ACP agent, and against the
+real ACP client SDK driving CUMA as an agent.
 
-Not yet built: the TUI event loop, CUMA as an ACP server, safe parallel
-execution, RTK integration, skill creation. See the
-[roadmap](docs/ROADMAP.md) — it distinguishes what is done from what is not,
-rather than implying.
+Known gaps are listed in the [roadmap](docs/ROADMAP.md) — it distinguishes what
+is done from what is not, rather than implying. The main ones: skill signatures
+are checked for presence but not cryptographically verified, A2A is synchronous
+(no streaming or task lifecycle), and write prediction over-serializes tasks
+whose description names no paths.
 
 ## History
 

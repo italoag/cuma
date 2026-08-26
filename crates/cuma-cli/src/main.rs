@@ -67,9 +67,13 @@ enum Command {
     ///
     /// Logs go to stderr; stdout is the protocol channel.
     Serve {
-        /// Which protocol to serve.
+        /// Which protocol to serve: `acp` (stdio) or `a2a` (HTTP).
         #[arg(long, default_value = "acp")]
         protocol: String,
+
+        /// Address to bind, for `--protocol a2a`.
+        #[arg(long, default_value = "127.0.0.1:8420")]
+        bind: String,
     },
 
     /// Inspect and manage agents.
@@ -170,7 +174,9 @@ async fn run() -> Result<()> {
             commands::run_goal(config, workspace, &goal, true, cli.json).await
         }
         Some(Command::Chat) | None => commands::chat(config, workspace).await,
-        Some(Command::Serve { protocol }) => commands::serve(config, workspace, &protocol).await,
+        Some(Command::Serve { protocol, bind }) => {
+            commands::serve(config, workspace, &protocol, &bind).await
+        }
         Some(Command::Agents { action }) => commands::agents(config, action, cli.json).await,
         Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
         Some(Command::Skills { action }) => commands::skills(config, action, cli.json).await,

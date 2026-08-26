@@ -37,6 +37,9 @@ crates/
 ├── cuma-protocol-acp   ACP adapter
 ├── cuma-protocol-a2a   A2A adapter
 ├── cuma-protocol-mcp   MCP tools
+├── cuma-server-acp     CUMA as an ACP agent
+├── cuma-workspace      isolation, checkpoints, sandbox, RTK
+├── cuma-providers      LlmProvider implementations, secret stores
 ├── cuma-testkit        mock agents
 ├── cuma-tui            view model and rendering
 └── cuma-cli            headless interface

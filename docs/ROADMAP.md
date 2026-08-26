@@ -15,8 +15,8 @@
 | 7 — MCP | **Done** |
 | 8 — A2A | **Done** |
 | 9 — Skills | **Done** |
-| 10 — TUI | **Partial** — state machine and view functions done and tested; event loop outstanding |
-| 11 — Optimization | **Partial** — context trimming, usage and adaptive routing done; RTK outstanding |
+| 10 — TUI | **Done** |
+| 11 — Optimization | **Done** |
 
 ## Acceptance criteria
 
@@ -54,61 +54,29 @@ Against the product definition, stated honestly.
 | Architecture documentation | **Done** |
 | ADRs | **Done** |
 | CLI headless | **Done** |
-| **Safe parallel execution** | **Not done** — DAG computes the frontier; workspace isolation missing |
-| **TUI** | **Partial** |
-| **RTK integration** | **Not done** |
-| **Skill creation** | **Not done** |
+| Safe parallel execution | **Done** |
+| TUI | **Done** |
+| RTK integration | **Done** |
+| Skill creation | **Done** |
+| CUMA as an ACP agent | **Done** |
+| CUMA as an A2A agent | **Done** |
+| Sandboxing | **Done** |
+| Provider adapters | **Done** |
 
-## Next, in order
+## What is not built
 
-Ordered by what unblocks the most.
+Stated plainly rather than implied.
 
-### 1. TUI event loop
-
-The state machine (`cuma_tui::AppState`) and the view functions are written and
-tested without a terminal. What remains is the crossterm loop: subscribe, fold,
-draw, handle keys.
-
-*First because it is the only unfinished item whose design is already settled.*
-
-### 2. CUMA as an ACP server
-
-The primary architectural goal.
-
-```
-JetBrains / Zed ──ACP──> CUMA ──┬──ACP──> Codex
-                                ├──ACP──> Claude Code
-                                └──A2A──> remote architect
-```
-
-The client half works and the SDK supports the agent role. A new
-`cuma-server-acp` crate implementing `Agent` and forwarding to the orchestrator.
-
-### 3. Safe parallel execution
-
-Not a scheduling problem — a safety one. Dependency independence is not
-workspace independence. Needs git worktrees, file ownership tracking and merge
-coordination before `max_parallel_tasks` can mean anything.
-
-### 4. RTK integration
-
-Detect on `PATH`, wrap shell-heavy tool calls, record tokens saved. The
-configuration surface and the usage counter already exist.
-
-### 5. Provider adapters
-
-A concrete `LlmProvider` so `LlmPlanner` has something to call. In a
-`cuma-providers` crate, behind the port — never scattered through the domain.
-
-### 6. Sandbox enforcement
-
-`security.sandbox` is configured and unenforced. Wire `sandbox_command` into
-agent and skill execution.
-
-### 7. Skill creation
-
-Generate, test, validate, register. The highest-risk feature in the brief,
-deliberately last, gated behind `allow_creation = false` by default.
+| Gap | Consequence |
+|---|---|
+| **Skill signature verification** | Presence of a checksum and signature is checked; neither is cryptographically validated. `Verified` currently means "claims integrity metadata", not "integrity proven". |
+| **A2A streaming and task lifecycle** | `message/send` runs synchronously; `tasks/get` and `tasks/cancel` report that there is nothing to address afterwards. The Agent Card does not claim streaming. |
+| **ACP `session/load`** | No resume path, so a session cannot be restored mid-flight. Advertised as `false` rather than claimed. |
+| **Worktree-per-task execution** | Worktrees are implemented and tested; the orchestrator isolates by file ownership instead. Ownership is sufficient for correctness; worktrees would raise the achievable parallelism. |
+| **Write prediction quality** | Paths are guessed from a task's description, so an unpredictable task claims the whole workspace and over-serializes. Better prediction is the main lever on achievable parallelism. |
+| **Remote skill registries** | The `SkillRegistry` trait supports multiple backends; only built-in and local-directory registries exist. |
+| **OpenTelemetry export** | `tracing` is the substrate, so this is a subscriber change rather than an instrumentation change. |
+| **Benchmarks** | No measurements for routing, context selection or registry lookup. |
 
 ## Later
 

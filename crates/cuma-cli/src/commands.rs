@@ -305,7 +305,7 @@ pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
 }
 
 /// Serve CUMA itself as an agent.
-pub async fn serve(config: Config, workspace: PathBuf, protocol: &str) -> Result<()> {
+pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &str) -> Result<()> {
     let (orchestrator, warnings) = harness::build_orchestrator(config, workspace).await?;
 
     // Warnings go to stderr: stdout carries the protocol.
@@ -328,8 +328,19 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str) -> Result
             );
             cuma_server_acp::serve_stdio(orchestrator).await
         }
+        "a2a" => {
+            let address: std::net::SocketAddr = bind.parse().map_err(|err| {
+                MetaAgentError::Configuration(format!("cannot parse --bind {bind:?}: {err}"))
+            })?;
+
+            eprintln!(
+                "serving {} agents over A2A on http://{address}",
+                orchestrator.agents().len().await
+            );
+            cuma_protocol_a2a::serve(orchestrator, address, &format!("http://{address}")).await
+        }
         other => Err(MetaAgentError::Configuration(format!(
-            "cannot serve protocol {other:?}; only \"acp\" is supported"
+            "cannot serve protocol {other:?}; expected \"acp\" or \"a2a\""
         ))),
     }
 }

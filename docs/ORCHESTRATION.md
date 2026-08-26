@@ -145,10 +145,41 @@ adapters. An adapter that ignores its timeout must not be able to hang a session
 
 ## Parallelism
 
-`ready_tasks()` computes the frontier correctly, and the orchestrator runs it
-**sequentially**.
+`ready_tasks()` computes the dependency frontier; an `OwnershipLedger` decides
+which of it may actually run together.
 
-Not a scheduling limitation — a safety one. Dependency independence is not
-workspace independence: two tasks with no edge between them can both edit the
-same file. Enabling parallelism requires git worktrees, file ownership tracking
-and merge coordination first. See [ADR-009](adr/ADR-009-agent-isolation.md).
+The distinction that matters: **dependency independence is not workspace
+independence.** Two tasks with no edge between them can both edit
+`src/auth.rs`, and whichever writes second silently discards the other's work.
+
+- Writing tasks claim the paths they will write, on **prefixes** — a task
+  owning `src/auth/` conflicts with one owning `src/auth/token.rs`.
+- A conflicting task is **deferred**, not failed: it runs in a later wave.
+- Prediction is **pessimistic**. A description naming no paths claims the whole
+  workspace. A false serialization costs latency; a false parallelization costs
+  the user's work.
+- Read-only tasks never contend.
+- `max_parallel_tasks` bounds the wave.
+
+Claims are released when a task reaches a terminal state, successful or not —
+a failed task that kept its claims would lock those paths for the session.
+
+See [ADR-011](adr/ADR-011-workspace-isolation.md).
+
+## Workspace safety
+
+Before anything writes, CUMA detects the repository and — under
+`security.checkpoint_before_write` — saves the working tree with
+`git stash create`, which writes a recoverable commit **without** touching the
+tree. A checkpoint that reverted the tree would change the task the agent was
+given.
+
+Commands agents run are screened, then wrapped:
+
+```
+screen (refuse destructive) ──> RTK (filter output) ──> sandbox (confine)
+```
+
+The order matters. Screening first means a refused command is never wrapped or
+spawned; RTK before the sandbox means the sandbox confines the whole pipeline
+rather than RTK escaping it.

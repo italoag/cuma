@@ -118,7 +118,22 @@ pub async fn build_orchestrator(
 ) -> Result<(Orchestrator, Vec<String>)> {
     let mut warnings = Vec::new();
 
-    let planner = Arc::new(HeuristicPlanner::new());
+    // --- planner ----------------------------------------------------------
+    // A configured LLM provider upgrades the planner from keyword matching to
+    // model-assisted decomposition. `LlmPlanner` falls back to the heuristic
+    // one on any failure, so this is strictly additive.
+    let secrets: Arc<dyn cuma_core::ports::SecretStore> =
+        Arc::new(cuma_providers::EnvSecretStore::new());
+    let providers = cuma_providers::from_config(&config, Arc::clone(&secrets));
+
+    let planner: Arc<dyn cuma_core::ports::Planner> = match providers.into_iter().next() {
+        Some(provider) => {
+            tracing::info!(provider = provider.name(), "using model-assisted planning");
+            Arc::new(cuma_planner::LlmPlanner::new(provider))
+        }
+        None => Arc::new(HeuristicPlanner::new()),
+    };
+
     let mut orchestrator = Orchestrator::new(config.clone(), planner, workspace.clone());
 
     // --- ACP agents -------------------------------------------------------

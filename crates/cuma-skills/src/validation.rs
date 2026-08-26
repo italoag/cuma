@@ -135,7 +135,14 @@ pub fn validate(manifest: &SkillManifest) -> ValidationReport {
 
     // --- origin -----------------------------------------------------------
     let source = manifest.source.trim().to_ascii_lowercase();
-    let origin_is_local = source.starts_with("builtin:") || source.starts_with("file:");
+
+    // A `generated:` skill was written by the harness itself and never crossed
+    // a network, so "was it fetched over TLS" is the wrong question for it.
+    // It is local in origin and, separately, the least trustworthy thing in
+    // the system — see the trust derivation below.
+    let origin_is_generated = source.starts_with("generated:");
+    let origin_is_local =
+        source.starts_with("builtin:") || source.starts_with("file:") || origin_is_generated;
     let origin_is_secure =
         origin_is_local || source.starts_with("https://") || source.starts_with("git+https://");
 
@@ -148,7 +155,12 @@ pub fn validate(manifest: &SkillManifest) -> ValidationReport {
 
     // --- derive the trust level ------------------------------------------
     // Trust is earned by verifiable evidence, in this order.
-    let derived = if source.starts_with("builtin:") {
+    let derived = if origin_is_generated {
+        // Checked before everything else: a skill the harness wrote for itself
+        // is never evidence of its own trustworthiness, however it is signed
+        // or wherever it claims to come from.
+        TrustLevel::Untrusted
+    } else if source.starts_with("builtin:") {
         TrustLevel::Trusted
     } else if has_signature && has_checksum {
         TrustLevel::Verified
@@ -365,6 +377,41 @@ mod tests {
         assert!(may_auto_install(TrustLevel::Trusted, Policy));
         assert!(may_auto_install(TrustLevel::Verified, Policy));
         assert!(!may_auto_install(TrustLevel::Community, Policy));
+    }
+
+    #[test]
+    fn a_generated_skill_is_local_in_origin_but_never_trusted() {
+        // It never crossed a network, so TLS is the wrong question — and it is
+        // still the least trustworthy thing in the system.
+        let mut m = manifest("generated:anthropic");
+        m.trust = TrustLevel::Trusted; // claimed, and ignored
+
+        let report = validate(&m);
+        assert!(report.permitted, "blockers: {:?}", report.blockers);
+        assert_eq!(report.trust, TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn a_generated_skill_stays_untrusted_even_when_signed() {
+        let mut m = manifest("generated:anthropic");
+        m.checksum = Some("sha256:abc".into());
+        m.signature = Some("ed25519:def".into());
+
+        assert_eq!(validate(&m).trust, TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn a_generated_skill_never_clears_any_auto_install_bar() {
+        for policy in [
+            cuma_config::SkillAutoInstall::Never,
+            cuma_config::SkillAutoInstall::TrustedOnly,
+            cuma_config::SkillAutoInstall::Verified,
+        ] {
+            assert!(
+                !may_auto_install(validate(&manifest("generated:x")).trust, policy),
+                "a generated skill must always need explicit approval"
+            );
+        }
     }
 
     #[test]
