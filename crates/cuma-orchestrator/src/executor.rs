@@ -83,12 +83,19 @@ pub struct Orchestrator {
     usage: Arc<Mutex<UsageTracker>>,
     history: Arc<Mutex<RoutingHistory>>,
     workspace: PathBuf,
+    ownership: cuma_workspace::OwnershipLedger,
+    command_guard: cuma_workspace::CommandGuard,
+    sandbox: cuma_workspace::Sandbox,
+    rtk: cuma_workspace::Rtk,
+    git: Arc<Mutex<Option<cuma_workspace::GitWorkspace>>>,
 }
 
 impl Orchestrator {
     /// Build an orchestrator.
     pub fn new(config: Config, planner: Arc<dyn Planner>, workspace: PathBuf) -> Self {
         let retry_policy = RetryPolicy::with_max_attempts(config.limits.max_retries.max(1) + 1);
+        let security = config.security.clone();
+        let rtk_config = config.rtk.clone();
 
         Self {
             config,
@@ -103,6 +110,11 @@ impl Orchestrator {
             events: EventBus::default(),
             usage: Arc::new(Mutex::new(UsageTracker::new())),
             history: Arc::new(Mutex::new(RoutingHistory::new())),
+            ownership: cuma_workspace::OwnershipLedger::new(),
+            command_guard: cuma_workspace::CommandGuard::new(&security),
+            sandbox: cuma_workspace::Sandbox::detect(&security),
+            rtk: cuma_workspace::Rtk::detect(&rtk_config),
+            git: Arc::new(Mutex::new(None)),
             workspace,
         }
     }
@@ -188,6 +200,9 @@ impl Orchestrator {
             },
         ));
 
+        // Protect the user's uncommitted work before anything writes.
+        self.prepare_workspace(&session_id).await;
+
         let graph = self.plan(goal).await?;
 
         self.events.publish(Event::session(
@@ -223,6 +238,102 @@ impl Orchestrator {
             spent_usd: spent,
             summary,
         })
+    }
+
+    /// Detect the repository and, if policy asks, checkpoint the working tree.
+    ///
+    /// Best effort by design: not being in a git repository, or git being
+    /// unavailable, must not stop a session. It only means the safety net is
+    /// absent, which the user is told about rather than left to discover.
+    async fn prepare_workspace(&self, session_id: &SessionId) {
+        let git = cuma_workspace::GitWorkspace::detect(&self.workspace).await;
+
+        if !git.is_repository() {
+            tracing::warn!(
+                workspace = %self.workspace.display(),
+                "not a git repository; agents' changes will not be recoverable from a checkpoint"
+            );
+            if let Ok(mut guard) = self.git.try_lock() {
+                *guard = Some(git);
+            }
+            return;
+        }
+
+        if self.config.security.checkpoint_before_write {
+            match git.checkpoint(&format!("cuma-{session_id}")).await {
+                Ok(checkpoint) if checkpoint.had_changes => {
+                    tracing::info!(
+                        commit = checkpoint.commit,
+                        restore = checkpoint.restore_hint(),
+                        "checkpointed uncommitted work"
+                    );
+                }
+                Ok(_) => {
+                    tracing::debug!("working tree is clean; HEAD is the recovery point");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not checkpoint the working tree");
+                }
+            }
+        }
+
+        if let Ok(mut guard) = self.git.try_lock() {
+            *guard = Some(git);
+        }
+    }
+
+    /// Prepare a shell command for execution: screen it, wrap it with RTK if
+    /// that will reduce its output, then confine it if a sandbox is available.
+    ///
+    /// The order matters. Screening first means a refused command is never
+    /// wrapped or spawned. RTK before the sandbox means the sandbox confines
+    /// the whole pipeline including RTK itself, rather than RTK escaping it.
+    ///
+    /// Returns the refusal reason when the command is not permitted.
+    pub fn prepare_command(&self, command: &str) -> std::result::Result<String, String> {
+        match self.command_guard.screen(command) {
+            cuma_workspace::CommandVerdict::Allow => {}
+            cuma_workspace::CommandVerdict::Deny { reason } => return Err(reason),
+        }
+
+        let optimized = self.rtk.wrap(command);
+        Ok(self.sandbox.wrap(&optimized, &self.workspace))
+    }
+
+    /// What sandboxing is doing, for `cuma doctor`.
+    pub fn sandbox_status(&self) -> &cuma_workspace::SandboxStatus {
+        self.sandbox.status()
+    }
+
+    /// What RTK is doing, for `cuma doctor`.
+    pub fn rtk_status(&self) -> &cuma_workspace::RtkStatus {
+        self.rtk.status()
+    }
+
+    /// Record tokens RTK kept out of an agent's context.
+    pub async fn record_rtk_saving(&self, saving: cuma_workspace::Saving) {
+        let saved = saving.tokens_saved();
+        if saved > 0 {
+            self.usage.lock().await.record_rtk_saving(saved);
+        }
+    }
+
+    /// Screen a shell command an agent wants to run.
+    ///
+    /// Exposed so an adapter that mediates tool calls can consult the same
+    /// policy the orchestrator enforces, rather than each adapter inventing
+    /// its own idea of what is destructive.
+    pub fn screen_command(&self, command: &str) -> cuma_workspace::CommandVerdict {
+        self.command_guard.screen(command)
+    }
+
+    /// Whether the workspace is under version control.
+    pub async fn is_git_repository(&self) -> bool {
+        self.git
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(cuma_workspace::GitWorkspace::is_repository)
     }
 
     /// Produce a plan without executing it.
@@ -298,13 +409,54 @@ impl Orchestrator {
                 break;
             }
 
-            // Tasks in one wave are dependency-independent, so they could run
-            // concurrently. They are run sequentially here because concurrent
-            // writers to one workspace corrupt each other, and workspace
-            // isolation (git worktrees, file ownership) is the mechanism that
-            // makes real parallelism safe. See docs/ORCHESTRATION.md.
+            // Dependency independence is not workspace independence: two tasks
+            // with no edge between them can both write `src/auth.rs`. The
+            // ownership ledger decides which of the ready set may actually run
+            // together; everything it refuses waits for the next wave.
+            let ready = self.admit_concurrently(&graph, ready);
+
+            // Everything admitted writes somewhere nothing else in this wave
+            // writes, so it can run concurrently. `execute_task` needs `&mut
+            // TaskGraph`, so each task runs against a clone of the graph and
+            // the results are folded back in afterwards — the alternative is
+            // a lock the whole wave contends on.
+            let mut running = Vec::new();
+
             for task_id in ready {
-                let outcome = self.execute_task(session_id, &mut graph, &task_id).await;
+                let mut task_graph = graph.clone();
+                let session = session_id.clone();
+
+                running.push(async move {
+                    let outcome = self.execute_task(&session, &mut task_graph, &task_id).await;
+                    (task_id, task_graph, outcome)
+                });
+            }
+
+            let results: Vec<(TaskId, TaskGraph, Result<bool>)> =
+                futures::future::join_all(running).await;
+
+            // Re-planning replaces the graph wholesale, so it can only be
+            // honoured when the task that asked for it ran alone.
+            let ran_alone = results.len() == 1;
+
+            for (task_id, task_graph, outcome) in results {
+                // A task that failed must release its claims too, or its
+                // paths stay locked for the rest of the session.
+                self.ownership.release(&task_id);
+
+                // Fold the task's own row back in. Only the executing task's
+                // row is taken, so two concurrent tasks cannot clobber each
+                // other's status by writing back a whole stale graph.
+                if let Some(executed) = task_graph.get(&task_id).cloned()
+                    && let Some(target) = graph.get_mut(&task_id)
+                {
+                    *target = executed;
+                }
+
+                if task_graph.len() != graph.len() && ran_alone {
+                    graph = task_graph;
+                    continue;
+                }
 
                 match outcome {
                     Ok(true) => {}
@@ -329,6 +481,42 @@ impl Orchestrator {
         }
 
         Ok(graph)
+    }
+
+    /// Narrow a dependency-ready set to those that may safely run together.
+    ///
+    /// Claims are taken here and released when each task reaches a terminal
+    /// state. A task whose paths are already claimed is dropped from this wave
+    /// rather than failed — it becomes ready again once the holder finishes.
+    fn admit_concurrently(&self, graph: &TaskGraph, ready: Vec<TaskId>) -> Vec<TaskId> {
+        let mut admitted = Vec::new();
+
+        for task_id in ready {
+            let Some(task) = graph.get(&task_id) else {
+                continue;
+            };
+
+            // Read-only work cannot corrupt anything, so it never contends.
+            if task.spec.risk == cuma_core::Risk::ReadOnly {
+                admitted.push(task_id);
+                continue;
+            }
+
+            let paths = cuma_workspace::ownership::predicted_writes(&task.spec.description);
+
+            match self.ownership.claim(&task_id, &paths) {
+                Ok(()) => admitted.push(task_id),
+                Err(conflict) => {
+                    tracing::debug!(
+                        task = %task_id,
+                        conflict = %conflict,
+                        "deferring a task that would write where another is writing"
+                    );
+                }
+            }
+        }
+
+        admitted
     }
 
     /// Run one task through route → execute → classify → react, until it

@@ -1,0 +1,26 @@
+[package]
+name = "cuma-workspace"
+description = "Workspace isolation and safety: git worktrees, checkpoints, file ownership"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cuma-core.workspace = true
+cuma-config.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "process", "fs", "time", "rt"] }
+tracing.workspace = true
+serde.workspace = true
+chrono.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -810,10 +810,42 @@ pub async fn doctor(
         notes.push("memory: disabled".to_owned());
     }
 
+    // --- workspace safety -------------------------------------------------
+    if orchestrator.is_git_repository().await {
+        notes.push(format!(
+            "workspace: git repository{}",
+            if config.security.checkpoint_before_write {
+                ", checkpointing before writes"
+            } else {
+                ", NOT checkpointing (security.checkpoint_before_write is off)"
+            }
+        ));
+    } else {
+        problems.push(
+            "workspace is not a git repository; agents' changes will not be recoverable".to_owned(),
+        );
+    }
+
+    // --- sandbox and RTK --------------------------------------------------
+    let sandbox = orchestrator.sandbox_status();
+    if sandbox.is_active() || matches!(sandbox, cuma_workspace::SandboxStatus::Disabled) {
+        notes.push(sandbox.describe());
+    } else {
+        // Requested but unavailable is exactly the case an operator must not
+        // discover by having something escape.
+        problems.push(sandbox.describe());
+    }
+
+    let rtk = orchestrator.rtk_status();
+    if rtk.is_fatal() {
+        problems.push(rtk.describe());
+    } else {
+        notes.push(rtk.describe());
+    }
+
     // --- security ---------------------------------------------------------
     notes.push(format!(
-        "security: sandbox={}, destructive operations {}",
-        config.security.sandbox,
+        "security: destructive operations {}",
         if config.security.allow_destructive_operations {
             "ALLOWED"
         } else {

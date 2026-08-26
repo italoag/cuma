@@ -651,6 +651,7 @@ dependencies = [
  "cuma-testkit",
  "cuma-tui",
  "cuma-usage",
+ "cuma-workspace",
  "serde",
  "serde_json",
  "tokio",
@@ -716,6 +717,8 @@ dependencies = [
  "cuma-router",
  "cuma-testkit",
  "cuma-usage",
+ "cuma-workspace",
+ "futures",
  "rand 0.9.5",
  "serde",
  "tokio",
@@ -898,6 +901,21 @@ dependencies = [
  "cuma-core",
  "serde",
  "tracing",
+]
+
+[[package]]
+name = "cuma-workspace"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cuma-config",
+ "cuma-core",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "which",
 ]
 
 [[package]]
@@ -3423,6 +3441,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
