@@ -5,9 +5,7 @@ use crate::output::{Table, USAGE_HEADERS, render_tokens, usage_row};
 use clap::Subcommand;
 use cuma_config::Config;
 use cuma_core::error::{MetaAgentError, Result};
-use cuma_core::ports::SkillRegistry;
 use cuma_core::{AgentId, EventKind, SkillId};
-use cuma_skills::{LocalSkillRegistry, SkillManager};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,23 +33,67 @@ pub enum ModelAction {
 /// Skill subcommands.
 #[derive(Subcommand)]
 pub enum SkillAction {
-    /// Search for skills.
+    /// Search every configured registry.
     Search {
         /// What to search for.
         query: Vec<String>,
     },
-    /// Show what a skill declares, and what validation makes of it.
+    /// Fetch and verify a skill without installing it, and show the result.
     Inspect {
         /// The skill's id.
         id: String,
     },
-    /// Install a skill after validating it.
+    /// Install a skill after verifying it. The skill is enabled.
     Install {
         /// The skill's id.
         id: String,
     },
     /// List installed skills.
     List,
+    /// Uninstall a skill and delete its files.
+    Remove {
+        /// The skill's id.
+        id: String,
+    },
+    /// Let a skill's instructions guide agents again.
+    Enable {
+        /// The skill's id.
+        id: String,
+    },
+    /// Stop a skill's instructions reaching agents, without uninstalling it.
+    Disable {
+        /// The skill's id.
+        id: String,
+    },
+    /// Re-fetch installed skills and install what changed, verified again.
+    Update {
+        /// Only this skill.
+        id: Option<String>,
+    },
+    /// Generate a skill for a capability (needs `skills.allow_creation` and a
+    /// provider). It is installed disabled and untrusted.
+    Create {
+        /// The capability it should provide.
+        capability: String,
+    },
+    /// Compute a skill directory's digest and check its signature.
+    Verify {
+        /// The skill package directory.
+        dir: PathBuf,
+    },
+    /// Sign a skill directory (writes `skill.sig`) — for publishers.
+    Sign {
+        /// The skill package directory.
+        dir: PathBuf,
+        /// The key id to put in the signature.
+        #[arg(long)]
+        key_id: String,
+        /// File holding the base64 secret key, as `keygen` prints it.
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// Generate a signing key pair — for publishers.
+    Keygen,
 }
 
 /// MCP subcommands.
@@ -523,9 +565,94 @@ pub async fn models(config: Config, action: ModelAction, json: bool) -> Result<(
 }
 
 /// Skill subcommands.
-pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<()> {
-    let registry = Arc::new(LocalSkillRegistry::new());
-    let manager = SkillManager::new(config.skills.clone(), vec![registry.clone()]);
+pub async fn skills(
+    config: Config,
+    workspace: PathBuf,
+    action: SkillAction,
+    json: bool,
+) -> Result<()> {
+    use base64::Engine;
+    use cuma_skills::integrity;
+
+    // The publisher-side commands need no manager.
+    match &action {
+        SkillAction::Keygen => {
+            let secret: [u8; 32] = rand::random();
+            let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+            let secret = base64::engine::general_purpose::STANDARD.encode(secret);
+            let public = integrity::public_key(&key);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "secret_key": secret, "public_key": public })
+                );
+            } else {
+                println!("secret key (keep it private): {secret}");
+                println!("public key:                   {public}");
+                println!(
+                    "\nConsumers trust it with:\n  [skills.trusted_keys]\n  <your-key-id> = \"{public}\""
+                );
+            }
+            return Ok(());
+        }
+        SkillAction::Sign {
+            dir,
+            key_id,
+            key_file,
+        } => {
+            let encoded = std::fs::read_to_string(key_file).map_err(|err| {
+                MetaAgentError::Configuration(format!("cannot read {}: {err}", key_file.display()))
+            })?;
+            let secret: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
+                    MetaAgentError::Configuration(
+                        "the key file does not hold a base64 32-byte key".to_owned(),
+                    )
+                })?;
+            let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+            let digest = integrity::content_digest(dir)?;
+            let line = integrity::sign(&digest, key_id, &key);
+            std::fs::write(dir.join(integrity::SIGNATURE_FILE), format!("{line}\n")).map_err(
+                |err| MetaAgentError::Skill(format!("cannot write the signature: {err}")),
+            )?;
+            println!("signed {digest} as {key_id}");
+            return Ok(());
+        }
+        SkillAction::Verify { dir } => {
+            let keys = integrity::TrustedKeys::from_config(&config.skills.trusted_keys)?;
+            let evidence = integrity::Evidence::gather(dir, None, &keys)?;
+            let manifest = cuma_skills::package::read_package(dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": manifest.id.as_str(),
+                        "digest": evidence.digest,
+                        "signature": format!("{:?}", evidence.signature),
+                    })
+                );
+            } else {
+                println!("{} ({})", manifest.name, manifest.id);
+                println!("  digest:    {}", evidence.digest.as_deref().unwrap_or("-"));
+                println!(
+                    "  signature: {:?}",
+                    evidence
+                        .signature
+                        .unwrap_or(integrity::SignatureCheck::Absent)
+                );
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let (manager, warnings) = cuma_skills::from_config(&config.skills, &workspace)?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
 
     match action {
         SkillAction::Search { query } => {
@@ -539,39 +666,37 @@ pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<(
                 );
                 return Ok(());
             }
-
             if found.is_empty() {
                 println!("No skills matched {query:?}.");
                 return Ok(());
             }
 
-            let mut table = Table::new(&["Skill", "Trust", "Capabilities", "Description"]);
+            // Search results are not verified yet; `inspect` fetches and
+            // checks them.
+            let mut table = Table::new(&["Skill", "Source", "Capabilities", "Description"]);
             for skill in found {
                 let capabilities: Vec<String> =
                     skill.capabilities.iter().map(ToString::to_string).collect();
                 table.row(vec![
                     skill.id.to_string(),
-                    format!("{:?}", skill.trust),
+                    skill.source,
                     capabilities.join(", "),
                     skill.description,
                 ]);
             }
-
             println!("{}", table.render());
             Ok(())
         }
 
         SkillAction::Inspect { id } => {
-            let manifest = registry.inspect(&SkillId::new(id)).await?;
-            let report = cuma_skills::validate(&manifest);
+            let (manifest, report) = manager.preview(&SkillId::new(id)).await?;
 
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "manifest": manifest,
-                        "validation": report,
-                    }))
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "manifest": manifest, "validation": report })
+                    )
                     .unwrap_or_default()
                 );
                 return Ok(());
@@ -591,20 +716,146 @@ pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<(
 
         SkillAction::Install { id } => {
             let installed = manager.install(&SkillId::new(id)).await?;
-            println!("installed {} ({:?} trust)", installed.id, installed.trust);
+            println!(
+                "installed {} ({:?}{}){}",
+                installed.manifest.id,
+                installed.manifest.trust,
+                installed
+                    .signed_by
+                    .as_ref()
+                    .map_or(String::new(), |k| format!(", signed by {k}")),
+                if installed.enabled {
+                    ""
+                } else {
+                    " — disabled"
+                }
+            );
             Ok(())
         }
 
         SkillAction::List => {
             let installed = manager.installed().await;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&installed).unwrap_or_default()
+                );
+                return Ok(());
+            }
             if installed.is_empty() {
                 println!("No skills are installed.");
+                return Ok(());
             }
+            let mut table = Table::new(&["Skill", "Trust", "Enabled", "Registry", "Digest"]);
             for skill in installed {
-                println!("  {} ({:?})", skill.id, skill.trust);
+                table.row(vec![
+                    skill.manifest.id.to_string(),
+                    format!("{:?}", skill.manifest.trust),
+                    skill.enabled.to_string(),
+                    skill.registry,
+                    skill
+                        .digest
+                        .map_or("-".to_owned(), |d| d.chars().take(19).collect()),
+                ]);
+            }
+            println!("{}", table.render());
+            Ok(())
+        }
+
+        SkillAction::Remove { id } => {
+            if manager.remove(&SkillId::new(id.clone())).await? {
+                println!("removed {id}");
+                Ok(())
+            } else {
+                Err(MetaAgentError::Skill(format!("{id} is not installed")))
+            }
+        }
+
+        SkillAction::Enable { id } => toggle(&manager, &id, true).await,
+        SkillAction::Disable { id } => toggle(&manager, &id, false).await,
+
+        SkillAction::Update { id } => {
+            let only = id.map(SkillId::new);
+            let outcomes = manager.update(only.as_ref()).await;
+            if json {
+                let rows: Vec<_> = outcomes
+                    .iter()
+                    .map(|(id, outcome)| serde_json::json!({ "id": id.as_str(), "outcome": outcome }))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rows).unwrap_or_default()
+                );
+                return Ok(());
+            }
+            if outcomes.is_empty() {
+                println!("Nothing to update.");
+            }
+            for (id, outcome) in outcomes {
+                match outcome {
+                    cuma_skills::UpdateOutcome::Unchanged => println!("  {id}: up to date"),
+                    cuma_skills::UpdateOutcome::Updated { disabled, .. } => println!(
+                        "  {id}: updated{}",
+                        if disabled {
+                            " — disabled, its trust fell"
+                        } else {
+                            ""
+                        }
+                    ),
+                    cuma_skills::UpdateOutcome::Refused { blockers } => {
+                        println!(
+                            "  {id}: REFUSED, kept the installed version: {}",
+                            blockers.join("; ")
+                        );
+                    }
+                    cuma_skills::UpdateOutcome::Unavailable { reason } => {
+                        println!("  {id}: unavailable: {reason}")
+                    }
+                }
             }
             Ok(())
         }
+
+        SkillAction::Create { capability } => {
+            let secrets: Arc<dyn cuma_core::ports::SecretStore> =
+                Arc::new(cuma_providers::EnvSecretStore::new());
+            let provider = cuma_providers::from_config(&config, secrets)
+                .into_iter()
+                .next();
+            let factory = match provider {
+                Some(provider) => {
+                    cuma_skills::SkillFactory::new(provider, config.skills.allow_creation)
+                }
+                None => cuma_skills::SkillFactory::disabled(),
+            };
+            let capability = cuma_core::Capability::parse(&capability);
+            match factory.create(&capability).await? {
+                Ok(generated) => {
+                    let installed = manager.install_generated(&generated).await?;
+                    println!(
+                        "generated {} for {capability}; installed DISABLED and Untrusted — review {} before relying on it",
+                        installed.manifest.id,
+                        manager.install_dir().map_or_else(String::new, |d| d
+                            .join(installed.manifest.id.as_str())
+                            .display()
+                            .to_string())
+                    );
+                    Ok(())
+                }
+                Err(refusal) => Err(MetaAgentError::Skill(refusal.explain())),
+            }
+        }
+
+        SkillAction::Keygen | SkillAction::Sign { .. } | SkillAction::Verify { .. } => Ok(()),
+    }
+}
+
+async fn toggle(manager: &cuma_skills::SkillManager, id: &str, enabled: bool) -> Result<()> {
+    if manager.set_enabled(&SkillId::new(id), enabled).await? {
+        println!("{} {id}", if enabled { "enabled" } else { "disabled" });
+        Ok(())
+    } else {
+        Err(MetaAgentError::Skill(format!("{id} is not installed")))
     }
 }
 

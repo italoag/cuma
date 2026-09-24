@@ -426,12 +426,17 @@ pub struct SkillsConfig {
     pub enabled: bool,
     /// Auto-installation policy.
     pub auto_install: SkillAutoInstall,
-    /// Registries to search, in order.
+    /// Registries to search, in order: `builtin`, `local` (skill packages
+    /// under `.cuma/skill-sources`), `git+https://…` repositories, and
+    /// `https://…` JSON indexes.
     pub registries: Vec<String>,
     /// Where installed skills live.
     pub install_dir: Option<String>,
     /// Whether the harness may generate a skill that does not exist.
     pub allow_creation: bool,
+    /// Ed25519 public keys (base64) whose signatures make a skill `Trusted`,
+    /// by the key id publishers name in `skill.sig`.
+    pub trusted_keys: BTreeMap<String, String>,
 }
 
 impl Default for SkillsConfig {
@@ -444,6 +449,7 @@ impl Default for SkillsConfig {
             // Generating and running new code unprompted is the highest-risk
             // thing the harness can do, so it is opt-in.
             allow_creation: false,
+            trusted_keys: BTreeMap::new(),
         }
     }
 }

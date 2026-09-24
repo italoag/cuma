@@ -108,6 +108,11 @@ impl Config {
         merge_option!(self.rtk.binary, other.rtk.binary);
 
         // --- skills -------------------------------------------------------
+        // Keyed like agents: a project may add a publisher's key without
+        // dropping the user's.
+        for (name, key) in other.skills.trusted_keys {
+            self.skills.trusted_keys.insert(name, key);
+        }
         merge_field!(self.skills.enabled, other.skills.enabled, d.skills.enabled);
         merge_field!(
             self.skills.auto_install,

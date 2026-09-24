@@ -261,6 +261,17 @@ pub async fn build_orchestrator(
     }
     let mut orchestrator = orchestrator.with_memory(memory);
 
+    // --- skills -----------------------------------------------------------
+    if config.skills.enabled {
+        match cuma_skills::from_config(&config.skills, &workspace) {
+            Ok((skills, skill_warnings)) => {
+                warnings.extend(skill_warnings);
+                orchestrator = orchestrator.with_skill_guidance(Arc::new(skills));
+            }
+            Err(err) => warnings.push(format!("skills are unavailable: {err}")),
+        }
+    }
+
     // --- runtime database -------------------------------------------------
     // A fresh process should route with everything previous sessions learned,
     // and every session — whichever front end started it — is recorded as it

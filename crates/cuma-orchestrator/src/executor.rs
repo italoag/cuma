@@ -94,6 +94,7 @@ pub struct Orchestrator {
     context_manager: Arc<dyn ContextManager>,
     memory: Option<Arc<dyn MemoryStore>>,
     recorder: Option<Arc<dyn crate::SessionRecorder>>,
+    skills: Option<Arc<dyn cuma_core::ports::SkillGuidance>>,
     events: EventBus,
     usage: Arc<Mutex<UsageTracker>>,
     history: Arc<Mutex<RoutingHistory>>,
@@ -132,6 +133,7 @@ impl Orchestrator {
             context_manager: Arc::new(MinimalContextManager::new()),
             memory: None,
             recorder: None,
+            skills: None,
             events: EventBus::default(),
             usage: Arc::new(Mutex::new(UsageTracker::new())),
             history: Arc::new(Mutex::new(RoutingHistory::new())),
@@ -156,6 +158,13 @@ impl Orchestrator {
         self.agents.register(descriptor).await;
         self.adapters.insert(adapter.agent_id().clone(), adapter);
         Ok(())
+    }
+
+    /// Give agents the instructions of enabled skills relevant to their task.
+    #[must_use]
+    pub fn with_skill_guidance(mut self, skills: Arc<dyn cuma_core::ports::SkillGuidance>) -> Self {
+        self.skills = Some(skills);
+        self
     }
 
     /// Record every session as it happens.
@@ -1075,6 +1084,43 @@ impl Orchestrator {
         }
     }
 
+    /// The instructions of enabled skills relevant to `task`.
+    ///
+    /// Bounded, most trusted first; a skill below `Verified` is labelled as
+    /// unverified so the agent can weigh it accordingly.
+    fn skill_section(&self, task: &Task) -> String {
+        const BUDGET: usize = 12_000;
+
+        let Some(skills) = &self.skills else {
+            return String::new();
+        };
+        let guides = skills.guidance_for(&task.spec.required_capabilities);
+        if guides.is_empty() {
+            return String::new();
+        }
+
+        let mut section = String::from(
+            "\n\n## Skills\nInstructions from skills the operator enabled for this kind of task.\n",
+        );
+        for guide in guides {
+            let label = match guide.trust {
+                cuma_core::ports::TrustLevel::Trusted => "trusted",
+                cuma_core::ports::TrustLevel::Verified => "verified",
+                _ => "community, unverified",
+            };
+            let entry = format!(
+                "\n### {} ({label})\n{}\n",
+                guide.name,
+                guide.instructions.trim()
+            );
+            if section.len() + entry.len() > BUDGET {
+                break;
+            }
+            section.push_str(&entry);
+        }
+        section
+    }
+
     /// What long-term memory knows about a task, rendered for its prompt.
     ///
     /// Bounded, labelled as background, and empty when memory is off,
@@ -1209,6 +1255,7 @@ impl Orchestrator {
             .assemble(task, graph, handoff, token_budget)
             .await?;
         prompt.push_str(recalled);
+        prompt.push_str(&self.skill_section(task));
 
         let request = cuma_core::ports::ExecutionRequest {
             task: task.clone(),

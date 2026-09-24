@@ -297,6 +297,51 @@ pub trait SkillRegistry: Send + Sync {
     /// Implementations must not execute skill code during installation, and
     /// must not install a manifest that has not passed validation.
     async fn install(&self, id: &SkillId) -> Result<SkillManifest>;
+
+    /// Write a skill's files under `into`, for verification before install.
+    ///
+    /// Nothing written here is executed. The default is for registries whose
+    /// skills are metadata only.
+    async fn fetch(&self, id: &SkillId, into: &std::path::Path) -> Result<FetchedSkill> {
+        let _ = into;
+        Ok(FetchedSkill {
+            manifest: self.inspect(id).await?,
+            published_digest: None,
+            has_files: false,
+        })
+    }
+}
+
+/// A skill's files, fetched but not yet trusted.
+#[derive(Debug, Clone)]
+pub struct FetchedSkill {
+    /// Its manifest, as the registry describes it.
+    pub manifest: SkillManifest,
+    /// The content digest the registry vouches for, when it publishes one.
+    pub published_digest: Option<String>,
+    /// Whether any files were written.
+    pub has_files: bool,
+}
+
+/// One enabled skill's instructions, for an agent working on a task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillGuide {
+    /// The skill.
+    pub id: SkillId,
+    /// Its name.
+    pub name: String,
+    /// How far it is trusted.
+    pub trust: TrustLevel,
+    /// Its instructions (`SKILL.md`).
+    pub instructions: String,
+}
+
+/// The instructions of enabled skills relevant to some capabilities.
+///
+/// Synchronous: it is consulted on every attempt, from memory.
+pub trait SkillGuidance: Send + Sync {
+    /// Guides for skills providing any of `capabilities`.
+    fn guidance_for(&self, capabilities: &crate::capability::CapabilitySet) -> Vec<SkillGuide>;
 }
 
 /// Direct model access, for the harness's own reasoning.

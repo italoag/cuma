@@ -73,6 +73,36 @@ impl ValidationReport {
 /// derives trust from what can actually be verified and takes the lower of the
 /// two.
 pub fn validate(manifest: &SkillManifest) -> ValidationReport {
+    validate_with(manifest, &crate::integrity::Evidence::default())
+}
+
+/// Assess a skill whose files were fetched and examined.
+///
+/// Registries label what they list with a provisional trust level for
+/// display; that label is theirs, not the skill's, and must not cap what the
+/// evidence shows. Evidence alone decides here — which still leaves a
+/// generated skill `Untrusted` and an unsigned, undigested one `Community`.
+pub fn assess_fetched(
+    manifest: &SkillManifest,
+    evidence: &crate::integrity::Evidence,
+) -> ValidationReport {
+    let mut unlabelled = manifest.clone();
+    unlabelled.trust = TrustLevel::Trusted;
+    validate_with(&unlabelled, evidence)
+}
+
+/// Validate a manifest against what its files were shown to be.
+///
+/// Trust comes from evidence alone: a signature that verifies against a key
+/// the operator configured makes a skill `Trusted`; contents matching the
+/// digest a TLS registry published make it `Verified`. A manifest's own
+/// `checksum` and `signature` fields are claims, and claims earn nothing.
+pub fn validate_with(
+    manifest: &SkillManifest,
+    evidence: &crate::integrity::Evidence,
+) -> ValidationReport {
+    use crate::integrity::SignatureCheck;
+
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
 
@@ -117,20 +147,36 @@ pub fn validate(manifest: &SkillManifest) -> ValidationReport {
     }
 
     // --- integrity --------------------------------------------------------
-    let has_checksum = manifest
-        .checksum
-        .as_ref()
-        .is_some_and(|c| !c.trim().is_empty());
-    let has_signature = manifest
-        .signature
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
-
-    if !has_checksum {
-        warnings.push("no checksum is published, so integrity cannot be verified".to_owned());
+    let digest_matches = evidence.digest_matches();
+    if digest_matches == Some(false) {
+        blockers.push(format!(
+            "its contents ({}) do not match the digest the registry published ({})",
+            evidence.digest.as_deref().unwrap_or("?"),
+            evidence.published_digest.as_deref().unwrap_or("?")
+        ));
     }
-    if !has_signature {
-        warnings.push("no signature is published, so origin cannot be verified".to_owned());
+
+    let signed_by_trusted_key = match &evidence.signature {
+        Some(SignatureCheck::Valid { .. }) => true,
+        Some(SignatureCheck::Invalid { reason }) => {
+            blockers.push(format!("its signature is invalid: {reason}"));
+            false
+        }
+        Some(SignatureCheck::UnknownKey { key }) => {
+            warnings.push(format!(
+                "signed by {key:?}, which is not in skills.trusted_keys, so the signature proves nothing"
+            ));
+            false
+        }
+        Some(SignatureCheck::Absent) | None => {
+            warnings.push("no signature, so its origin cannot be verified".to_owned());
+            false
+        }
+    };
+
+    if evidence.published_digest.is_none() {
+        warnings
+            .push("no digest is published for it, so its integrity cannot be verified".to_owned());
     }
 
     // --- origin -----------------------------------------------------------
@@ -160,9 +206,9 @@ pub fn validate(manifest: &SkillManifest) -> ValidationReport {
         // is never evidence of its own trustworthiness, however it is signed
         // or wherever it claims to come from.
         TrustLevel::Untrusted
-    } else if source.starts_with("builtin:") {
+    } else if source.starts_with("builtin:") || signed_by_trusted_key {
         TrustLevel::Trusted
-    } else if has_signature && has_checksum {
+    } else if digest_matches == Some(true) && !origin_is_local {
         TrustLevel::Verified
     } else if origin_is_secure {
         TrustLevel::Community
@@ -234,15 +280,104 @@ mod tests {
     }
 
     #[test]
-    fn a_signed_and_checksummed_skill_is_verified() {
+    fn claimed_checksums_and_signatures_earn_nothing() {
+        // The fields a manifest carries are claims. Before this was fixed,
+        // having both was enough to be rated Verified.
         let mut m = manifest("https://registry.example/skills/rust-debug");
         m.checksum = Some("sha256:abc".into());
         m.signature = Some("ed25519:def".into());
-        m.trust = TrustLevel::Verified;
+        m.trust = TrustLevel::Trusted;
 
         let report = validate(&m);
         assert!(report.permitted);
+        assert_eq!(report.trust, TrustLevel::Community);
+    }
+
+    fn evidence(
+        digest: &str,
+        published: Option<&str>,
+        signature: crate::integrity::SignatureCheck,
+    ) -> crate::integrity::Evidence {
+        crate::integrity::Evidence {
+            digest: Some(digest.into()),
+            published_digest: published.map(Into::into),
+            signature: Some(signature),
+        }
+    }
+
+    #[test]
+    fn contents_matching_a_published_digest_are_verified() {
+        let mut m = manifest("https://registry.example/skills/rust-debug");
+        m.trust = TrustLevel::Trusted;
+        let report = validate_with(
+            &m,
+            &evidence(
+                "sha256:aa",
+                Some("sha256:aa"),
+                crate::integrity::SignatureCheck::Absent,
+            ),
+        );
+        assert!(report.permitted);
         assert_eq!(report.trust, TrustLevel::Verified);
+    }
+
+    #[test]
+    fn contents_not_matching_the_published_digest_are_refused() {
+        let report = validate_with(
+            &manifest("https://registry.example/skills/rust-debug"),
+            &evidence(
+                "sha256:aa",
+                Some("sha256:bb"),
+                crate::integrity::SignatureCheck::Absent,
+            ),
+        );
+        assert!(!report.permitted);
+        assert!(report.blockers[0].contains("do not match"));
+    }
+
+    #[test]
+    fn a_signature_by_a_configured_key_makes_a_skill_trusted() {
+        let mut m = manifest("git+https://github.com/acme/skills#rust-debug");
+        m.trust = TrustLevel::Trusted;
+        let report = validate_with(
+            &m,
+            &evidence(
+                "sha256:aa",
+                None,
+                crate::integrity::SignatureCheck::Valid { key: "acme".into() },
+            ),
+        );
+        assert_eq!(report.trust, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn an_invalid_signature_is_a_blocker_not_a_downgrade() {
+        let report = validate_with(
+            &manifest("https://registry.example/skills/rust-debug"),
+            &evidence(
+                "sha256:aa",
+                None,
+                crate::integrity::SignatureCheck::Invalid {
+                    reason: "tampered".into(),
+                },
+            ),
+        );
+        assert!(!report.permitted);
+    }
+
+    #[test]
+    fn a_generated_skill_stays_untrusted_whatever_its_evidence() {
+        let mut m = manifest("generated:rust-debug");
+        m.trust = TrustLevel::Trusted;
+        let report = validate_with(
+            &m,
+            &evidence(
+                "sha256:aa",
+                Some("sha256:aa"),
+                crate::integrity::SignatureCheck::Valid { key: "acme".into() },
+            ),
+        );
+        assert_eq!(report.trust, TrustLevel::Untrusted);
     }
 
     #[test]

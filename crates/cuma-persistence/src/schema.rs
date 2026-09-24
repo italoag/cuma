@@ -107,15 +107,9 @@ pub fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             updated_at   TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS installed_skills (
-            id           TEXT PRIMARY KEY,
-            name         TEXT NOT NULL,
-            version      TEXT NOT NULL,
-            source       TEXT NOT NULL,
-            trust        TEXT NOT NULL,
-            capabilities TEXT NOT NULL,
-            installed_at TEXT NOT NULL
-        );
+        -- Installed skills are recorded beside their files, in the skill
+        -- install directory's `installed.json`, not here: the record and
+        -- the files it describes must move and be deleted together.
 
         COMMIT;
         ",
