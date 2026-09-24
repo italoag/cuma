@@ -9,6 +9,23 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// An agent's last recorded health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHealthRecord {
+    /// The agent.
+    pub agent_id: String,
+    /// `Healthy`, `Degraded`, `Unavailable`…
+    pub state: String,
+    /// Failures since it was last healthy.
+    pub consecutive_failures: u64,
+    /// When it last succeeded (RFC 3339).
+    pub last_success: Option<String>,
+    /// The most recent failure.
+    pub last_error: Option<String>,
+    /// When this was recorded (RFC 3339).
+    pub updated_at: String,
+}
+
 /// Persistent runtime state.
 ///
 /// A single connection behind a mutex rather than a pool: writes are
@@ -79,7 +96,10 @@ impl RuntimeStore {
     pub fn begin_session(&self, session_id: &SessionId, goal: &str) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT OR REPLACE INTO sessions (id, goal, started_at) VALUES (?1, ?2, ?3)",
+                // An upsert, not INSERT OR REPLACE: a replace deletes the row
+                // first, and the delete cascades to the session's tasks.
+                "INSERT INTO sessions (id, goal, started_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET goal = ?2",
                 params![session_id.as_str(), goal, chrono::Utc::now().to_rfc3339()],
             )?;
             Ok(())
@@ -111,9 +131,13 @@ impl RuntimeStore {
     pub fn save_task(&self, session_id: &SessionId, task: &Task) -> Result<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT OR REPLACE INTO tasks
+                // An upsert, for the same reason as `begin_session`: a
+                // replace would cascade away the task's attempts.
+                "INSERT INTO tasks
                  (id, session_id, parent_id, description, task_type, status, risk, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                   parent_id = ?3, description = ?4, task_type = ?5, status = ?6, risk = ?7",
                 params![
                     task.id.as_str(),
                     session_id.as_str(),
@@ -137,6 +161,21 @@ impl RuntimeStore {
     pub fn record_attempt(&self, record: &UsageRecord) -> Result<()> {
         self.with_connection(|connection| {
             let transaction = connection.unchecked_transaction()?;
+
+            // Attempts are recorded as they happen, before the task's full
+            // row is written at the end of the session; make sure the row
+            // the attempt refers to exists.
+            transaction.execute(
+                "INSERT INTO tasks (id, session_id, description, task_type, status, risk, created_at)
+                 VALUES (?1, ?2, '', ?3, 'Running', '', ?4)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    record.task_id.as_str(),
+                    record.session_id.as_str(),
+                    format!("{:?}", record.task_type),
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
 
             transaction.execute(
                 "INSERT OR REPLACE INTO attempts
@@ -221,6 +260,78 @@ impl RuntimeStore {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Record an agent's health as of now.
+    ///
+    /// Consecutive failures accumulate until the agent is next healthy, so
+    /// `cuma doctor` can say "failing since…" about an agent the current
+    /// process has not even tried yet.
+    pub fn record_agent_health(
+        &self,
+        agent_id: &AgentId,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        // A failure can leave an agent rated healthy — one crash does not
+        // trip a breaker — but it is still a failure, not a success.
+        let healthy = error.is_none();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO agent_health
+                 (agent_id, state, consecutive_failures, last_success, last_error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id) DO UPDATE SET
+                   state = ?2,
+                   consecutive_failures = CASE WHEN ?7 THEN 0 ELSE consecutive_failures + 1 END,
+                   last_success = COALESCE(?4, last_success),
+                   last_error = CASE WHEN ?7 THEN last_error ELSE ?5 END,
+                   updated_at = ?6",
+                params![
+                    agent_id.as_str(),
+                    state,
+                    i64::from(!healthy),
+                    healthy.then(|| now.clone()),
+                    error,
+                    now,
+                    healthy,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every agent's last recorded health.
+    pub fn agent_health(&self) -> Result<Vec<AgentHealthRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT agent_id, state, consecutive_failures, last_success, last_error, updated_at
+                 FROM agent_health ORDER BY agent_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(AgentHealthRecord {
+                    agent_id: row.get(0)?,
+                    state: row.get(1)?,
+                    consecutive_failures: row.get::<_, i64>(2)?.max(0) as u64,
+                    last_success: row.get(3)?,
+                    last_error: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// How many routing decisions have been recorded.
+    pub fn routing_decision_count(&self) -> Result<u64> {
+        self.with_connection(|connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM routing_decisions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|n| n.max(0) as u64)
         })
     }
 
@@ -415,6 +526,82 @@ fn parse_task_type(raw: &str) -> Option<TaskType> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn an_attempt_recorded_before_its_task_is_kept_and_survives_the_task_being_saved() {
+        let store = RuntimeStore::in_memory().unwrap();
+        let session = SessionId::new("s1");
+        store.begin_session(&session, "goal").unwrap();
+
+        let mut task = Task::new(cuma_core::TaskSpec::new(
+            "write docs",
+            TaskType::Documentation,
+        ));
+        task.id = TaskId::new("t1");
+
+        let mut attempt = record("codex", true, Some(0.01));
+        attempt.session_id = session.clone();
+        attempt.task_id = task.id.clone();
+        store.record_attempt(&attempt).unwrap();
+        assert_eq!(store.attempt_count().unwrap(), 1);
+
+        // Writing the full task row afterwards, and restarting the session
+        // row, must not cascade the attempt away.
+        store.save_task(&session, &task).unwrap();
+        store.begin_session(&session, "goal").unwrap();
+        assert_eq!(store.attempt_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn agent_health_accumulates_failures_until_a_success() {
+        let store = RuntimeStore::in_memory().unwrap();
+        let codex = AgentId::new("codex");
+
+        store
+            .record_agent_health(&codex, "Degraded", Some("429"))
+            .unwrap();
+        store
+            .record_agent_health(&codex, "Unavailable", Some("crash"))
+            .unwrap();
+        let health = store.agent_health().unwrap();
+        assert_eq!(health[0].consecutive_failures, 2);
+        assert_eq!(health[0].last_error.as_deref(), Some("crash"));
+        assert_eq!(health[0].last_success, None);
+
+        store.record_agent_health(&codex, "Healthy", None).unwrap();
+        let health = store.agent_health().unwrap();
+        assert_eq!(health[0].state, "Healthy");
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert!(health[0].last_success.is_some());
+        assert_eq!(
+            health[0].last_error.as_deref(),
+            Some("crash"),
+            "the last failure is still worth knowing after a recovery"
+        );
+    }
+
+    #[test]
+    fn routing_decisions_are_counted() {
+        let store = RuntimeStore::in_memory().unwrap();
+        store
+            .record_routing_decision(
+                &SessionId::new("s"),
+                &TaskId::new("t"),
+                &AgentId::new("a"),
+                None,
+                0.8,
+                "because",
+            )
+            .unwrap();
+        assert_eq!(store.routing_decision_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .routing_explanation(&TaskId::new("t"))
+                .unwrap()
+                .as_deref(),
+            Some("because")
+        );
+    }
     use cuma_core::{AttemptId, TaskSpec, TokenUsage};
 
     fn record(agent: &str, success: bool, cost: Option<f64>) -> UsageRecord {

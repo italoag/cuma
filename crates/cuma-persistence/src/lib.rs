@@ -22,4 +22,4 @@
 mod schema;
 mod store;
 
-pub use store::RuntimeStore;
+pub use store::{AgentHealthRecord, RuntimeStore};

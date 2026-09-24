@@ -463,7 +463,15 @@ pub struct SecurityConfig {
     /// Shell commands agents may run. Empty means "no allowlist enforced here".
     pub command_allowlist: Vec<String>,
     /// Hosts agents may reach. Empty means "no allowlist enforced here".
+    ///
+    /// Enforced when agents run under ai-jail: a non-empty list becomes
+    /// filtered egress (`--allow-host`), an empty one leaves the network open,
+    /// since an agent cut off from its model API cannot work at all.
     pub network_allowlist: Vec<String>,
+    /// Environment variables forwarded into a sandboxed agent. The sandbox
+    /// passes a minimal allowlist by default; name API-key variables here only
+    /// when an agent authenticates that way rather than with its own login.
+    pub agent_env: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -477,6 +485,7 @@ impl Default for SecurityConfig {
             checkpoint_before_write: true,
             command_allowlist: Vec::new(),
             network_allowlist: Vec::new(),
+            agent_env: Vec::new(),
         }
     }
 }
@@ -495,6 +504,23 @@ pub struct LimitsConfig {
     pub max_cost_usd: Option<f64>,
     /// Session token ceiling, when set.
     pub max_tokens: Option<u64>,
+    /// Where concurrent writing tasks do their work.
+    pub isolation: TaskIsolation,
+}
+
+/// Where a writing task does its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskIsolation {
+    /// Everyone works in the workspace itself; the ownership ledger keeps
+    /// predicted writes apart.
+    #[default]
+    Shared,
+    /// Each writing task works in its own git worktree, and its changes are
+    /// applied back to the workspace, uncommitted, when it succeeds. A change
+    /// that no longer applies fails the task and keeps its worktree for a
+    /// human, instead of landing on top of someone else's.
+    Worktree,
 }
 
 impl Default for LimitsConfig {
@@ -505,6 +531,7 @@ impl Default for LimitsConfig {
             task_timeout_secs: 600,
             max_cost_usd: None,
             max_tokens: None,
+            isolation: TaskIsolation::Shared,
         }
     }
 }

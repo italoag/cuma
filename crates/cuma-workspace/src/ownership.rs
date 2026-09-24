@@ -214,6 +214,68 @@ pub fn predicted_writes(description: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Predict a task's writes, grounded in the workspace and its dependencies.
+///
+/// Builds on [`predicted_writes`]:
+///
+/// - a path named in the description is resolved against `index`, so "fix
+///   auth.rs" claims `src/auth.rs` — the same path a task saying
+///   "src/auth.rs" claims — rather than a bare `auth.rs` that conflicts with
+///   nothing;
+/// - files the task's dependencies changed are claimed too, since work that
+///   follows on from theirs usually touches the same files;
+/// - a named path that matches nothing in the index is kept as written: it
+///   may be a file the task is about to create.
+///
+/// Still pessimistic: a description naming no path claims the whole
+/// workspace, whatever the dependencies did.
+pub fn predict_writes(
+    description: &str,
+    index: Option<&crate::WorkspaceIndex>,
+    dependency_outputs: &[String],
+) -> Vec<PathBuf> {
+    let named = predicted_writes(description);
+    if named == [PathBuf::from(".")] {
+        return named;
+    }
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut add = |path: PathBuf| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+
+    for path in named {
+        let resolved = match index {
+            Some(index) if !index.contains(&path) => {
+                let is_bare_name = path.components().count() == 1;
+                if is_bare_name {
+                    index.named(&path.to_string_lossy())
+                } else {
+                    index.ending_with(&path)
+                }
+            }
+            _ => Vec::new(),
+        };
+
+        if resolved.is_empty() {
+            add(path);
+        } else {
+            resolved.into_iter().for_each(&mut add);
+        }
+    }
+
+    for output in dependency_outputs {
+        let output = output.trim();
+        if !output.is_empty() {
+            add(PathBuf::from(output));
+        }
+    }
+
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -225,6 +287,71 @@ mod tests {
 
     fn paths(entries: &[&str]) -> Vec<PathBuf> {
         entries.iter().map(PathBuf::from).collect()
+    }
+
+    fn index(entries: &[&str]) -> crate::WorkspaceIndex {
+        crate::WorkspaceIndex::from_files(paths(entries))
+    }
+
+    #[test]
+    fn a_bare_file_name_resolves_to_the_file_it_means() {
+        let index = index(&["src/auth.rs", "src/main.rs"]);
+        assert_eq!(
+            predict_writes("fix the bug in auth.rs", Some(&index), &[]),
+            paths(&["src/auth.rs"])
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_file_now_conflict() {
+        let index = index(&["src/auth.rs"]);
+        let ledger = OwnershipLedger::new();
+
+        let first = predict_writes("update src/auth.rs", Some(&index), &[]);
+        let second = predict_writes("fix auth.rs", Some(&index), &[]);
+        ledger.claim(&task("t1"), &first).unwrap();
+        assert!(
+            ledger.claim(&task("t2"), &second).is_err(),
+            "without the index these would have run concurrently on one file"
+        );
+    }
+
+    #[test]
+    fn a_partial_path_resolves_by_suffix() {
+        let index = index(&["crates/core/src/auth/mod.rs"]);
+        assert_eq!(
+            predict_writes("edit auth/mod.rs", Some(&index), &[]),
+            paths(&["crates/core/src/auth/mod.rs"])
+        );
+    }
+
+    #[test]
+    fn a_file_about_to_be_created_is_claimed_as_named() {
+        let index = index(&["src/main.rs"]);
+        assert_eq!(
+            predict_writes("create src/health.rs", Some(&index), &[]),
+            paths(&["src/health.rs"])
+        );
+    }
+
+    #[test]
+    fn dependency_outputs_are_claimed_too() {
+        assert_eq!(
+            predict_writes(
+                "add tests for src/auth.rs",
+                None,
+                &["src/session.rs".into()]
+            ),
+            paths(&["src/auth.rs", "src/session.rs"])
+        );
+    }
+
+    #[test]
+    fn naming_no_path_still_claims_everything_whatever_the_dependencies_did() {
+        assert_eq!(
+            predict_writes("refactor error handling", None, &["src/error.rs".into()]),
+            paths(&["."])
+        );
     }
 
     #[test]

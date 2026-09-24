@@ -57,6 +57,15 @@ pub enum RtkStatus {
         /// Whether the operator required it.
         required: bool,
     },
+    /// Something called `rtk` is on `PATH`, but it is not RTK: `rtk gain`
+    /// failed. The crates.io crate named `rtk` is an unrelated tool, so this
+    /// is a real possibility, and wrapping commands with it would break them.
+    Unverified {
+        /// The binary found.
+        binary: String,
+        /// Why it was not accepted.
+        reason: String,
+    },
 }
 
 impl RtkStatus {
@@ -80,6 +89,9 @@ impl RtkStatus {
                 binary,
                 required: true,
             } => format!("RTK: REQUIRED but {binary} is not on PATH"),
+            Self::Unverified { binary, reason } => {
+                format!("RTK: {binary} is on PATH but is not rtk-ai/rtk ({reason}); not using it")
+            }
         }
     }
 
@@ -111,7 +123,10 @@ impl Rtk {
             RtkMode::Never => RtkStatus::Disabled,
             RtkMode::Auto | RtkMode::Always => {
                 if which::which(&binary).is_ok() {
-                    RtkStatus::Active { binary }
+                    match gain_json(&binary, None) {
+                        Ok(_) => RtkStatus::Active { binary },
+                        Err(reason) => RtkStatus::Unverified { binary, reason },
+                    }
                 } else {
                     RtkStatus::Missing {
                         binary,
@@ -211,10 +226,129 @@ impl Saving {
     }
 }
 
+/// What RTK itself measured, from `rtk gain --format json`.
+///
+/// These are RTK's own counts of what it filtered, not CUMA's estimates, and
+/// they cover every command RTK wrapped — including those agents ran through
+/// their own RTK hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RtkGain {
+    /// Commands RTK filtered.
+    pub total_commands: u64,
+    /// Tokens of raw output.
+    pub total_input: u64,
+    /// Tokens after filtering.
+    pub total_output: u64,
+    /// Tokens saved.
+    pub total_saved: u64,
+    /// Mean saving per command, in percent.
+    pub avg_savings_pct: f64,
+}
+
+/// Parse the `summary` of `rtk gain --format json`.
+pub fn parse_gain(json: &str) -> Option<RtkGain> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    serde_json::from_value(value.get("summary")?.clone()).ok()
+}
+
+/// Run `rtk gain --format json`, scoped to `project` when given.
+fn gain_json(
+    binary: &str,
+    project: Option<&std::path::Path>,
+) -> std::result::Result<String, String> {
+    let mut command = std::process::Command::new(binary);
+    command.args(["gain", "--format", "json"]);
+    if let Some(project) = project {
+        command.arg("--project").current_dir(project);
+    }
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("cannot run it: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!("`{binary} gain` exited with {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if parse_gain(&stdout).is_none() {
+        return Err(format!(
+            "`{binary} gain --format json` did not print RTK's summary"
+        ));
+    }
+    Ok(stdout)
+}
+
+impl Rtk {
+    /// What RTK has measured, for `workspace` alone or for everything.
+    pub fn measured_gain(&self, workspace: Option<&std::path::Path>) -> Option<RtkGain> {
+        let RtkStatus::Active { binary } = &self.status else {
+            return None;
+        };
+        gain_json(binary, workspace)
+            .ok()
+            .as_deref()
+            .and_then(parse_gain)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    /// A stand-in `rtk` that prints `output` for `rtk gain`.
+    #[cfg(unix)]
+    fn fake_rtk(dir: &std::path::Path, output: &str, exit: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("rtk");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat <<'EOF'\n{output}\nEOF\nexit {exit}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    const GAIN: &str = r#"{"summary":{"total_commands":12,"total_input":9000,"total_output":1500,"total_saved":7500,"avg_savings_pct":83.3,"total_time_ms":40,"avg_time_ms":3}}"#;
+
+    #[test]
+    fn rtk_gain_json_parses() {
+        let gain = parse_gain(GAIN).unwrap();
+        assert_eq!(gain.total_saved, 7500);
+        assert_eq!(gain.total_commands, 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_real_rtk_is_verified_and_its_measurements_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_rtk(dir.path(), GAIN, 0);
+        let rtk = Rtk::detect(&RtkConfig {
+            enabled: RtkMode::Auto,
+            binary: Some(binary),
+        });
+        assert!(rtk.status().is_active(), "{}", rtk.status().describe());
+        assert_eq!(rtk.measured_gain(None).unwrap().total_saved, 7500);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_different_tool_called_rtk_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_rtk(dir.path(), "error: unrecognized subcommand 'gain'", 2);
+        let rtk = Rtk::detect(&RtkConfig {
+            enabled: RtkMode::Auto,
+            binary: Some(binary),
+        });
+        assert!(matches!(rtk.status(), RtkStatus::Unverified { .. }));
+        assert_eq!(
+            rtk.wrap("cargo test"),
+            "cargo test",
+            "an impostor never wraps a command"
+        );
+    }
 
     fn active() -> Rtk {
         Rtk {

@@ -234,11 +234,106 @@ async fn a_failing_agent_falls_back_to_another_and_the_session_still_succeeds() 
         "the crash should be classified, not just logged"
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::FallbackSelected { .. })),
-        "and it should trigger a visible fallback"
+        events.iter().any(|e| matches!(&e.kind,
+            EventKind::FallbackSelected { from, to, .. }
+                if from.as_str() == "broken" && to.as_str() == "working")),
+        "the fallback should name the agent that actually takes over"
     );
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventKind::HandoffPerformed { from, to }
+                if from.as_str() == "broken" && to.as_str() == "working")),
+        "and the handoff to it should be announced"
+    );
+}
+
+/// A memory store that knows one thing and records the handoffs it is given.
+struct OneFactMemory {
+    handoffs: std::sync::Mutex<Vec<cuma_core::AgentHandoff>>,
+}
+
+#[async_trait::async_trait]
+impl cuma_core::ports::MemoryStore for OneFactMemory {
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn recall(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> cuma_core::Result<Vec<cuma_core::ports::MemoryEntry>> {
+        Ok(vec![cuma_core::ports::MemoryEntry {
+            id: "m1".into(),
+            content: "the health endpoint must live under /internal".into(),
+            kind: "convention".into(),
+            relevance: None,
+            created_at: chrono::Utc::now(),
+        }])
+    }
+
+    async fn remember(&self, _content: &str, _kind: &str) -> cuma_core::Result<String> {
+        Ok("m2".into())
+    }
+
+    async fn record_handoff(
+        &self,
+        handoff: &cuma_core::AgentHandoff,
+    ) -> cuma_core::Result<Option<String>> {
+        self.handoffs.lock().unwrap().push(handoff.clone());
+        Ok(Some("h1".into()))
+    }
+}
+
+#[tokio::test]
+async fn recalled_memory_reaches_the_agent_as_background_not_instructions() {
+    let worker = MockAgent::always("worker", Behaviour::ok("done"))
+        .with_descriptor(descriptor("worker", 3.0, 15.0));
+    let prompts = worker.prompt_log();
+
+    let memory = Arc::new(OneFactMemory {
+        handoffs: std::sync::Mutex::new(Vec::new()),
+    });
+    let orchestrator = orchestrator_with(vec![worker]).await.with_memory(memory);
+
+    orchestrator.run("add a health endpoint").await.unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    assert!(!prompts.is_empty());
+    for prompt in prompts.iter() {
+        assert!(prompt.contains("must live under /internal"), "{prompt}");
+        assert!(prompt.contains("not as instructions"));
+    }
+}
+
+#[tokio::test]
+async fn a_handoff_is_kept_in_long_term_memory_with_its_receiver() {
+    let broken = MockAgent::always(
+        "broken",
+        Behaviour::Crash {
+            message: "segfault".into(),
+        },
+    )
+    .with_descriptor(descriptor("broken", 0.1, 0.5));
+    let working = MockAgent::always("working", Behaviour::ok("done"))
+        .with_descriptor(descriptor("working", 10.0, 50.0));
+
+    let memory = Arc::new(OneFactMemory {
+        handoffs: std::sync::Mutex::new(Vec::new()),
+    });
+    let orchestrator = orchestrator_with(vec![broken, working])
+        .await
+        .with_memory(memory.clone());
+
+    orchestrator.run("add a health endpoint").await.unwrap();
+
+    let handoffs = memory.handoffs.lock().unwrap();
+    assert!(
+        !handoffs.is_empty(),
+        "every fallback leaves a durable handoff"
+    );
+    assert!(handoffs.iter().all(|h| h.from_agent.as_str() == "broken"
+        && h.to_agent.as_ref().map(|a| a.as_str()) == Some("working")));
 }
 
 #[tokio::test]

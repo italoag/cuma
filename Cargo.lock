@@ -770,6 +770,7 @@ dependencies = [
  "futures",
  "rand 0.9.5",
  "serde",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -984,6 +985,7 @@ dependencies = [
  "cuma-config",
  "cuma-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

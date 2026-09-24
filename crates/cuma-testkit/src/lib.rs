@@ -28,6 +28,14 @@ pub enum Behaviour {
         /// Files to report as changed.
         changed_files: Vec<String>,
     },
+    /// Write files into the workspace the request names, then succeed. Paths
+    /// are relative to that workspace; used to test isolation and ownership.
+    Writes {
+        /// `(relative path, contents)` pairs.
+        files: Vec<(String, String)>,
+        /// The output to return.
+        output: String,
+    },
     /// Take `delay` before succeeding. Used to test timeouts and latency scoring.
     Slow {
         /// How long to take.
@@ -86,6 +94,8 @@ pub struct MockAgent {
     script: Vec<Behaviour>,
     calls: Arc<AtomicUsize>,
     tokens_per_call: TokenUsage,
+    prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    workspaces: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
 }
 
 impl MockAgent {
@@ -105,6 +115,8 @@ impl MockAgent {
             },
             calls: Arc::new(AtomicUsize::new(0)),
             tokens_per_call: TokenUsage::reported(100, 50),
+            prompts: Arc::default(),
+            workspaces: Arc::default(),
         }
     }
 
@@ -145,6 +157,16 @@ impl MockAgent {
         Arc::clone(&self.calls)
     }
 
+    /// A handle to every prompt this agent has been sent, in order.
+    pub fn prompt_log(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(&self.prompts)
+    }
+
+    /// A handle to the workspace each request named, in order.
+    pub fn workspace_log(&self) -> Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> {
+        Arc::clone(&self.workspaces)
+    }
+
     fn next_behaviour(&self) -> Behaviour {
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
         let clamped = index.min(self.script.len() - 1);
@@ -169,6 +191,12 @@ impl AgentAdapter for MockAgent {
     ) -> Result<ExecutionOutcome> {
         let behaviour = self.next_behaviour();
         let started = std::time::Instant::now();
+        if let Ok(mut prompts) = self.prompts.lock() {
+            prompts.push(request.prompt.clone());
+        }
+        if let Ok(mut workspaces) = self.workspaces.lock() {
+            workspaces.push(request.workspace.clone());
+        }
 
         let outcome = |success: bool,
                        output: String,
@@ -202,6 +230,23 @@ impl AgentAdapter for MockAgent {
                     })
                     .await;
                 Ok(outcome(true, output, changed_files, None, None))
+            }
+
+            Behaviour::Writes { files, output } => {
+                let mut changed = Vec::new();
+                for (relative, contents) in files {
+                    let path = request.workspace.join(&relative);
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    tokio::fs::write(&path, contents).await.map_err(|err| {
+                        MetaAgentError::Other(format!(
+                            "mock agent could not write {relative}: {err}"
+                        ))
+                    })?;
+                    changed.push(relative);
+                }
+                Ok(outcome(true, output, changed, None, None))
             }
 
             Behaviour::Slow { delay, output } => {

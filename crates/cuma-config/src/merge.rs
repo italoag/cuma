@@ -150,8 +150,14 @@ impl Config {
             self.security.network_allowlist,
             other.security.network_allowlist
         );
+        merge_collection!(self.security.agent_env, other.security.agent_env);
 
         // --- limits -------------------------------------------------------
+        merge_field!(
+            self.limits.isolation,
+            other.limits.isolation,
+            d.limits.isolation
+        );
         merge_field!(
             self.limits.max_parallel_tasks,
             other.limits.max_parallel_tasks,

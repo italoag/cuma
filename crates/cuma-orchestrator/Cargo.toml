@@ -26,6 +26,7 @@ futures.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 cuma-testkit.workspace = true
 cuma-workspace.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

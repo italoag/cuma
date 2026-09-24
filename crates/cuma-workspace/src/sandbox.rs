@@ -19,6 +19,9 @@ use std::path::Path;
 ///
 /// Ordered by isolation strength, then by how commonly they are installed.
 const KNOWN_RUNTIMES: &[(&str, &str)] = &[
+    // First: the only runtime here built to confine a coding agent that needs
+    // its model API and its own credentials.
+    ("ai-jail", "ai-jail"),
     ("bwrap", "bubblewrap"),
     ("firejail", "firejail"),
     ("sandbox-exec", "macOS sandbox-exec"),
@@ -142,6 +145,9 @@ impl Sandbox {
         let workspace = workspace.display();
 
         match runtime.as_str() {
+            // `--exec`: no PTY proxy or status bar between the command and
+            // its caller. Network stays off, which is ai-jail's default.
+            "ai-jail" => format!("ai-jail --exec -- {command}"),
             "bubblewrap" => format!(
                 // Read-only system, writable workspace, no network, no new
                 // privileges. `--die-with-parent` stops an orphaned agent
@@ -166,11 +172,173 @@ impl Sandbox {
     }
 }
 
+/// How a sandboxed agent may reach the outside world.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentConfinement {
+    /// Hosts the agent may reach. Empty means unrestricted network.
+    pub allowed_hosts: Vec<String>,
+    /// Environment variables forwarded into the sandbox.
+    pub forwarded_env: Vec<String>,
+}
+
+impl AgentConfinement {
+    /// Confinement as the security configuration describes it.
+    pub fn from_config(config: &SecurityConfig) -> Self {
+        Self {
+            allowed_hosts: config.network_allowlist.clone(),
+            forwarded_env: config.agent_env.clone(),
+        }
+    }
+}
+
+impl Sandbox {
+    /// The prefix that launches a coding agent inside the sandbox, or `None`
+    /// when this sandbox cannot confine one.
+    ///
+    /// A coding agent is not an arbitrary command: it needs its model API and
+    /// its own credentials, and speaks JSON-RPC over stdio, so a profile that
+    /// cuts the network or interposes a terminal breaks it outright. Only
+    /// ai-jail is built for that — `--exec` for a clean stdio channel,
+    /// `--agent-state` for the agent's own login, `--allow-host` for filtered
+    /// egress — so only ai-jail is used here, and every other runtime reports
+    /// agents as unconfined rather than pretending.
+    pub fn agent_launch_prefix(
+        &self,
+        workspace: &Path,
+        confinement: &AgentConfinement,
+    ) -> Option<Vec<String>> {
+        let SandboxStatus::Active { runtime } = &self.status else {
+            return None;
+        };
+        if runtime != "ai-jail" {
+            return None;
+        }
+
+        let mut prefix = vec![
+            "ai-jail".to_owned(),
+            "--exec".to_owned(),
+            "--agent-state".to_owned(),
+        ];
+
+        if confinement.allowed_hosts.is_empty() {
+            prefix.push("--network".to_owned());
+        } else {
+            for host in &confinement.allowed_hosts {
+                prefix.push("--allow-host".to_owned());
+                prefix.push(host.clone());
+            }
+        }
+
+        for name in &confinement.forwarded_env {
+            prefix.push("--env".to_owned());
+            prefix.push(name.clone());
+        }
+
+        // ai-jail makes its working directory writable. The agent is launched
+        // from CUMA's, so a workspace elsewhere is mapped explicitly.
+        let here = std::env::current_dir().ok();
+        if here.as_deref() != Some(workspace) {
+            prefix.push("--rw-map".to_owned());
+            prefix.push(workspace.display().to_string());
+        }
+
+        prefix.push("--".to_owned());
+        Some(prefix)
+    }
+
+    /// One line on whether agents themselves run confined.
+    pub fn describe_agent_confinement(&self) -> String {
+        match &self.status {
+            SandboxStatus::Active { runtime } if runtime == "ai-jail" => {
+                "agents: confined by ai-jail".to_owned()
+            }
+            SandboxStatus::Active { runtime } => format!(
+                "agents: UNCONFINED — {runtime} cannot confine a networked agent; \
+                 install ai-jail to sandbox agents themselves"
+            ),
+            SandboxStatus::Disabled => "agents: unconfined (sandbox disabled)".to_owned(),
+            SandboxStatus::Unavailable { .. } => {
+                "agents: UNCONFINED — no sandbox runtime is available".to_owned()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use std::path::PathBuf;
+
+    fn jail() -> Sandbox {
+        Sandbox {
+            status: SandboxStatus::Active {
+                runtime: "ai-jail".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_agent_under_ai_jail_keeps_its_login_and_a_clean_stdio_channel() {
+        let prefix = jail()
+            .agent_launch_prefix(Path::new("/work"), &AgentConfinement::default())
+            .unwrap();
+        assert_eq!(&prefix[..3], ["ai-jail", "--exec", "--agent-state"]);
+        assert!(
+            prefix.contains(&"--network".to_owned()),
+            "no allowlist: open network"
+        );
+        assert_eq!(prefix.last().map(String::as_str), Some("--"));
+    }
+
+    #[test]
+    fn a_network_allowlist_becomes_filtered_egress() {
+        let prefix = jail()
+            .agent_launch_prefix(
+                Path::new("/work"),
+                &AgentConfinement {
+                    allowed_hosts: vec!["api.anthropic.com".into(), "registry.npmjs.org".into()],
+                    forwarded_env: vec!["ANTHROPIC_API_KEY".into()],
+                },
+            )
+            .unwrap();
+        assert!(!prefix.contains(&"--network".to_owned()));
+        let joined = prefix.join(" ");
+        assert!(joined.contains("--allow-host api.anthropic.com --allow-host registry.npmjs.org"));
+        assert!(joined.contains("--env ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn a_workspace_other_than_the_working_directory_is_mapped() {
+        let prefix = jail()
+            .agent_launch_prefix(
+                Path::new("/elsewhere/project"),
+                &AgentConfinement::default(),
+            )
+            .unwrap();
+        let joined = prefix.join(" ");
+        assert!(joined.contains("--rw-map /elsewhere/project"), "{joined}");
+    }
+
+    #[test]
+    fn other_runtimes_do_not_pretend_to_confine_agents() {
+        let bwrap = Sandbox {
+            status: SandboxStatus::Active {
+                runtime: "bubblewrap".to_owned(),
+            },
+        };
+        assert!(
+            bwrap
+                .agent_launch_prefix(Path::new("/w"), &AgentConfinement::default())
+                .is_none()
+        );
+        assert!(bwrap.describe_agent_confinement().contains("UNCONFINED"));
+        assert!(
+            Sandbox::disabled()
+                .agent_launch_prefix(Path::new("/w"), &AgentConfinement::default())
+                .is_none()
+        );
+    }
 
     fn workspace() -> PathBuf {
         PathBuf::from("/projects/app")

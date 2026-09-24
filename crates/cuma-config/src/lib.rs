@@ -20,7 +20,7 @@ mod model;
 pub use model::{
     AgentConfig, Config, LimitsConfig, McpServerSettings, MemoryConfig, RouterConfig,
     RouterWeights, RoutingStrategy, RtkConfig, RtkMode, SecurityConfig, SkillAutoInstall,
-    SkillsConfig, TelemetryConfig,
+    SkillsConfig, TaskIsolation, TelemetryConfig,
 };
 
 use cuma_core::error::{MetaAgentError, Result};

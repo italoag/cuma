@@ -259,6 +259,130 @@ impl GitWorkspace {
         }
     }
 
+    /// Commit the working tree as it stands — tracked, modified and
+    /// untracked files alike, `.gitignore` respected — without touching the
+    /// user's index, working tree or branches.
+    ///
+    /// The commit is dangling: nothing refers to it, so it disappears with the
+    /// next garbage collection once the worktrees built on it are gone.
+    pub async fn snapshot(&self) -> Result<String> {
+        if !self.is_repository {
+            return Err(MetaAgentError::Configuration(
+                "cannot snapshot outside a git repository".to_owned(),
+            ));
+        }
+
+        let index = run_git(
+            &self.root,
+            &["rev-parse", "--git-path", "cuma-snapshot-index"],
+        )
+        .await?;
+        let index = self.root.join(index.trim()).with_extension(uuid_suffix());
+        let index_env = [("GIT_INDEX_FILE", index.as_os_str())];
+
+        let has_head = run_git(&self.root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+            .await
+            .is_ok();
+        let result = async {
+            if has_head {
+                run_git_env(&self.root, &["read-tree", "HEAD"], &index_env, None).await?;
+            }
+            run_git_env(&self.root, &["add", "-A"], &index_env, None).await?;
+            let tree = run_git_env(&self.root, &["write-tree"], &index_env, None).await?;
+            let mut args = vec!["commit-tree", tree.trim(), "-m", "cuma: workspace snapshot"];
+            if has_head {
+                args.extend(["-p", "HEAD"]);
+            }
+            let commit = run_git(&self.root, &args).await?;
+            Ok(commit.trim().to_owned())
+        }
+        .await;
+
+        let _ = tokio::fs::remove_file(&index).await;
+        result
+    }
+
+    /// A detached worktree at `commit`, under `base`.
+    ///
+    /// Detached rather than on a branch: nothing is left in the user's branch
+    /// list, and nothing is committed on their behalf.
+    pub async fn create_detached_worktree(
+        &self,
+        label: &str,
+        base: &Path,
+        commit: &str,
+    ) -> Result<Worktree> {
+        if !self.is_repository {
+            return Err(MetaAgentError::Configuration(
+                "cannot create a worktree outside a git repository".to_owned(),
+            ));
+        }
+
+        let path = base.join(sanitize_ref(label));
+        if path.exists() {
+            return Err(MetaAgentError::Other(format!(
+                "worktree path {} already exists",
+                path.display()
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                MetaAgentError::Other(format!("cannot create {}: {err}", parent.display()))
+            })?;
+        }
+
+        let path_text = path.to_string_lossy().to_string();
+        run_git(
+            &self.root,
+            &["worktree", "add", "--detach", &path_text, commit],
+        )
+        .await?;
+
+        Ok(Worktree {
+            path,
+            branch: String::new(),
+            repository: self.root.clone(),
+        })
+    }
+
+    /// Apply what changed in `worktree` since `base` to the workspace, as
+    /// uncommitted changes, and return the paths touched.
+    ///
+    /// Nothing is committed and no branch moves. If the changes no longer
+    /// apply — someone else changed the same lines since — nothing is applied
+    /// and the error says so; the worktree is left for a human.
+    pub async fn apply_worktree(&self, worktree: &Worktree, base: &str) -> Result<Vec<String>> {
+        run_git(&worktree.path, &["add", "-A"]).await?;
+
+        let changed = run_git(&worktree.path, &["diff", "--cached", "--name-only", base]).await?;
+        let changed: Vec<String> = changed
+            .lines()
+            .map(str::to_owned)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+
+        let patch = run_git(&worktree.path, &["diff", "--cached", "--binary", base]).await?;
+        run_git_env(
+            &self.root,
+            &["apply", "--check", "--binary", "-"],
+            &[],
+            Some(&patch),
+        )
+        .await
+        .map_err(|err| {
+            MetaAgentError::Other(format!(
+                "the changes in {} no longer apply to the workspace: {err}",
+                worktree.path.display()
+            ))
+        })?;
+        run_git_env(&self.root, &["apply", "--binary", "-"], &[], Some(&patch)).await?;
+
+        Ok(changed)
+    }
+
     /// Checkpoints CUMA has created in this repository.
     pub async fn checkpoints(&self) -> Result<Vec<String>> {
         if !self.is_repository {
@@ -303,6 +427,67 @@ fn sanitize_ref(raw: &str) -> String {
     } else {
         bounded
     }
+}
+
+/// A suffix unique to this process and moment, for temporary files.
+fn uuid_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    )
+}
+
+/// Run git with extra environment and, optionally, stdin.
+async fn run_git_env(
+    directory: &Path,
+    args: &[&str],
+    env: &[(&str, &std::ffi::OsStr)],
+    input: Option<&str>,
+) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut command = tokio::process::Command::new("git");
+    command.current_dir(directory).args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.stdin(if input.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let run = async {
+        let mut child = command.spawn()?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input.as_bytes()).await?;
+            drop(stdin);
+        }
+        child.wait_with_output().await
+    };
+
+    let output = tokio::time::timeout(GIT_TIMEOUT, run)
+        .await
+        .map_err(|_| MetaAgentError::Timeout {
+            operation: format!("git {}", args.join(" ")),
+            elapsed_ms: GIT_TIMEOUT.as_millis() as u64,
+        })?
+        .map_err(|err| MetaAgentError::Other(format!("cannot run git: {err}")))?;
+
+    if !output.status.success() {
+        return Err(MetaAgentError::Other(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run git in `directory` and return stdout.
@@ -355,6 +540,90 @@ mod tests {
 
         let workspace = GitWorkspace::detect(path).await;
         Some((directory, workspace))
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_captures_untracked_work_without_touching_the_index() {
+        let Some((directory, git)) = repository().await else {
+            return;
+        };
+        let root = directory.path();
+        std::fs::write(root.join("new.txt"), "fresh").unwrap();
+        let status_before = run_git(root, &["status", "--porcelain"]).await.unwrap();
+
+        let commit = git.snapshot().await.unwrap();
+
+        let files = run_git(root, &["ls-tree", "-r", "--name-only", &commit])
+            .await
+            .unwrap();
+        assert!(
+            files.lines().any(|f| f == "new.txt"),
+            "untracked work is in the snapshot"
+        );
+        assert_eq!(
+            run_git(root, &["status", "--porcelain"]).await.unwrap(),
+            status_before,
+            "the user's index and tree are exactly as they were"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worktrees_changes_come_back_uncommitted() {
+        let Some((directory, git)) = repository().await else {
+            return;
+        };
+        let root = directory.path();
+        let head_before = run_git(root, &["rev-parse", "HEAD"]).await.unwrap();
+
+        let base = git.snapshot().await.unwrap();
+        let place = tempfile::tempdir().unwrap();
+        let worktree = git
+            .create_detached_worktree("t1", place.path(), &base)
+            .await
+            .unwrap();
+        std::fs::write(worktree.path.join("added.rs"), "fn main() {}\n").unwrap();
+
+        let changed = git.apply_worktree(&worktree, &base).await.unwrap();
+        assert_eq!(changed, vec!["added.rs".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("added.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            run_git(root, &["rev-parse", "HEAD"]).await.unwrap(),
+            head_before,
+            "nothing is committed on the user's behalf"
+        );
+        git.remove_worktree(&worktree).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changes_that_no_longer_apply_are_refused_and_nothing_lands() {
+        let Some((directory, git)) = repository().await else {
+            return;
+        };
+        let root = directory.path();
+        std::fs::write(root.join("shared.txt"), "one\n").unwrap();
+        let base = git.snapshot().await.unwrap();
+
+        let place = tempfile::tempdir().unwrap();
+        let worktree = git
+            .create_detached_worktree("t2", place.path(), &base)
+            .await
+            .unwrap();
+        std::fs::write(worktree.path.join("shared.txt"), "from the worktree\n").unwrap();
+
+        // Meanwhile, someone else changed the same line in the workspace.
+        std::fs::write(root.join("shared.txt"), "from someone else\n").unwrap();
+
+        let err = git.apply_worktree(&worktree, &base).await.unwrap_err();
+        assert!(err.to_string().contains("no longer apply"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared.txt")).unwrap(),
+            "from someone else\n",
+            "the other change is untouched"
+        );
+        assert!(worktree.path.exists(), "the worktree is kept for a human");
     }
 
     #[tokio::test]

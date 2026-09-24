@@ -211,7 +211,17 @@ pub async fn build_orchestrator(
     if !shared.is_empty() {
         tracing::info!(count = shared.len(), "offering MCP servers to ACP agents");
     }
-    let acp = AcpConfigDiscovery::new(config.clone()).with_mcp_servers(shared);
+    let sandbox = cuma_workspace::Sandbox::detect(&config.security);
+    let confinement = cuma_workspace::AgentConfinement::from_config(&config.security);
+    let launch_prefix = sandbox
+        .agent_launch_prefix(&workspace, &confinement)
+        .unwrap_or_default();
+    if config.security.sandbox && launch_prefix.is_empty() {
+        warnings.push(sandbox.describe_agent_confinement());
+    }
+    let acp = AcpConfigDiscovery::new(config.clone())
+        .with_mcp_servers(shared)
+        .with_launch_prefix(launch_prefix);
     for adapter in acp.adapters() {
         let id = adapter.agent_id().clone();
 
@@ -251,13 +261,19 @@ pub async fn build_orchestrator(
     }
     let mut orchestrator = orchestrator.with_memory(memory);
 
-    // --- routing history --------------------------------------------------
-    // A fresh process should route with everything previous sessions learned.
+    // --- runtime database -------------------------------------------------
+    // A fresh process should route with everything previous sessions learned,
+    // and every session — whichever front end started it — is recorded as it
+    // happens so the next process can learn from this one.
     match cuma_persistence::RuntimeStore::open(&database_path(&config, &workspace)) {
-        Ok(store) => match store.load_routing_history() {
-            Ok(history) => orchestrator = orchestrator.with_history(history),
-            Err(err) => warnings.push(format!("could not load routing history: {err}")),
-        },
+        Ok(store) => {
+            match store.load_routing_history() {
+                Ok(history) => orchestrator = orchestrator.with_history(history),
+                Err(err) => warnings.push(format!("could not load routing history: {err}")),
+            }
+            orchestrator =
+                orchestrator.with_recorder(Arc::new(crate::recorder::StoreRecorder::new(store)));
+        }
         Err(err) => warnings.push(format!("could not open the runtime database: {err}")),
     }
 

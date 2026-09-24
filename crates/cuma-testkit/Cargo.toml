@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 cuma-core.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "fs"] }
 tracing.workspace = true
 
 [dev-dependencies]

@@ -23,6 +23,8 @@ pub struct AcpConfigDiscovery {
     require_launchable: bool,
     /// MCP servers every discovered agent is offered.
     mcp_servers: Vec<crate::SharedMcpServer>,
+    /// A sandbox launcher every discovered agent is started under.
+    launch_prefix: Vec<String>,
 }
 
 impl AcpConfigDiscovery {
@@ -32,7 +34,15 @@ impl AcpConfigDiscovery {
             config,
             require_launchable: true,
             mcp_servers: Vec::new(),
+            launch_prefix: Vec::new(),
         }
+    }
+
+    /// Start every discovered agent under `prefix`.
+    #[must_use]
+    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.launch_prefix = prefix;
+        self
     }
 
     /// Offer `servers` to every agent discovered.
@@ -70,8 +80,9 @@ impl AcpConfigDiscovery {
                 continue;
             };
 
-            let adapter =
-                AcpAdapter::new(id.as_str(), command).with_mcp_servers(self.mcp_servers.clone());
+            let adapter = AcpAdapter::new(id.as_str(), command)
+                .with_mcp_servers(self.mcp_servers.clone())
+                .with_launch_prefix(self.launch_prefix.clone());
 
             if self.require_launchable && !adapter.is_launchable() {
                 tracing::info!(

@@ -15,6 +15,8 @@
 
 mod context;
 mod executor;
+mod recorder;
 
 pub use context::MinimalContextManager;
 pub use executor::{Orchestrator, SessionResult};
+pub use recorder::SessionRecorder;

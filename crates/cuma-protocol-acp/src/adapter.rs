@@ -59,6 +59,8 @@ pub struct AcpAdapter {
     command: String,
     permission_policy: PermissionPolicy,
     mcp_servers: Vec<SharedMcpServer>,
+    /// A sandbox launcher the agent is started under, e.g. `ai-jail --exec … --`.
+    launch_prefix: Vec<String>,
 }
 
 /// An MCP server to hand an agent in `session/new`.
@@ -95,6 +97,27 @@ impl AcpAdapter {
             command: command.into(),
             permission_policy: PermissionPolicy::AllowLowRisk,
             mcp_servers: Vec::new(),
+            launch_prefix: Vec::new(),
+        }
+    }
+
+    /// Launch the agent under `prefix` — a sandbox, typically.
+    #[must_use]
+    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.launch_prefix = prefix;
+        self
+    }
+
+    /// The full command the agent is launched with, sandbox included.
+    pub fn launch_command(&self) -> String {
+        if self.launch_prefix.is_empty() {
+            self.command.clone()
+        } else {
+            format!(
+                "{} {}",
+                shell_words::join(&self.launch_prefix),
+                self.command
+            )
         }
     }
 
@@ -134,14 +157,19 @@ impl AcpAdapter {
         let Ok(parts) = shell_words::split(&self.command) else {
             return false;
         };
-        parts
+        let agent = parts
             .first()
-            .is_some_and(|binary| which::which(binary).is_ok())
+            .is_some_and(|binary| which::which(binary).is_ok());
+        let launcher = self
+            .launch_prefix
+            .first()
+            .is_none_or(|binary| which::which(binary).is_ok());
+        agent && launcher
     }
 
     /// Build the SDK's agent handle from the configured command.
     fn spawn_handle(&self) -> Result<AcpAgent> {
-        AcpAgent::from_str(&self.command).map_err(|err| {
+        AcpAgent::from_str(&self.launch_command()).map_err(|err| {
             MetaAgentError::Configuration(format!(
                 "agent {}: cannot parse command {:?}: {err}",
                 self.id, self.command
@@ -477,6 +505,42 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use agent_client_protocol::schema::v1::Cost;
+
+    #[test]
+    fn a_sandboxed_agent_is_launched_under_its_prefix_with_quoting_intact() {
+        let adapter = AcpAdapter::new(
+            "claude",
+            "npx -y @agentclientprotocol/claude-agent-acp@latest",
+        )
+        .with_launch_prefix(vec![
+            "ai-jail".into(),
+            "--exec".into(),
+            "--rw-map".into(),
+            "/work/my project".into(),
+            "--".into(),
+        ]);
+        let command = adapter.launch_command();
+        assert_eq!(
+            shell_words::split(&command).unwrap(),
+            vec![
+                "ai-jail",
+                "--exec",
+                "--rw-map",
+                "/work/my project",
+                "--",
+                "npx",
+                "-y",
+                "@agentclientprotocol/claude-agent-acp@latest"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_whose_sandbox_is_missing_is_not_launchable() {
+        let adapter = AcpAdapter::new("echo", "echo")
+            .with_launch_prefix(vec!["definitely-not-a-sandbox-5b1c".into(), "--".into()]);
+        assert!(!adapter.is_launchable());
+    }
 
     #[test]
     fn a_shared_mcp_server_is_declared_as_a_stdio_server() {

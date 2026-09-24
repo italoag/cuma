@@ -169,11 +169,15 @@ pub async fn run_goal(
     });
 
     let result = orchestrator.run(goal).await?;
-    printer.abort();
 
-    let store_result = persist_session(&config, &workspace, &orchestrator, &result).await;
-    if let Err(err) = store_result {
-        eprintln!("warning: could not persist this session: {err}");
+    // The printer stops on its own at `SessionCompleted`; aborting it here
+    // would drop whatever the bus still had queued. The session was recorded
+    // as it ran, so there is nothing left to persist.
+    if tokio::time::timeout(std::time::Duration::from_secs(2), printer)
+        .await
+        .is_err()
+    {
+        tracing::debug!("progress output did not drain before the deadline");
     }
 
     if json {
@@ -297,29 +301,6 @@ async fn explain_plan(
         }
     }
 
-    Ok(())
-}
-
-/// Write a finished session to the runtime database.
-async fn persist_session(
-    config: &Config,
-    workspace: &std::path::Path,
-    orchestrator: &cuma_orchestrator::Orchestrator,
-    result: &cuma_orchestrator::SessionResult,
-) -> Result<()> {
-    let store = cuma_persistence::RuntimeStore::open(&harness::database_path(config, workspace))?;
-
-    store.begin_session(&result.session_id, &result.summary)?;
-
-    for task in result.graph.iter() {
-        store.save_task(&result.session_id, task)?;
-    }
-
-    for record in orchestrator.usage_snapshot().await.records() {
-        store.record_attempt(record)?;
-    }
-
-    store.finish_session(&result.session_id, result.success, &result.summary)?;
     Ok(())
 }
 
@@ -712,6 +693,11 @@ pub async fn usage(config: Config, workspace: PathBuf, by_model: bool, json: boo
 
     let history = store.load_routing_history()?;
 
+    // RTK's own measurements, for this project. Not CUMA's estimates: RTK
+    // counted what it filtered, including commands agents ran through their
+    // own RTK hooks.
+    let rtk_gain = cuma_workspace::Rtk::detect(&config.rtk).measured_gain(Some(&workspace));
+
     if json {
         let groups: Vec<serde_json::Value> = grouped
             .iter()
@@ -755,13 +741,21 @@ pub async fn usage(config: Config, workspace: PathBuf, by_model: bool, json: boo
                 "recorded_spend_usd": spend,
                 "groups": groups,
                 "routing_history": buckets,
+                "rtk_measured": rtk_gain,
             }))
             .unwrap_or_default()
         );
         return Ok(());
     }
 
-    println!("Sessions: {sessions}   Attempts: {attempts}   Recorded spend: >=${spend:.4}\n");
+    println!("Sessions: {sessions}   Attempts: {attempts}   Recorded spend: >=${spend:.4}");
+    if let Some(gain) = rtk_gain.filter(|g| g.total_commands > 0) {
+        println!(
+            "RTK (measured): {} commands filtered, {} tokens saved ({:.0}% on average)",
+            gain.total_commands, gain.total_saved, gain.avg_savings_pct
+        );
+    }
+    println!();
 
     if grouped.is_empty() {
         println!("No usage has been recorded yet. Run `cuma run \"...\"` first.");
@@ -906,11 +900,43 @@ pub async fn doctor(
         problems.push(sandbox.describe());
     }
 
+    let agent_sandbox = cuma_workspace::Sandbox::detect(&config.security);
+    let confinement = agent_sandbox.describe_agent_confinement();
+    if agent_sandbox
+        .agent_launch_prefix(
+            &workspace,
+            &cuma_workspace::AgentConfinement::from_config(&config.security),
+        )
+        .is_some()
+        || !config.security.sandbox
+    {
+        notes.push(confinement);
+    } else {
+        problems.push(confinement);
+    }
+
     let rtk = orchestrator.rtk_status();
-    if rtk.is_fatal() {
+    if rtk.is_fatal() || matches!(rtk, cuma_workspace::RtkStatus::Unverified { .. }) {
         problems.push(rtk.describe());
     } else {
         notes.push(rtk.describe());
+    }
+    if rtk.is_active() {
+        let measured = cuma_workspace::Rtk::detect(&config.rtk).measured_gain(Some(&workspace));
+        match measured {
+            Some(gain) if gain.total_commands > 0 => notes.push(format!(
+                "RTK measured in this project: {} commands, {} tokens saved ({:.0}% on average)",
+                gain.total_commands, gain.total_saved, gain.avg_savings_pct
+            )),
+            _ => notes.push("RTK has not filtered anything in this project yet".to_owned()),
+        }
+        // CUMA wraps the commands it runs itself; agents run their own shell
+        // commands, which only RTK's per-agent hooks can reach.
+        notes.push(
+            "RTK hooks: agents filter their own shell output only once hooked — \
+             `rtk init -g` for Claude Code, `rtk init -g --agent <name>` for others"
+                .to_owned(),
+        );
     }
 
     // --- security ---------------------------------------------------------

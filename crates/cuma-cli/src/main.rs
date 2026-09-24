@@ -8,6 +8,7 @@ mod commands;
 mod harness;
 mod mcp_tools;
 mod output;
+mod recorder;
 
 use clap::{Parser, Subcommand};
 use cuma_core::error::Result;

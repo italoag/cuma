@@ -25,12 +25,14 @@
 
 pub mod git;
 pub mod guard;
+pub mod index;
 pub mod ownership;
 pub mod rtk;
 pub mod sandbox;
 
 pub use git::{Checkpoint, GitWorkspace, Worktree};
 pub use guard::{CommandGuard, CommandVerdict};
-pub use ownership::{OwnershipLedger, WriteConflict};
-pub use rtk::{Rtk, RtkStatus, Saving, estimate_tokens};
-pub use sandbox::{Sandbox, SandboxStatus};
+pub use index::WorkspaceIndex;
+pub use ownership::{OwnershipLedger, WriteConflict, predict_writes};
+pub use rtk::{Rtk, RtkGain, RtkStatus, Saving, estimate_tokens, parse_gain};
+pub use sandbox::{AgentConfinement, Sandbox, SandboxStatus};
