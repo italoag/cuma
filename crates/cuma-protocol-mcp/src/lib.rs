@@ -15,6 +15,8 @@
 
 mod provider;
 mod registry;
+mod server;
 
 pub use provider::McpToolProvider;
-pub use registry::{McpServerConfig, McpServerRegistry};
+pub use registry::{McpServerConfig, McpServerRegistry, shared_server_command};
+pub use server::ToolServer;

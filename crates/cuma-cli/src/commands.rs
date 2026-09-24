@@ -54,6 +54,35 @@ pub enum SkillAction {
     List,
 }
 
+/// MCP subcommands.
+#[derive(Subcommand)]
+pub enum McpAction {
+    /// List configured MCP servers.
+    List,
+    /// List the tools the configured servers expose, allowlists applied.
+    Tools {
+        /// Only this server.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Call a tool.
+    Call {
+        /// The tool's name.
+        tool: String,
+        /// Arguments as a JSON object.
+        #[arg(long, default_value = "{}")]
+        args: String,
+    },
+    /// Serve one configured server on stdio with its allowlist enforced.
+    ///
+    /// This is what ACP agents launch for a server shared with
+    /// `share_with_agents = true`.
+    Proxy {
+        /// The server's name under `[mcp.*]`.
+        name: String,
+    },
+}
+
 /// Memory subcommands.
 #[derive(Subcommand)]
 pub enum MemoryAction {
@@ -350,8 +379,22 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
             );
             cuma_protocol_a2a::serve(orchestrator, address, &format!("http://{address}")).await
         }
+        "mcp" => {
+            eprintln!(
+                "serving CUMA's tools over MCP on stdio ({} agents behind them)",
+                orchestrator.agents().len().await
+            );
+            let tools = crate::mcp_tools::OrchestratorTools::new(std::sync::Arc::new(orchestrator));
+            cuma_protocol_mcp::ToolServer::new("cuma", std::sync::Arc::new(tools))
+                .with_instructions(
+                    "CUMA routes software-engineering goals across coding agents. \
+                     Use cuma_explain to preview a plan and cuma_run to carry it out.",
+                )
+                .serve_stdio()
+                .await
+        }
         other => Err(MetaAgentError::Configuration(format!(
-            "cannot serve protocol {other:?}; expected \"acp\" or \"a2a\""
+            "cannot serve protocol {other:?}; expected \"acp\", \"a2a\" or \"mcp\""
         ))),
     }
 }
@@ -585,8 +628,13 @@ pub async fn skills(config: Config, action: SkillAction, json: bool) -> Result<(
 }
 
 /// Memory subcommands.
-pub async fn memory(config: Config, action: MemoryAction, json: bool) -> Result<()> {
-    let store = cuma_memory::from_config(&config.memory);
+pub async fn memory(
+    config: Config,
+    workspace: PathBuf,
+    action: MemoryAction,
+    json: bool,
+) -> Result<()> {
+    let store = harness::memory_store(&config, &workspace);
 
     match action {
         MemoryAction::Status => {
@@ -818,7 +866,7 @@ pub async fn doctor(
     }
 
     // --- memory -----------------------------------------------------------
-    let memory = cuma_memory::from_config(&config.memory);
+    let memory = harness::memory_store(&config, &workspace);
     if config.memory.enabled {
         if memory.is_available().await {
             notes.push(format!("memory: {} is reachable", config.memory.backend));
@@ -912,4 +960,119 @@ pub async fn doctor(
     }
 
     Ok(())
+}
+
+/// MCP subcommands.
+pub async fn mcp(config: Config, action: McpAction, json: bool) -> Result<()> {
+    use cuma_core::ports::ToolProvider;
+
+    let registry = cuma_protocol_mcp::McpServerRegistry::from_config(&config);
+
+    match action {
+        McpAction::List => {
+            if json {
+                let servers: Vec<serde_json::Value> = config
+                    .mcp
+                    .iter()
+                    .map(|(name, server)| {
+                        serde_json::json!({
+                            "name": name,
+                            "command": server.command,
+                            "args": server.args,
+                            "enabled": server.enabled,
+                            "allowed_tools": server.allowed_tools,
+                            "share_with_agents": server.share_with_agents,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&servers).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            if config.mcp.is_empty() {
+                println!("No MCP servers are configured. Add one under [mcp.<name>].");
+                return Ok(());
+            }
+            let mut table =
+                Table::new(&["Server", "Enabled", "Shared", "Allowed tools", "Command"]);
+            for (name, server) in &config.mcp {
+                table.row(vec![
+                    name.clone(),
+                    server.enabled.to_string(),
+                    server.share_with_agents.to_string(),
+                    if server.allowed_tools.is_empty() {
+                        "all".to_owned()
+                    } else {
+                        server.allowed_tools.join(", ")
+                    },
+                    std::iter::once(server.command.as_str())
+                        .chain(server.args.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ]);
+            }
+            println!("{}", table.render());
+            Ok(())
+        }
+        McpAction::Tools { server } => {
+            let provider = cuma_protocol_mcp::McpToolProvider::new(registry);
+            let tools = match &server {
+                Some(name) => provider.list_server_tools(name).await?,
+                None => provider.list_tools().await?,
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tools).unwrap_or_default()
+                );
+                return Ok(());
+            }
+            let mut table = Table::new(&["Server", "Tool", "Description"]);
+            for tool in tools {
+                let description: String = tool
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
+                table.row(vec![tool.server, tool.name, description]);
+            }
+            println!("{}", table.render());
+            Ok(())
+        }
+        McpAction::Call { tool, args } => {
+            let arguments: serde_json::Value = serde_json::from_str(&args).map_err(|err| {
+                MetaAgentError::Configuration(format!("--args must be a JSON object: {err}"))
+            })?;
+            let provider = cuma_protocol_mcp::McpToolProvider::new(registry);
+            // Tool output is untrusted data; it is printed, never interpreted.
+            let output = provider.call_tool(&tool, arguments).await?;
+            if json {
+                println!("{}", serde_json::json!({ "tool": tool, "output": output }));
+            } else {
+                println!("{output}");
+            }
+            Ok(())
+        }
+        McpAction::Proxy { name } => {
+            let Some(only) = registry.only(&name) else {
+                return Err(MetaAgentError::Configuration(format!(
+                    "no MCP server named {name:?} is configured"
+                )));
+            };
+            let provider = cuma_protocol_mcp::McpToolProvider::new(only);
+            cuma_protocol_mcp::ToolServer::new(
+                format!("cuma-proxy-{name}"),
+                std::sync::Arc::new(provider),
+            )
+            .serve_stdio()
+            .await
+        }
+    }
 }

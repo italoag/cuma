@@ -20,9 +20,11 @@
 //! backend or malformed output costs recall, never the session.
 
 mod cli;
+mod mcp;
 mod null;
 
 pub use cli::AiMemoryCli;
+pub use mcp::AiMemoryMcp;
 pub use null::NullMemory;
 
 use cuma_core::ports::MemoryStore;
@@ -46,6 +48,14 @@ pub fn from_config(config: &cuma_config::MemoryConfig) -> Arc<dyn MemoryStore> {
             Arc::new(AiMemoryCli::new(command))
         }
         "none" => Arc::new(NullMemory),
+        "ai-memory-mcp" | "mcp" => {
+            // Needs an MCP client, which the caller wires up; see the CLI's
+            // `memory_store`. Reaching here means nobody did.
+            tracing::warn!(
+                "the ai-memory MCP backend needs an MCP tool provider; running without long-term memory"
+            );
+            Arc::new(NullMemory)
+        }
         other => {
             tracing::warn!(
                 backend = other,

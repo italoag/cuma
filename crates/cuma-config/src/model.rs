@@ -15,6 +15,8 @@ pub struct Config {
     pub router: RouterConfig,
     /// Per-agent settings, keyed by agent id.
     pub agents: BTreeMap<String, AgentConfig>,
+    /// MCP servers, keyed by name.
+    pub mcp: BTreeMap<String, McpServerSettings>,
     /// Long-term memory backend.
     pub memory: MemoryConfig,
     /// Output-reduction proxy.
@@ -56,6 +58,34 @@ impl Config {
             return Err(MetaAgentError::Configuration(
                 "limits.max_cost_usd must be positive when set".to_owned(),
             ));
+        }
+
+        for (name, server) in &self.mcp {
+            // The name travels as a command-line argument to the MCP proxy
+            // and as a server name to agents; keep it a plain identifier.
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(MetaAgentError::Configuration(format!(
+                    "mcp.{name}: server names must be letters, digits, '-' or '_'"
+                )));
+            }
+            if server.command.trim().is_empty() {
+                return Err(MetaAgentError::Configuration(format!(
+                    "mcp.{name}.command must be set"
+                )));
+            }
+        }
+
+        if let Some(server) = &self.memory.mcp_server
+            && !self.mcp.contains_key(server)
+        {
+            return Err(MetaAgentError::Configuration(format!(
+                "memory.mcp_server = {server:?} names no [mcp.{server}] section"
+            )));
         }
 
         Ok(())
@@ -270,6 +300,55 @@ impl Default for AgentConfig {
     }
 }
 
+/// One MCP server.
+///
+/// ```toml
+/// [mcp.git]
+/// command = "uvx"
+/// args = ["mcp-server-git"]
+/// allowed_tools = ["git_status", "git_diff", "git_log"]
+/// share_with_agents = true
+///
+/// [mcp.github]
+/// command = "github-mcp-server"
+/// args = ["stdio"]
+/// env = { GITHUB_PERSONAL_ACCESS_TOKEN = "$GH_TOKEN" }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerSettings {
+    /// Whether the server is used at all.
+    pub enabled: bool,
+    /// The command that starts it on stdio.
+    pub command: String,
+    /// Its arguments.
+    pub args: Vec<String>,
+    /// Environment for the child. A value starting with `$` is a reference to
+    /// CUMA's own environment, resolved at launch — never a secret in the file.
+    pub env: BTreeMap<String, String>,
+    /// Tools it may expose. Empty means all.
+    pub allowed_tools: Vec<String>,
+    /// Whether to hand this server to the ACP agents CUMA delegates to.
+    ///
+    /// Off by default. When on, agents reach it through `cuma mcp proxy`, so
+    /// `allowed_tools` still applies and secrets never appear in the ACP
+    /// session request.
+    pub share_with_agents: bool,
+}
+
+impl Default for McpServerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            allowed_tools: Vec::new(),
+            share_with_agents: false,
+        }
+    }
+}
+
 /// Long-term memory backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -278,8 +357,12 @@ pub struct MemoryConfig {
     pub enabled: bool,
     /// How to reach the backend: `ai-memory-cli`, `mcp` or `none`.
     pub backend: String,
-    /// Command that runs the memory backend, for the CLI transport.
+    /// Command that runs the memory backend. For `ai-memory-mcp` it is
+    /// launched as `<command> serve --transport stdio` unless `mcp_server`
+    /// names a configured server instead.
     pub command: Option<String>,
+    /// For the `ai-memory-mcp` backend: an `[mcp.<name>]` server to use.
+    pub mcp_server: Option<String>,
     /// How many memories to inject into a plan.
     pub recall_limit: usize,
 }
@@ -293,6 +376,7 @@ impl Default for MemoryConfig {
             enabled: false,
             backend: "ai-memory-cli".to_owned(),
             command: None,
+            mcp_server: None,
             recall_limit: 8,
         }
     }
@@ -451,6 +535,56 @@ impl Default for TelemetryConfig {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn the_documented_mcp_example_parses() {
+        let config = crate::Config::from_toml(
+            r#"
+            [mcp.git]
+            command = "uvx"
+            args = ["mcp-server-git"]
+            allowed_tools = ["git_status", "git_diff"]
+            share_with_agents = true
+
+            [mcp.github]
+            command = "github-mcp-server"
+            args = ["stdio"]
+            env = { GITHUB_PERSONAL_ACCESS_TOKEN = "$GH_TOKEN" }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp.len(), 2);
+        assert!(config.mcp["git"].share_with_agents);
+        assert!(!config.mcp["github"].share_with_agents, "sharing is opt-in");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_mcp_server_without_a_command_is_rejected() {
+        let config = crate::Config::from_toml("[mcp.git]\nargs = [\"x\"]\n").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn an_mcp_server_name_that_is_not_an_identifier_is_rejected() {
+        let config = crate::Config::from_toml("[mcp.\"a b\"]\ncommand = \"x\"\n").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn memory_cannot_name_an_mcp_server_that_does_not_exist() {
+        let config = crate::Config::from_toml(
+            "[memory]\nbackend = \"ai-memory-mcp\"\nmcp_server = \"nope\"\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_in_an_mcp_section_is_rejected() {
+        assert!(crate::Config::from_toml("[mcp.git]\ncommand = \"x\"\nshare = true\n").is_err());
+    }
 
     #[test]
     fn cost_first_weights_cost_above_quality() {

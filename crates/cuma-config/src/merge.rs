@@ -85,10 +85,18 @@ impl Config {
             self.agents.insert(id, agent);
         }
 
+        // --- mcp ----------------------------------------------------------
+        // Keyed like agents: a project adds a server without dropping the
+        // user's, and redefining one replaces that one.
+        for (name, server) in other.mcp {
+            self.mcp.insert(name, server);
+        }
+
         // --- memory -------------------------------------------------------
         merge_field!(self.memory.enabled, other.memory.enabled, d.memory.enabled);
         merge_field!(self.memory.backend, other.memory.backend, d.memory.backend);
         merge_option!(self.memory.command, other.memory.command);
+        merge_option!(self.memory.mcp_server, other.memory.mcp_server);
         merge_field!(
             self.memory.recall_limit,
             other.memory.recall_limit,

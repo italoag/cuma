@@ -28,6 +28,22 @@ pub struct McpServerConfig {
     /// and "the agent can do whatever this server implements".
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Whether ACP agents may be handed this server (through the proxy).
+    #[serde(default)]
+    pub share_with_agents: bool,
+}
+
+impl From<&cuma_config::McpServerSettings> for McpServerConfig {
+    fn from(settings: &cuma_config::McpServerSettings) -> Self {
+        Self {
+            command: settings.command.clone(),
+            args: settings.args.clone(),
+            env: settings.env.clone(),
+            enabled: settings.enabled,
+            allowed_tools: settings.allowed_tools.clone(),
+            share_with_agents: settings.share_with_agents,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -43,6 +59,7 @@ impl McpServerConfig {
             env: BTreeMap::new(),
             enabled: true,
             allowed_tools: Vec::new(),
+            share_with_agents: false,
         }
     }
 
@@ -136,15 +153,60 @@ impl McpServerRegistry {
         self.servers.is_empty()
     }
 
-    /// Parse a `.cuma/mcp.toml` file.
-    pub fn from_toml(text: &str) -> Result<Self> {
-        toml_parse(text)
+    /// The servers in the `[mcp.*]` section of a configuration.
+    pub fn from_config(config: &cuma_config::Config) -> Self {
+        Self {
+            servers: config
+                .mcp
+                .iter()
+                .map(|(name, settings)| (name.clone(), McpServerConfig::from(settings)))
+                .collect(),
+        }
+    }
+
+    /// A registry holding only `name`, if it is configured.
+    pub fn only(&self, name: &str) -> Option<Self> {
+        let config = self.servers.get(name)?.clone();
+        Some(Self {
+            servers: BTreeMap::from([(name.to_owned(), config)]),
+        })
+    }
+
+    /// Enabled servers the operator chose to share with agents.
+    pub fn shared(&self) -> impl Iterator<Item = (&String, &McpServerConfig)> {
+        self.enabled().filter(|(_, c)| c.share_with_agents)
+    }
+
+    /// Parse a JSON map of server name to settings — the shape other MCP
+    /// hosts use in their `mcpServers` files.
+    pub fn from_json(text: &str) -> Result<Self> {
+        json_parse(text)
     }
 }
 
-fn toml_parse(text: &str) -> Result<McpServerRegistry> {
-    // Parsed via serde_json's Value only to avoid pulling a second TOML
-    // dependency chain into this crate; `cuma-config` owns TOML parsing.
+/// How an agent launches a shared server: `cuma mcp proxy <name>`, rooted in
+/// `workspace` so the proxy reads the same configuration CUMA did.
+///
+/// Returned as a program and arguments; the caller wraps it in whatever its
+/// protocol calls an MCP server declaration.
+pub fn shared_server_command(
+    cuma: &std::path::Path,
+    workspace: &std::path::Path,
+    name: &str,
+) -> (String, Vec<String>) {
+    (
+        cuma.display().to_string(),
+        vec![
+            "--workspace".to_owned(),
+            workspace.display().to_string(),
+            "mcp".to_owned(),
+            "proxy".to_owned(),
+            name.to_owned(),
+        ],
+    )
+}
+
+fn json_parse(text: &str) -> Result<McpServerRegistry> {
     let parsed: BTreeMap<String, McpServerConfig> = match serde_json::from_str(text) {
         Ok(map) => map,
         Err(err) => {

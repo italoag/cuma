@@ -106,6 +106,76 @@ pub fn database_path(config: &Config, workspace: &Path) -> PathBuf {
         .map_or_else(|| workspace.join(".cuma").join("runtime.db"), PathBuf::from)
 }
 
+/// The MCP servers to hand every ACP agent.
+///
+/// Each is declared as `cuma mcp proxy <name>` rather than as the server's
+/// own command: the agent then reaches it through CUMA, which enforces the
+/// server's allowlist and resolves its secrets from CUMA's environment, so
+/// neither the allowlist nor a token depends on the agent behaving.
+pub fn shared_mcp_servers(
+    config: &Config,
+    workspace: &Path,
+) -> Vec<cuma_protocol_acp::SharedMcpServer> {
+    let registry = cuma_protocol_mcp::McpServerRegistry::from_config(config);
+    if registry.shared().next().is_none() {
+        return Vec::new();
+    }
+
+    let Ok(cuma) = std::env::current_exe() else {
+        tracing::warn!("cannot locate the cuma executable; MCP servers will not be shared");
+        return Vec::new();
+    };
+
+    registry
+        .shared()
+        .map(|(name, _)| {
+            let (command, args) = cuma_protocol_mcp::shared_server_command(&cuma, workspace, name);
+            cuma_protocol_acp::SharedMcpServer {
+                name: name.clone(),
+                command,
+                args,
+            }
+        })
+        .collect()
+}
+
+/// Build the long-term memory store the configuration asks for.
+///
+/// `ai-memory-mcp` talks to `ai-memory serve --transport stdio` (or the
+/// `[mcp.<name>]` server `memory.mcp_server` names); everything else is
+/// handled by [`cuma_memory::from_config`].
+pub fn memory_store(config: &Config, workspace: &Path) -> Arc<dyn cuma_core::ports::MemoryStore> {
+    let memory = &config.memory;
+    if !memory.enabled || !matches!(memory.backend.as_str(), "ai-memory-mcp" | "mcp") {
+        return cuma_memory::from_config(memory);
+    }
+
+    let registry = match &memory.mcp_server {
+        Some(name) => cuma_protocol_mcp::McpServerRegistry::from_config(config)
+            .only(name)
+            .unwrap_or_default(),
+        None => {
+            let command = memory
+                .command
+                .clone()
+                .unwrap_or_else(|| "ai-memory".to_owned());
+            let mut registry = cuma_protocol_mcp::McpServerRegistry::new();
+            registry.add(
+                "ai-memory",
+                cuma_protocol_mcp::McpServerConfig::new(command)
+                    .arg("serve")
+                    .arg("--transport")
+                    .arg("stdio"),
+            );
+            registry
+        }
+    };
+
+    let tools: Arc<dyn cuma_core::ports::ToolProvider> =
+        Arc::new(cuma_protocol_mcp::McpToolProvider::new(registry));
+    Arc::new(cuma_memory::AiMemoryMcp::new(tools).in_workspace(workspace))
+}
+
 /// Build a fully wired orchestrator: agents discovered, memory attached,
 /// history restored.
 ///
@@ -137,7 +207,11 @@ pub async fn build_orchestrator(
     let mut orchestrator = Orchestrator::new(config.clone(), planner, workspace.clone());
 
     // --- ACP agents -------------------------------------------------------
-    let acp = AcpConfigDiscovery::new(config.clone());
+    let shared = shared_mcp_servers(&config, &workspace);
+    if !shared.is_empty() {
+        tracing::info!(count = shared.len(), "offering MCP servers to ACP agents");
+    }
+    let acp = AcpConfigDiscovery::new(config.clone()).with_mcp_servers(shared);
     for adapter in acp.adapters() {
         let id = adapter.agent_id().clone();
 
@@ -167,7 +241,7 @@ pub async fn build_orchestrator(
     }
 
     // --- memory -----------------------------------------------------------
-    let memory = cuma_memory::from_config(&config.memory);
+    let memory = memory_store(&config, &workspace);
     if config.memory.enabled && !memory.is_available().await {
         warnings.push(
             "long-term memory is enabled but its backend is not reachable; \

@@ -3,9 +3,10 @@
 use crate::capabilities::capabilities_from_initialize;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, StopReason, TextContent, Usage, UsageUpdate,
+    ContentBlock, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent, Usage,
+    UsageUpdate,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use async_trait::async_trait;
@@ -57,6 +58,29 @@ pub struct AcpAdapter {
     id: AgentId,
     command: String,
     permission_policy: PermissionPolicy,
+    mcp_servers: Vec<SharedMcpServer>,
+}
+
+/// An MCP server to hand an agent in `session/new`.
+///
+/// Plain data, so whoever builds it needs no ACP types. Every ACP agent must
+/// accept stdio servers, so that is the only transport offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedMcpServer {
+    /// The name the agent will know it by.
+    pub name: String,
+    /// The program to launch.
+    pub command: String,
+    /// Its arguments.
+    pub args: Vec<String>,
+}
+
+impl SharedMcpServer {
+    fn to_acp(&self) -> McpServer {
+        McpServer::Stdio(
+            McpServerStdio::new(self.name.clone(), self.command.clone()).args(self.args.clone()),
+        )
+    }
 }
 
 impl AcpAdapter {
@@ -70,7 +94,20 @@ impl AcpAdapter {
             id,
             command: command.into(),
             permission_policy: PermissionPolicy::AllowLowRisk,
+            mcp_servers: Vec::new(),
         }
+    }
+
+    /// MCP servers to offer the agent in every session.
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<SharedMcpServer>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    /// The MCP servers this adapter offers its agent.
+    pub fn mcp_servers(&self) -> &[SharedMcpServer] {
+        &self.mcp_servers
     }
 
     /// Seed the adapter with a configured descriptor.
@@ -249,6 +286,11 @@ impl AgentAdapter for AcpAdapter {
         let prompt_text = request.prompt.clone();
         let workspace = request.workspace.clone();
         let agent_id = self.id.clone();
+        let mcp_servers: Vec<McpServer> = self
+            .mcp_servers
+            .iter()
+            .map(SharedMcpServer::to_acp)
+            .collect();
 
         // Collected assistant text and the latest usage report, shared with
         // the notification handler.
@@ -312,7 +354,7 @@ impl AgentAdapter for AcpAdapter {
                     .await?;
 
                 let session = connection
-                    .send_request(NewSessionRequest::new(workspace))
+                    .send_request(NewSessionRequest::new(workspace).mcp_servers(mcp_servers))
                     .block_task()
                     .await?;
 
@@ -435,6 +477,47 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use agent_client_protocol::schema::v1::Cost;
+
+    #[test]
+    fn a_shared_mcp_server_is_declared_as_a_stdio_server() {
+        let shared = SharedMcpServer {
+            name: "git".into(),
+            command: "/usr/bin/cuma".into(),
+            args: vec!["mcp".into(), "proxy".into(), "git".into()],
+        };
+        let json = serde_json::to_value(shared.to_acp()).unwrap();
+
+        assert_eq!(json["name"], "git");
+        assert_eq!(json["command"], "/usr/bin/cuma");
+        assert_eq!(json["args"][2], "git");
+        assert!(
+            json.get("type").is_none(),
+            "stdio servers carry no type tag"
+        );
+        assert_eq!(
+            json["env"],
+            serde_json::json!([]),
+            "no secrets travel in the request"
+        );
+    }
+
+    #[test]
+    fn discovered_agents_are_offered_the_shared_servers() {
+        let config = cuma_config::Config::from_toml(
+            "[agents.echo]\nprotocol = \"acp\"\ncommand = \"echo\"\n",
+        )
+        .unwrap();
+        let shared = vec![SharedMcpServer {
+            name: "git".into(),
+            command: "cuma".into(),
+            args: Vec::new(),
+        }];
+
+        let adapters = crate::AcpConfigDiscovery::new(config)
+            .with_mcp_servers(shared.clone())
+            .adapters();
+        assert_eq!(adapters[0].mcp_servers(), shared.as_slice());
+    }
 
     #[test]
     fn a_turns_own_usage_is_taken_as_reported() {

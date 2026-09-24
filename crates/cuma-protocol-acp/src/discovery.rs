@@ -21,6 +21,8 @@ pub struct AcpConfigDiscovery {
     /// On by default: an agent the router can select but the machine cannot
     /// launch wins routing decisions and then fails every one of them.
     require_launchable: bool,
+    /// MCP servers every discovered agent is offered.
+    mcp_servers: Vec<crate::SharedMcpServer>,
 }
 
 impl AcpConfigDiscovery {
@@ -29,7 +31,15 @@ impl AcpConfigDiscovery {
         Self {
             config,
             require_launchable: true,
+            mcp_servers: Vec::new(),
         }
+    }
+
+    /// Offer `servers` to every agent discovered.
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<crate::SharedMcpServer>) -> Self {
+        self.mcp_servers = servers;
+        self
     }
 
     /// Register agents even when their command is missing.
@@ -60,7 +70,8 @@ impl AcpConfigDiscovery {
                 continue;
             };
 
-            let adapter = AcpAdapter::new(id.as_str(), command);
+            let adapter =
+                AcpAdapter::new(id.as_str(), command).with_mcp_servers(self.mcp_servers.clone());
 
             if self.require_launchable && !adapter.is_launchable() {
                 tracing::info!(

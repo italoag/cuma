@@ -198,6 +198,21 @@ pub trait MemoryStore: Send + Sync {
 
     /// Record a memory.
     async fn remember(&self, content: &str, kind: &str) -> Result<String>;
+
+    /// Publish a handoff so that the agent picking the work up — or a human,
+    /// later — can find it outside this process.
+    ///
+    /// Returns the backend's identifier for it, or `None` when the backend
+    /// has nowhere to put handoffs. The default does nothing: a handoff is
+    /// always passed to the receiving agent directly, and this is only its
+    /// durable copy.
+    async fn record_handoff(
+        &self,
+        handoff: &crate::handoff::AgentHandoff,
+    ) -> Result<Option<String>> {
+        let _ = handoff;
+        Ok(None)
+    }
 }
 
 /// A tool the harness or an agent can call.

@@ -11,9 +11,9 @@ authors.workspace = true
 [dependencies]
 cuma-core.workspace = true
 cuma-config.workspace = true
-rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+rmcp = { workspace = true, features = ["client", "server", "transport-child-process", "transport-io"] }
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "process", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "process", "rt", "io-util", "io-std"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,6 +21,7 @@ shell-words.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
 
 [lints]
 workspace = true

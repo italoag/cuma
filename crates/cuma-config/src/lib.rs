@@ -18,8 +18,9 @@ mod merge;
 mod model;
 
 pub use model::{
-    AgentConfig, Config, LimitsConfig, MemoryConfig, RouterConfig, RouterWeights, RoutingStrategy,
-    RtkConfig, RtkMode, SecurityConfig, SkillAutoInstall, SkillsConfig, TelemetryConfig,
+    AgentConfig, Config, LimitsConfig, McpServerSettings, MemoryConfig, RouterConfig,
+    RouterWeights, RoutingStrategy, RtkConfig, RtkMode, SecurityConfig, SkillAutoInstall,
+    SkillsConfig, TelemetryConfig,
 };
 
 use cuma_core::error::{MetaAgentError, Result};

@@ -6,6 +6,7 @@
 
 mod commands;
 mod harness;
+mod mcp_tools;
 mod output;
 
 use clap::{Parser, Subcommand};
@@ -67,7 +68,7 @@ enum Command {
     ///
     /// Logs go to stderr; stdout is the protocol channel.
     Serve {
-        /// Which protocol to serve: `acp` (stdio) or `a2a` (HTTP).
+        /// Which protocol to serve: `acp` (stdio), `a2a` (HTTP) or `mcp` (stdio).
         #[arg(long, default_value = "acp")]
         protocol: String,
 
@@ -92,6 +93,12 @@ enum Command {
     Skills {
         #[command(subcommand)]
         action: commands::SkillAction,
+    },
+
+    /// Inspect and call MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        action: commands::McpAction,
     },
 
     /// Inspect long-term memory.
@@ -180,7 +187,10 @@ async fn run() -> Result<()> {
         Some(Command::Agents { action }) => commands::agents(config, action, cli.json).await,
         Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
         Some(Command::Skills { action }) => commands::skills(config, action, cli.json).await,
-        Some(Command::Memory { action }) => commands::memory(config, action, cli.json).await,
+        Some(Command::Memory { action }) => {
+            commands::memory(config, workspace, action, cli.json).await
+        }
+        Some(Command::Mcp { action }) => commands::mcp(config, action, cli.json).await,
         Some(Command::Usage { by_model }) => {
             commands::usage(config, workspace, by_model, cli.json).await
         }
