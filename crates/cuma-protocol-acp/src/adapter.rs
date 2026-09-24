@@ -5,7 +5,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, StopReason, TextContent,
+    SessionNotification, SessionUpdate, StopReason, TextContent, Usage, UsageUpdate,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use async_trait::async_trait;
@@ -152,6 +152,49 @@ fn translate_update(notification: &SessionNotification) -> Option<ExecutionUpdat
     }
 }
 
+/// Work out an attempt's token usage from what the agent reported.
+///
+/// In order of preference:
+///
+/// 1. the turn's own usage (`PromptResponse.usage`) — exact, and marked
+///    reported;
+/// 2. the last `UsageUpdate`: its `used` is the context the agent held, which
+///    for a fresh session is the input it consumed, but output is not
+///    reported, so it is estimated from the transcript and the whole figure
+///    is marked estimated;
+/// 3. an estimate from the text exchanged.
+///
+/// Each attempt runs in a fresh ACP session, so session-cumulative figures
+/// are this attempt's figures.
+fn account_tokens(
+    turn: Option<&Usage>,
+    context: Option<&UsageUpdate>,
+    prompt: &str,
+    output: &str,
+) -> TokenUsage {
+    if let Some(turn) = turn {
+        let mut tokens = TokenUsage::reported(turn.input_tokens, turn.output_tokens);
+        tokens.cached = turn.cached_read_tokens.unwrap_or(0);
+        return tokens;
+    }
+
+    let estimate = TokenUsage::estimate_from_text(prompt, output);
+    match context {
+        Some(report) if report.used > 0 => TokenUsage::estimated(report.used, estimate.output),
+        _ => estimate,
+    }
+}
+
+/// The cost an agent reported, when it reported one in dollars.
+///
+/// Other currencies are not converted: an exchange rate CUMA made up would be
+/// exactly the kind of estimate presented as a measurement it refuses to make.
+fn reported_cost(report: &UsageUpdate) -> Option<f64> {
+    let cost = report.cost.as_ref()?;
+    (cost.currency.eq_ignore_ascii_case("USD") && cost.amount.is_finite() && cost.amount >= 0.0)
+        .then_some(cost.amount)
+}
+
 /// Map an ACP stop reason onto success or a classified failure.
 fn interpret_stop_reason(reason: StopReason) -> std::result::Result<(), (ErrorClass, String)> {
     match reason {
@@ -207,16 +250,22 @@ impl AgentAdapter for AcpAdapter {
         let workspace = request.workspace.clone();
         let agent_id = self.id.clone();
 
-        // Collected assistant text, shared with the notification handler.
+        // Collected assistant text and the latest usage report, shared with
+        // the notification handler.
         let transcript = Arc::new(Mutex::new(String::new()));
         let transcript_for_handler = Arc::clone(&transcript);
+        let usage = Arc::new(Mutex::new(None::<UsageUpdate>));
+        let usage_for_handler = Arc::clone(&usage);
         let updates_for_handler = updates.clone();
 
-        let stop_reason = agent_client_protocol::Client
+        let (stop_reason, turn_usage) = agent_client_protocol::Client
             .builder()
             .name("cuma")
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::UsageUpdate(report) = &notification.update {
+                        *usage_for_handler.lock().await = Some(report.clone());
+                    }
                     if let Some(update) = translate_update(&notification) {
                         if let ExecutionUpdate::Text { content } = &update {
                             transcript_for_handler.lock().await.push_str(content);
@@ -275,7 +324,7 @@ impl AgentAdapter for AcpAdapter {
                     .block_task()
                     .await?;
 
-                Ok(response.stop_reason)
+                Ok((response.stop_reason, response.usage))
             })
             .await
             .map_err(|err| {
@@ -286,6 +335,14 @@ impl AgentAdapter for AcpAdapter {
             })?;
 
         let output = transcript.lock().await.clone();
+        let context_report = usage.lock().await.clone();
+        let tokens = account_tokens(
+            turn_usage.as_ref(),
+            context_report.as_ref(),
+            &request.prompt,
+            &output,
+        );
+        let reported_cost_usd = context_report.as_ref().and_then(reported_cost);
         #[allow(clippy::cast_possible_truncation)]
         let latency_ms = started.elapsed().as_millis() as u64;
 
@@ -303,13 +360,11 @@ impl AgentAdapter for AcpAdapter {
             // ACP does not report changed files as part of a prompt turn.
             // Claiming otherwise would put fabricated paths in the handoff.
             changed_files: Vec::new(),
-            // Token reporting is behind an unstable ACP feature. Rather than
-            // guess, usage is marked estimated and zero, so the ledger shows
-            // "unknown" instead of a made-up number.
-            tokens: TokenUsage::estimated(0, 0),
+            tokens,
             latency_ms,
             failure_class,
             failure_reason,
+            reported_cost_usd,
         })
     }
 
@@ -379,6 +434,48 @@ impl AcpAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use agent_client_protocol::schema::v1::Cost;
+
+    #[test]
+    fn a_turns_own_usage_is_taken_as_reported() {
+        let turn = Usage::new(1_500, 1_200, 300);
+        let tokens = account_tokens(Some(&turn), None, "prompt", "output");
+        assert!(tokens.reported);
+        assert_eq!((tokens.input, tokens.output), (1_200, 300));
+    }
+
+    #[test]
+    fn a_context_report_supplies_input_but_the_total_stays_an_estimate() {
+        let context = UsageUpdate::new(40_000, 200_000);
+        let tokens = account_tokens(None, Some(&context), "prompt", &"x".repeat(400));
+        assert_eq!(tokens.input, 40_000);
+        assert_eq!(tokens.output, 100);
+        assert!(
+            !tokens.reported,
+            "output was estimated, so the whole figure is"
+        );
+    }
+
+    #[test]
+    fn with_no_report_tokens_are_estimated_from_the_text_and_never_zero() {
+        let tokens = account_tokens(None, None, &"p".repeat(80), &"o".repeat(40));
+        assert!(!tokens.reported);
+        assert_eq!((tokens.input, tokens.output), (20, 10));
+    }
+
+    #[test]
+    fn only_a_dollar_cost_is_taken_at_face_value() {
+        let usd = UsageUpdate::new(1, 1).cost(Cost::new(0.045, "USD"));
+        assert_eq!(reported_cost(&usd), Some(0.045));
+
+        let eur = UsageUpdate::new(1, 1).cost(Cost::new(0.045, "EUR"));
+        assert_eq!(reported_cost(&eur), None, "no invented exchange rate");
+
+        let nonsense = UsageUpdate::new(1, 1).cost(Cost::new(-3.0, "USD"));
+        assert_eq!(reported_cost(&nonsense), None);
+
+        assert_eq!(reported_cost(&UsageUpdate::new(1, 1)), None);
+    }
 
     #[test]
     fn a_read_only_task_is_permitted_under_the_default_policy() {

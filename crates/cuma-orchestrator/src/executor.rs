@@ -25,6 +25,20 @@ use tokio::sync::Mutex;
 /// Bounded so a stuck subscriber cannot hold up the next task.
 const UPDATE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Releases a wave's ownership claims when dropped.
+struct ClaimsGuard<'a> {
+    ledger: &'a cuma_workspace::OwnershipLedger,
+    tasks: Vec<TaskId>,
+}
+
+impl Drop for ClaimsGuard<'_> {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            self.ledger.release(task);
+        }
+    }
+}
+
 /// What a session produced.
 #[derive(Debug, Clone)]
 pub struct SessionResult {
@@ -191,8 +205,16 @@ impl Orchestrator {
 
     /// Plan and execute a goal end to end.
     pub async fn run(&self, goal: &str) -> Result<SessionResult> {
-        let session_id = SessionId::generate();
+        self.run_session(SessionId::generate(), goal).await
+    }
 
+    /// Plan and execute a goal under a session id the caller chose.
+    ///
+    /// A front end that serves several sessions at once subscribes to the bus
+    /// *before* starting a run and keeps only events carrying its own id;
+    /// choosing the id up front is what makes that filter possible without a
+    /// race.
+    pub async fn run_session(&self, session_id: SessionId, goal: &str) -> Result<SessionResult> {
         self.events.publish(Event::session(
             session_id.clone(),
             EventKind::SessionStarted {
@@ -424,6 +446,14 @@ impl Orchestrator {
             // together; everything it refuses waits for the next wave.
             let ready = self.admit_concurrently(&graph, ready);
 
+            // Released on drop as well as explicitly below: a run that is
+            // aborted mid-wave (a cancelled A2A task, a dropped ACP prompt)
+            // must not leave its paths locked for every later session.
+            let _claims = ClaimsGuard {
+                ledger: &self.ownership,
+                tasks: ready.clone(),
+            };
+
             // Everything admitted writes somewhere nothing else in this wave
             // writes, so it can run concurrently. `execute_task` needs `&mut
             // TaskGraph`, so each task runs against a clone of the graph and
@@ -652,6 +682,7 @@ impl Orchestrator {
             let tokens = outcome
                 .as_ref()
                 .map_or(TokenUsage::estimated(0, 0), |o| o.tokens);
+            let reported_cost = outcome.as_ref().and_then(|o| o.reported_cost_usd);
 
             self.record_attempt(
                 session_id,
@@ -662,6 +693,7 @@ impl Orchestrator {
                 started_at,
                 latency_ms,
                 tokens,
+                reported_cost,
                 failure.is_none(),
                 failure.as_ref().map(|(class, _)| *class),
                 attempts_on_target,
@@ -748,6 +780,7 @@ impl Orchestrator {
                 latency_ms,
                 failure_class: Some(class),
                 failure_reason: Some(reason.clone()),
+                reported_cost_usd: None,
             });
 
             let attempts_so_far = if let Some(task) = graph.get_mut(task_id) {
@@ -961,11 +994,13 @@ impl Orchestrator {
         started_at: chrono::DateTime<chrono::Utc>,
         latency_ms: u64,
         tokens: TokenUsage,
+        reported_cost: Option<f64>,
         success: bool,
         failure_class: Option<cuma_core::ErrorClass>,
         retry_count: u32,
     ) {
-        let cost = match (self.agents.get(agent_id).await, model_id) {
+        // What the agent says it spent beats what a price table predicts.
+        let estimated = match (self.agents.get(agent_id).await, model_id) {
             (Some(agent), Some(model_id)) => agent
                 .model(model_id)
                 .map(|m| &m.cost)
@@ -973,6 +1008,7 @@ impl Orchestrator {
             (Some(agent), None) => cuma_usage::estimate_cost(&agent.cost_profile, tokens),
             _ => None,
         };
+        let cost = reported_cost.or(estimated);
 
         self.usage.lock().await.record(UsageRecord {
             attempt_id: attempt_id.clone(),
@@ -986,6 +1022,7 @@ impl Orchestrator {
             latency_ms,
             tokens,
             estimated_cost_usd: cost,
+            cost_reported: reported_cost.is_some(),
             success,
             failure_class,
             retry_count,

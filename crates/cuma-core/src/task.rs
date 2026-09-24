@@ -162,6 +162,16 @@ impl TokenUsage {
         }
     }
 
+    /// Usage estimated from the text sent and received.
+    ///
+    /// Roughly four bytes per token. Crude, and marked as an estimate for
+    /// exactly that reason; its use is for transports that report nothing,
+    /// where a rough non-zero figure is more useful to a budget than zero.
+    pub fn estimate_from_text(input: &str, output: &str) -> Self {
+        let tokens = |text: &str| (text.len() as u64).div_ceil(4);
+        Self::estimated(tokens(input), tokens(output))
+    }
+
     /// Input plus output. Cached tokens are already counted in `input`.
     pub fn total(&self) -> u64 {
         self.input.saturating_add(self.output)
@@ -266,6 +276,12 @@ pub struct ExecutionOutcome {
     pub failure_class: Option<crate::error::ErrorClass>,
     /// Human-readable failure reason.
     pub failure_reason: Option<String>,
+    /// USD the agent itself reported spending on this attempt.
+    ///
+    /// `None` when the agent reported nothing, which is the usual case; the
+    /// harness then estimates from its price table and labels it as such.
+    #[serde(default)]
+    pub reported_cost_usd: Option<f64>,
 }
 
 /// A task, as tracked by the orchestrator.
@@ -646,6 +662,7 @@ mod tests {
             latency_ms: 10,
             failure_class: Some(crate::error::ErrorClass::RateLimit),
             failure_reason: Some("429".into()),
+            reported_cost_usd: None,
         });
 
         let failed = task.failed_targets();
@@ -668,6 +685,7 @@ mod tests {
                 latency_ms: 1,
                 failure_class: None,
                 failure_reason: None,
+                reported_cost_usd: None,
             });
         }
         assert_eq!(task.total_tokens().total(), 300);

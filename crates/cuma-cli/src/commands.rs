@@ -306,7 +306,8 @@ pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
 
 /// Serve CUMA itself as an agent.
 pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &str) -> Result<()> {
-    let (orchestrator, warnings) = harness::build_orchestrator(config, workspace).await?;
+    let database = harness::database_path(&config, &workspace);
+    let (orchestrator, warnings) = harness::build_orchestrator(config, workspace.clone()).await?;
 
     // Warnings go to stderr: stdout carries the protocol.
     for warning in &warnings {
@@ -326,7 +327,17 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
                 "serving {} agents over ACP on stdio",
                 orchestrator.agents().len().await
             );
-            cuma_server_acp::serve_stdio(orchestrator).await
+            // Sessions live beside the runtime database, so `session/load`
+            // can restore a conversation after the editor restarts CUMA.
+            let sessions_dir = database
+                .parent()
+                .map_or_else(|| workspace.join(".cuma"), std::path::Path::to_path_buf)
+                .join("acp-sessions");
+            cuma_server_acp::serve_stdio_with(
+                orchestrator,
+                cuma_server_acp::SessionRegistry::persistent(sessions_dir),
+            )
+            .await
         }
         "a2a" => {
             let address: std::net::SocketAddr = bind.parse().map_err(|err| {

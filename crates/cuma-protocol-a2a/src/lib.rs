@@ -24,7 +24,11 @@
 mod card;
 mod client;
 mod server;
+pub mod wire;
 
-pub use card::{AgentCard, AgentCardCapabilities, AgentSkill, capabilities_from_card};
+pub use card::{
+    AGENT_CARD_PATH, AgentCard, AgentCardCapabilities, AgentInterface, AgentSkill,
+    capabilities_from_card,
+};
 pub use client::{A2aAdapter, A2aDiscovery};
-pub use server::{agent_card, goal_from_params, handle_rpc, serve};
+pub use server::{A2aServer, Reply, TaskStream, agent_card, goal_from_params, handle_rpc, serve};

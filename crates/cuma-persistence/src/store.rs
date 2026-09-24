@@ -430,6 +430,7 @@ mod tests {
             latency_ms: 1000,
             tokens: TokenUsage::reported(100, 50),
             estimated_cost_usd: cost,
+            cost_reported: false,
             success,
             failure_class: (!success).then_some(cuma_core::ErrorClass::RateLimit),
             retry_count: 0,

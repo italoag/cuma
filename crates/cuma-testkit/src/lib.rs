@@ -187,6 +187,7 @@ impl AgentAdapter for MockAgent {
                 latency_ms: started.elapsed().as_millis() as u64,
                 failure_class: class,
                 failure_reason: reason,
+                reported_cost_usd: None,
             }
         };
 

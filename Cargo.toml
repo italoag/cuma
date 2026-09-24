@@ -83,7 +83,7 @@ which = "8"
 tempfile = "3.27"
 
 # --- protocol SDKs (validated against crates.io index, see DEPENDENCY_ANALYSIS.md) ---
-agent-client-protocol = "2.0"
+agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage"] }
 rmcp = "3.1"
 
 # --- storage ---

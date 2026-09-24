@@ -39,6 +39,10 @@ pub struct UsageRecord {
     pub tokens: TokenUsage,
     /// Estimated USD. `None` when pricing is unknown — never `Some(0.0)`.
     pub estimated_cost_usd: Option<f64>,
+    /// Whether `estimated_cost_usd` is the agent's own figure rather than
+    /// the harness's estimate.
+    #[serde(default)]
+    pub cost_reported: bool,
     /// Whether the attempt succeeded.
     pub success: bool,
     /// How it failed, when it did.
@@ -297,6 +301,7 @@ mod tests {
                 reported,
             },
             estimated_cost_usd: cost,
+            cost_reported: false,
             success,
             failure_class: if success {
                 None

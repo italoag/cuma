@@ -172,6 +172,7 @@ mod tests {
             latency_ms: 1,
             failure_class: None,
             failure_reason: None,
+            reported_cost_usd: None,
         });
         task
     }
@@ -287,6 +288,7 @@ mod tests {
             latency_ms: 1,
             failure_class: Some(cuma_core::ErrorClass::TaskFailure),
             failure_reason: Some("the mock server rejects PKCE".into()),
+            reported_cost_usd: None,
         });
 
         let prompt = MinimalContextManager::new()

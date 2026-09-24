@@ -84,6 +84,7 @@ impl AgentAdapter for ConcurrencyProbe {
             latency_ms: 1,
             failure_class: None,
             failure_reason: None,
+            reported_cost_usd: None,
         })
     }
 }

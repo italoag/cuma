@@ -314,3 +314,278 @@ async fn internal_bookkeeping_does_not_leak_into_the_client_transcript() {
     assert!(!outcome.transcript.contains("circuit breaker"));
     assert!(!outcome.transcript.contains("Rejected:"));
 }
+
+// ---------------------------------------------------------------------------
+// Several sessions, cancellation, and reloading
+// ---------------------------------------------------------------------------
+
+/// Transcripts per ACP session id, as a client saw them.
+type Transcripts = Arc<Mutex<std::collections::HashMap<String, String>>>;
+
+/// Start CUMA on a pipe and return the client's end.
+fn serve_in_background(
+    orchestrator: Orchestrator,
+    sessions: cuma_server_acp::SessionRegistry,
+) -> tokio::io::DuplexStream {
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let _ =
+            cuma_server_acp::serve_with(orchestrator, sessions, byte_streams(server_side)).await;
+    });
+    client_side
+}
+
+/// Run `body` as an ACP client over `stream`, recording every text chunk by
+/// session and marking which side of the conversation it came from.
+async fn with_client<R>(
+    stream: tokio::io::DuplexStream,
+    transcripts: &Transcripts,
+    body: impl AsyncFnOnce(ConnectionTo<Agent>) -> Result<R, agent_client_protocol::Error>,
+) -> R {
+    let transcripts = Arc::clone(transcripts);
+    agent_client_protocol::Client
+        .builder()
+        .name("editor")
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                use agent_client_protocol::schema::v1::SessionUpdate;
+                let (prefix, chunk) = match &notification.update {
+                    SessionUpdate::AgentMessageChunk(chunk) => ("", chunk),
+                    SessionUpdate::UserMessageChunk(chunk) => ("USER: ", chunk),
+                    _ => return Ok(()),
+                };
+                if let ContentBlock::Text(text) = &chunk.content
+                    && let Ok(mut all) = transcripts.lock()
+                {
+                    let entry = all.entry(notification.session_id.to_string()).or_default();
+                    entry.push_str(prefix);
+                    entry.push_str(&text.text);
+                    entry.push('\n');
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(byte_streams(stream), body)
+        .await
+        .unwrap()
+}
+
+fn text(goal: &str) -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(TextContent::new(goal.to_owned()))]
+}
+
+#[tokio::test]
+async fn concurrent_sessions_see_only_their_own_work() {
+    let worker = MockAgent::always(
+        "worker",
+        Behaviour::Slow {
+            delay: std::time::Duration::from_millis(200),
+            output: "slow work".into(),
+        },
+    )
+    .with_descriptor(descriptor("worker"));
+
+    let client_side = serve_in_background(
+        orchestrator_with(vec![worker]).await,
+        cuma_server_acp::SessionRegistry::new(),
+    );
+    let transcripts = Transcripts::default();
+
+    let (first, second) = with_client(client_side, &transcripts, async |connection| {
+        connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let a = connection
+            .send_request(NewSessionRequest::new(std::env::temp_dir()))
+            .block_task()
+            .await?
+            .session_id;
+        let b = connection
+            .send_request(NewSessionRequest::new(std::env::temp_dir()))
+            .block_task()
+            .await?
+            .session_id;
+
+        // Both prompts are in flight at once.
+        let first = connection.send_request(PromptRequest::new(a.clone(), text("write docs")));
+        let second = connection.send_request(PromptRequest::new(b.clone(), text("write docs")));
+        first.block_task().await?;
+        second.block_task().await?;
+        Ok((a.to_string(), b.to_string()))
+    })
+    .await;
+
+    let all = transcripts.lock().unwrap().clone();
+    for session in [&first, &second] {
+        let transcript = all.get(session).cloned().unwrap_or_default();
+        assert_eq!(
+            transcript.matches("Planned").count(),
+            1,
+            "session {session} saw another session's plan:\n{transcript}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_can_cancel_a_running_prompt() {
+    let worker = MockAgent::always(
+        "worker",
+        Behaviour::Slow {
+            delay: std::time::Duration::from_secs(30),
+            output: "never".into(),
+        },
+    )
+    .with_descriptor(descriptor("worker"));
+
+    let client_side = serve_in_background(
+        orchestrator_with(vec![worker]).await,
+        cuma_server_acp::SessionRegistry::new(),
+    );
+    let transcripts = Transcripts::default();
+
+    let started = std::time::Instant::now();
+    let stop = with_client(client_side, &transcripts, async |connection| {
+        connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let session = connection
+            .send_request(NewSessionRequest::new(std::env::temp_dir()))
+            .block_task()
+            .await?
+            .session_id;
+
+        let pending =
+            connection.send_request(PromptRequest::new(session.clone(), text("write docs")));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        connection.send_notification(
+            agent_client_protocol::schema::v1::CancelNotification::new(session),
+        )?;
+        Ok(pending.block_task().await?.stop_reason)
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::Cancelled);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "cancelling must not wait for the agent to finish"
+    );
+}
+
+#[tokio::test]
+async fn a_persisted_session_can_be_loaded_by_a_new_process() {
+    let directory = tempfile::tempdir().unwrap();
+
+    // First "process": hold a conversation.
+    let client_side = serve_in_background(
+        orchestrator_with(vec![
+            MockAgent::always("worker", Behaviour::ok("added the endpoint"))
+                .with_descriptor(descriptor("worker")),
+        ])
+        .await,
+        cuma_server_acp::SessionRegistry::persistent(directory.path()),
+    );
+    let transcripts = Transcripts::default();
+    let session = with_client(client_side, &transcripts, async |connection| {
+        let init = connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        assert!(
+            init.agent_capabilities.load_session,
+            "a persistent registry can load"
+        );
+        let session = connection
+            .send_request(NewSessionRequest::new(std::env::temp_dir()))
+            .block_task()
+            .await?
+            .session_id;
+        connection
+            .send_request(PromptRequest::new(
+                session.clone(),
+                text("add a health endpoint"),
+            ))
+            .block_task()
+            .await?;
+        Ok(session)
+    })
+    .await;
+
+    // Second "process": nothing in memory, only what was written to disk.
+    let client_side = serve_in_background(
+        orchestrator_with(vec![]).await,
+        cuma_server_acp::SessionRegistry::persistent(directory.path()),
+    );
+    let replayed = Transcripts::default();
+    let loaded_id = session.clone();
+    with_client(client_side, &replayed, async |connection| {
+        connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        connection
+            .send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
+                loaded_id,
+                std::env::temp_dir(),
+            ))
+            .block_task()
+            .await?;
+        Ok(())
+    })
+    .await;
+
+    // Notifications may trail the response by a moment.
+    let mut transcript = String::new();
+    for _ in 0..50 {
+        transcript = replayed
+            .lock()
+            .unwrap()
+            .get(&session.to_string())
+            .cloned()
+            .unwrap_or_default();
+        if transcript.contains("added the endpoint") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        transcript.contains("USER: add a health endpoint"),
+        "{transcript}"
+    );
+    assert!(transcript.contains("added the endpoint"), "{transcript}");
+}
+
+#[tokio::test]
+async fn loading_an_unknown_session_is_an_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let client_side = serve_in_background(
+        orchestrator_with(vec![]).await,
+        cuma_server_acp::SessionRegistry::persistent(directory.path()),
+    );
+
+    let result = agent_client_protocol::Client
+        .builder()
+        .connect_with(
+            byte_streams(client_side),
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(connection
+                    .send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
+                        agent_client_protocol::schema::v1::SessionId::new("cuma-missing"),
+                        std::env::temp_dir(),
+                    ))
+                    .block_task()
+                    .await
+                    .is_err())
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result, "an unknown session must not load");
+}

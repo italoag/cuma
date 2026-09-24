@@ -17,8 +17,9 @@ use cuma_orchestrator::SessionResult;
 /// produces a worse experience than not claiming it.
 pub fn advertised_capabilities() -> AgentCapabilities {
     AgentCapabilities::new()
-        // `session/load` would mean restoring a plan mid-flight. The
-        // orchestrator has no resume path yet, so this stays false.
+        // `session/load` restores a conversation, which needs sessions that
+        // outlive the process. The server turns this on only when its session
+        // registry is persistent.
         .load_session(false)
         .prompt_capabilities(
             PromptCapabilities::new()

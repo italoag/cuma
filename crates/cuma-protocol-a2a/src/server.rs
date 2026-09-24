@@ -1,9 +1,9 @@
 //! CUMA as an A2A agent.
 //!
 //! The mirror of [`A2aAdapter`](crate::A2aAdapter): instead of delegating *to*
-//! a peer, CUMA serves an Agent Card and accepts `message/send`, so another
-//! agentic system can delegate software-engineering work to it and CUMA routes
-//! that work across everything it has.
+//! a peer, CUMA serves an Agent Card and accepts tasks, so another agentic
+//! system can delegate software-engineering work to it and CUMA routes that
+//! work across everything it has.
 //!
 //! ```text
 //! another agentic system
@@ -15,6 +15,24 @@
 //!              └── A2A ──> a further peer
 //! ```
 //!
+//! ## What is served
+//!
+//! | Method | Behaviour |
+//! |---|---|
+//! | `SendMessage` | Starts a task; blocks until it settles unless `returnImmediately` |
+//! | `SendStreamingMessage` | Starts a task and streams it over SSE |
+//! | `GetTask` / `ListTasks` | Reads the task store |
+//! | `CancelTask` | Aborts the run; claims and agent processes are released |
+//! | `SubscribeToTask` | Re-attaches to a running task's stream |
+//! | push-notification config | `-32003`: not offered, and the card says so |
+//! | `GetExtendedAgentCard` | `-32007`: there is no extended card |
+//!
+//! Every 1.0 method is also accepted under its 0.3 name, and answered in the
+//! dialect it was asked in.
+//!
+//! Task records are held in memory and bounded: a process restart forgets
+//! them, and the oldest settled tasks are evicted first.
+//!
 //! ## Trust
 //!
 //! Everything a caller sends is untrusted. A message part is a goal string and
@@ -22,18 +40,33 @@
 //! the orchestrator would not do for a local user.
 
 use crate::card::{AgentCard, AgentCardCapabilities, AgentSkill};
+use crate::wire::{self, Dialect, TaskState, WireTask, error_code, methods};
+use cuma_core::SessionId;
 use cuma_core::error::{MetaAgentError, Result};
+use cuma_core::event::EventKind;
 use cuma_orchestrator::Orchestrator;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::{broadcast, watch};
 
 /// The largest request body accepted.
 ///
 /// A caller is not trusted to bound its own request; without a cap one peer
 /// could exhaust the harness's memory.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// How many task records are retained.
+const MAX_RETAINED_TASKS: usize = 512;
+
+/// How many tasks may run at once. Beyond this a caller is told to wait,
+/// rather than every caller being slowed down together.
+const MAX_ACTIVE_TASKS: usize = 32;
+
+/// The most tasks one `ListTasks` page returns.
+const MAX_PAGE_SIZE: usize = 100;
 
 /// A JSON-RPC request, as an A2A caller sends it.
 #[derive(Debug, Deserialize)]
@@ -73,40 +106,28 @@ pub async fn agent_card(orchestrator: &Orchestrator, base_url: &str) -> AgentCar
     };
 
     AgentCard {
-        name: "CUMA".to_owned(),
         description: "A universal control plane for coding agents".to_owned(),
-        url: base_url.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol_version: Some("1.0.0".to_owned()),
         capabilities: AgentCardCapabilities {
-            // Streaming and push notifications are not implemented; claiming
-            // them would make a caller wait for updates that never arrive.
-            streaming: false,
+            streaming: true,
+            // Not implemented; claiming it would make a caller wait for
+            // callbacks that never arrive.
             push_notifications: false,
-            state_transition_history: false,
+            extended_agent_card: false,
         },
         skills,
         default_input_modes: vec!["text/plain".to_owned()],
         default_output_modes: vec!["text/plain".to_owned()],
+        ..AgentCard::new("CUMA", base_url)
     }
 }
 
-/// Extract the goal from a `message/send` params object.
+/// Extract the goal from a `SendMessage` params object.
 ///
 /// Only text parts contribute, and the result is a plain string. There is no
 /// path by which a caller's message becomes anything but a goal.
 pub fn goal_from_params(params: &Value) -> String {
-    let Some(parts) = params.pointer("/message/parts").and_then(Value::as_array) else {
-        return String::new();
-    };
-
-    parts
-        .iter()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    wire::parts_text(params.pointer("/message/parts"))
 }
 
 /// A JSON-RPC error response.
@@ -123,102 +144,634 @@ fn rpc_result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// Handle one JSON-RPC call.
-///
-/// Returns the response body. Errors are JSON-RPC errors rather than HTTP
-/// failures, because that is what an A2A caller expects to parse.
-pub async fn handle_rpc(orchestrator: &Orchestrator, body: &str) -> Value {
-    let request: JsonRpcRequest = match serde_json::from_str(body) {
-        Ok(request) => request,
-        Err(err) => {
-            return rpc_error(Value::Null, -32700, &format!("parse error: {err}"));
+/// Something that happened to a task, as its stream subscribers see it.
+#[derive(Debug, Clone)]
+enum TaskUpdate {
+    /// The task changed state.
+    Status(WireTask),
+    /// An agent produced output.
+    Chunk(String),
+}
+
+/// One task's record.
+struct TaskEntry {
+    snapshot: watch::Sender<WireTask>,
+    updates: broadcast::Sender<TaskUpdate>,
+    run: Option<tokio::task::AbortHandle>,
+}
+
+impl TaskEntry {
+    fn current(&self) -> WireTask {
+        self.snapshot.borrow().clone()
+    }
+}
+
+/// The in-memory task store.
+#[derive(Default)]
+struct TaskMap {
+    entries: HashMap<String, TaskEntry>,
+    /// Insertion order, oldest first, for eviction and listing.
+    order: VecDeque<String>,
+}
+
+impl TaskMap {
+    fn active(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| !settled(e.current().state))
+            .count()
+    }
+
+    /// Drop the oldest settled tasks until there is room for one more.
+    fn make_room(&mut self) {
+        while self.entries.len() >= MAX_RETAINED_TASKS {
+            let Some(position) = self.order.iter().position(|id| {
+                self.entries
+                    .get(id)
+                    .is_none_or(|e| settled(e.current().state))
+            }) else {
+                return;
+            };
+            if let Some(id) = self.order.remove(position) {
+                self.entries.remove(&id);
+            }
+        }
+    }
+}
+
+/// Whether a task will not change again without the caller.
+fn settled(state: TaskState) -> bool {
+    state.is_terminal() || state.is_interrupted()
+}
+
+/// What a JSON-RPC call produced.
+pub enum Reply {
+    /// A single JSON-RPC response.
+    Json(Value),
+    /// An SSE stream of JSON-RPC responses.
+    Stream(TaskStream),
+}
+
+/// A subscription to one task's updates, rendered as JSON-RPC envelopes.
+pub struct TaskStream {
+    request_id: Value,
+    dialect: Dialect,
+    first: Option<WireTask>,
+    updates: broadcast::Receiver<TaskUpdate>,
+    snapshot: watch::Receiver<WireTask>,
+    done: bool,
+}
+
+impl TaskStream {
+    /// The next envelope, or `None` once the task has settled.
+    pub async fn next(&mut self) -> Option<Value> {
+        if self.done {
+            return None;
+        }
+
+        if let Some(task) = self.first.take() {
+            // A task that settled before anyone subscribed ends here.
+            self.done = settled(task.state);
+            return Some(self.envelope(wire::task_event_json(&task, self.dialect)));
+        }
+
+        match self.updates.recv().await {
+            Ok(TaskUpdate::Chunk(text)) => {
+                let task = self.snapshot.borrow().clone();
+                Some(self.envelope(wire::artifact_event_json(
+                    &task,
+                    "stream",
+                    &text,
+                    self.dialect,
+                )))
+            }
+            Ok(TaskUpdate::Status(task)) => {
+                self.done = settled(task.state);
+                Some(self.envelope(wire::status_event_json(&task, self.dialect)))
+            }
+            // A slow reader missed updates. Resynchronise with a full
+            // snapshot rather than pretending nothing was lost.
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let task = self.snapshot.borrow().clone();
+                self.done = settled(task.state);
+                Some(self.envelope(wire::task_event_json(&task, self.dialect)))
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                self.done = true;
+                let task = self.snapshot.borrow().clone();
+                Some(self.envelope(wire::task_event_json(&task, self.dialect)))
+            }
+        }
+    }
+
+    fn envelope(&self, result: Value) -> Value {
+        rpc_result(self.request_id.clone(), result)
+    }
+}
+
+/// CUMA's A2A endpoint: an orchestrator plus the tasks it is running for
+/// callers.
+pub struct A2aServer {
+    orchestrator: Arc<Orchestrator>,
+    card: AgentCard,
+    tasks: Arc<Mutex<TaskMap>>,
+}
+
+impl A2aServer {
+    /// A server publishing a card for `base_url`.
+    pub async fn new(orchestrator: Arc<Orchestrator>, base_url: &str) -> Self {
+        let card = agent_card(&orchestrator, base_url).await;
+        Self {
+            orchestrator,
+            card,
+            tasks: Arc::new(Mutex::new(TaskMap::default())),
+        }
+    }
+
+    /// The card this server publishes.
+    pub fn card(&self) -> &AgentCard {
+        &self.card
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, TaskMap> {
+        // A poisoned lock means a panic elsewhere mid-update; the map itself
+        // is still structurally sound, and refusing every later call would
+        // turn one bug into an outage.
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Handle a call that must answer with a single JSON value.
+    ///
+    /// A streaming method called this way is answered with its first event.
+    pub async fn handle_json(&self, body: &str) -> Value {
+        match self.handle(body).await {
+            Reply::Json(value) => value,
+            Reply::Stream(mut stream) => stream.next().await.unwrap_or(Value::Null),
+        }
+    }
+
+    /// Handle one JSON-RPC call.
+    ///
+    /// Errors are JSON-RPC errors rather than HTTP failures, because that is
+    /// what an A2A caller expects to parse.
+    pub async fn handle(&self, body: &str) -> Reply {
+        let request: JsonRpcRequest = match serde_json::from_str(body) {
+            Ok(request) => request,
+            Err(err) => {
+                return Reply::Json(rpc_error(
+                    Value::Null,
+                    error_code::PARSE_ERROR,
+                    &format!("parse error: {err}"),
+                ));
+            }
+        };
+
+        let dialect = if methods::is_legacy(&request.method) {
+            Dialect::Legacy
+        } else {
+            Dialect::V1
+        };
+        let id = request.id;
+        let params = request.params;
+
+        match methods::canonical(&request.method) {
+            methods::SEND_MESSAGE => Reply::Json(self.send_message(id, &params, dialect).await),
+            methods::SEND_STREAMING_MESSAGE => match self.start(&params) {
+                Ok((task_id, _)) => self.subscribe(id, &task_id, dialect, true),
+                Err((code, message)) => Reply::Json(rpc_error(id, code, &message)),
+            },
+            methods::GET_TASK => Reply::Json(self.get_task(id, &params, dialect)),
+            methods::LIST_TASKS => Reply::Json(self.list_tasks(id, &params, dialect)),
+            methods::CANCEL_TASK => Reply::Json(self.cancel_task(id, &params, dialect)),
+            methods::SUBSCRIBE_TO_TASK => {
+                let task_id = task_id_param(&params);
+                self.subscribe(id, &task_id, dialect, false)
+            }
+            methods::GET_EXTENDED_AGENT_CARD | "agent/getAuthenticatedExtendedCard" => {
+                Reply::Json(rpc_error(
+                    id,
+                    error_code::EXTENDED_CARD_NOT_CONFIGURED,
+                    "CUMA publishes no extended Agent Card",
+                ))
+            }
+            other if other.contains("PushNotification") || other.contains("pushNotification") => {
+                Reply::Json(rpc_error(
+                    id,
+                    error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
+                    "push notifications are not supported; poll GetTask or stream instead",
+                ))
+            }
+            other => Reply::Json(rpc_error(
+                id,
+                error_code::METHOD_NOT_FOUND,
+                &format!("unknown method {other:?}"),
+            )),
+        }
+    }
+
+    /// `SendMessage`: start a task and, unless asked not to, wait for it.
+    async fn send_message(&self, id: Value, params: &Value, dialect: Dialect) -> Value {
+        let (_, mut snapshot) = match self.start(params) {
+            Ok(started) => started,
+            Err((code, message)) => return rpc_error(id, code, &message),
+        };
+
+        let return_immediately = match dialect {
+            Dialect::V1 => params
+                .pointer("/configuration/returnImmediately")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            // 0.3 callers commonly omit `blocking` and expect an answer, which
+            // is how CUMA behaved before tasks were addressable.
+            Dialect::Legacy => params
+                .pointer("/configuration/blocking")
+                .and_then(Value::as_bool)
+                .is_some_and(|blocking| !blocking),
+        };
+
+        if !return_immediately {
+            // Ends when the task settles or its record is evicted.
+            let _ = snapshot.wait_for(|task| settled(task.state)).await;
+        }
+
+        let task = snapshot.borrow().clone();
+        rpc_result(id, wire::send_result_json(&task, dialect))
+    }
+
+    /// Create a task for a message and start running it.
+    fn start(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<(String, watch::Receiver<WireTask>), (i64, String)> {
+        let goal = goal_from_params(params);
+        if goal.is_empty() {
+            return Err((
+                error_code::INVALID_PARAMS,
+                "the message contained no text".to_owned(),
+            ));
+        }
+
+        if params
+            .pointer("/message/taskId")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty())
+        {
+            // CUMA never pauses a task to ask for input, so there is never a
+            // task waiting for a follow-up.
+            return Err((
+                error_code::UNSUPPORTED_OPERATION,
+                "CUMA tasks do not take follow-up messages; send a new message, \
+                 reusing contextId to group related work"
+                    .to_owned(),
+            ));
+        }
+
+        let context_id = params
+            .pointer("/message/contextId")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty() && c.len() <= 128)
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let initial = WireTask {
+            id: task_id.clone(),
+            context_id,
+            state: TaskState::Submitted,
+            status_text: None,
+            timestamp: Some(chrono_now()),
+            artifacts: Vec::new(),
+        };
+
+        let (snapshot, receiver) = watch::channel(initial);
+        let (updates, _) = broadcast::channel(256);
+
+        {
+            let mut tasks = self.tasks();
+            if tasks.active() >= MAX_ACTIVE_TASKS {
+                return Err((
+                    error_code::INTERNAL_ERROR,
+                    format!("CUMA is already running {MAX_ACTIVE_TASKS} tasks; try again later"),
+                ));
+            }
+            tasks.make_room();
+            tasks.entries.insert(
+                task_id.clone(),
+                TaskEntry {
+                    snapshot: snapshot.clone(),
+                    updates: updates.clone(),
+                    run: None,
+                },
+            );
+            tasks.order.push_back(task_id.clone());
+        }
+
+        let handle = tokio::spawn(drive(
+            Arc::clone(&self.orchestrator),
+            goal,
+            snapshot,
+            updates,
+        ));
+
+        if let Some(entry) = self.tasks().entries.get_mut(&task_id) {
+            entry.run = Some(handle.abort_handle());
+        }
+
+        Ok((task_id, receiver))
+    }
+
+    /// Stream a task's updates.
+    fn subscribe(&self, id: Value, task_id: &str, dialect: Dialect, fresh: bool) -> Reply {
+        let tasks = self.tasks();
+        let Some(entry) = tasks.entries.get(task_id) else {
+            return Reply::Json(rpc_error(
+                id,
+                error_code::TASK_NOT_FOUND,
+                &format!("no task {task_id:?}"),
+            ));
+        };
+
+        // Subscribe before reading the snapshot, so nothing falls between.
+        let updates = entry.updates.subscribe();
+        let current = entry.current();
+
+        if !fresh && current.state.is_terminal() {
+            return Reply::Json(rpc_error(
+                id,
+                error_code::UNSUPPORTED_OPERATION,
+                "the task has finished; use GetTask to read its result",
+            ));
+        }
+
+        Reply::Stream(TaskStream {
+            request_id: id,
+            dialect,
+            first: Some(current),
+            updates,
+            snapshot: entry.snapshot.subscribe(),
+            done: false,
+        })
+    }
+
+    fn get_task(&self, id: Value, params: &Value, dialect: Dialect) -> Value {
+        let task_id = task_id_param(params);
+        match self.tasks().entries.get(&task_id) {
+            Some(entry) => rpc_result(id, entry.current().to_json(dialect)),
+            None => rpc_error(
+                id,
+                error_code::TASK_NOT_FOUND,
+                &format!("no task {task_id:?}"),
+            ),
+        }
+    }
+
+    fn list_tasks(&self, id: Value, params: &Value, dialect: Dialect) -> Value {
+        let context = params
+            .get("contextId")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty());
+        let status = params
+            .get("status")
+            .and_then(Value::as_str)
+            .map(TaskState::parse)
+            .filter(|s| *s != TaskState::Unknown);
+        let page_size = params
+            .get("pageSize")
+            .and_then(Value::as_u64)
+            .map_or(50, |n| usize::try_from(n).unwrap_or(MAX_PAGE_SIZE))
+            .clamp(1, MAX_PAGE_SIZE);
+        let offset = params
+            .get("pageToken")
+            .and_then(Value::as_str)
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let tasks = self.tasks();
+        // Newest first.
+        let matching: Vec<WireTask> = tasks
+            .order
+            .iter()
+            .rev()
+            .filter_map(|task_id| tasks.entries.get(task_id))
+            .map(TaskEntry::current)
+            .filter(|t| context.is_none_or(|c| t.context_id == c))
+            .filter(|t| status.is_none_or(|s| t.state == s))
+            .collect();
+        drop(tasks);
+
+        let total = matching.len();
+        let page: Vec<Value> = matching
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|t| t.to_json(dialect))
+            .collect();
+        let next = offset + page.len();
+
+        rpc_result(
+            id,
+            json!({
+                "tasks": page,
+                "nextPageToken": if next < total { next.to_string() } else { String::new() },
+                "pageSize": page_size,
+                "totalSize": total,
+            }),
+        )
+    }
+
+    fn cancel_task(&self, id: Value, params: &Value, dialect: Dialect) -> Value {
+        let task_id = task_id_param(params);
+        let tasks = self.tasks();
+        let Some(entry) = tasks.entries.get(&task_id) else {
+            return rpc_error(
+                id,
+                error_code::TASK_NOT_FOUND,
+                &format!("no task {task_id:?}"),
+            );
+        };
+
+        let current = entry.current();
+        if settled(current.state) {
+            return rpc_error(
+                id,
+                error_code::TASK_NOT_CANCELABLE,
+                &format!("the task is already {}", current.state.render(dialect)),
+            );
+        }
+
+        // Dropping the run drops the agents' futures, which kills their
+        // processes and releases their file claims.
+        if let Some(run) = &entry.run {
+            run.abort();
+        }
+
+        let cancelled = WireTask {
+            state: TaskState::Canceled,
+            status_text: Some("cancelled at the caller's request".to_owned()),
+            timestamp: Some(chrono_now()),
+            ..current
+        };
+        entry.snapshot.send_replace(cancelled.clone());
+        let _ = entry.updates.send(TaskUpdate::Status(cancelled.clone()));
+
+        rpc_result(id, cancelled.to_json(dialect))
+    }
+
+    /// An axum router serving the card and the JSON-RPC endpoint.
+    pub fn router(self: Arc<Self>) -> axum::Router {
+        use axum::extract::{DefaultBodyLimit, State};
+        use axum::response::IntoResponse;
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        let card = self.card.clone();
+        let card_route = get(move || {
+            let card = card.clone();
+            async move { Json(card) }
+        });
+
+        let rpc = post(|State(server): State<Arc<Self>>, body: String| async move {
+            match server.handle(&body).await {
+                Reply::Json(value) => Json(value).into_response(),
+                Reply::Stream(stream) => {
+                    let events = futures::stream::unfold(stream, |mut stream| async move {
+                        let value = stream.next().await?;
+                        let event = Event::default().data(value.to_string());
+                        Some((Ok::<_, std::convert::Infallible>(event), stream))
+                    });
+                    Sse::new(events)
+                        .keep_alive(KeepAlive::default())
+                        .into_response()
+                }
+            }
+        });
+
+        Router::new()
+            .route(crate::card::AGENT_CARD_PATH, card_route)
+            .route("/", rpc)
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .with_state(self)
+    }
+}
+
+/// The `id` param of a task-addressing call.
+fn task_id_param(params: &Value) -> String {
+    params
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn chrono_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Run one task on the orchestrator, publishing its progress.
+async fn drive(
+    orchestrator: Arc<Orchestrator>,
+    goal: String,
+    snapshot: watch::Sender<WireTask>,
+    updates: broadcast::Sender<TaskUpdate>,
+) {
+    let session_id = SessionId::new(snapshot.borrow().id.clone());
+
+    let set = |change: &dyn Fn(&mut WireTask)| {
+        snapshot.send_modify(|task| {
+            change(task);
+            task.timestamp = Some(chrono_now());
+        });
+        let _ = updates.send(TaskUpdate::Status(snapshot.borrow().clone()));
+    };
+
+    // Subscribe before starting, and keep only this session's events: other
+    // callers' tasks share the same bus.
+    let mut events = orchestrator.events().subscribe();
+    set(&|task| task.state = TaskState::Working);
+
+    let run = orchestrator.run_session(session_id.clone(), &goal);
+    tokio::pin!(run);
+
+    let forward = |event: cuma_core::event::Event| {
+        if event.session_id == session_id
+            && let EventKind::AgentOutputReceived { chunk } = event.kind
+        {
+            let _ = updates.send(TaskUpdate::Chunk(chunk));
         }
     };
 
-    match request.method.as_str() {
-        "message/send" => {
-            let goal = goal_from_params(&request.params);
-
-            if goal.is_empty() {
-                return rpc_error(request.id, -32602, "the message contained no text");
-            }
-
-            match orchestrator.run(&goal).await {
-                Ok(outcome) => {
-                    let transcript = outcome
-                        .graph
-                        .iter()
-                        .filter_map(|task| {
-                            task.successful_outcome()
-                                .map(|o| format!("## {}\n{}", task.spec.description, o.output))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-
-                    rpc_result(
-                        request.id,
-                        json!({
-                            "id": outcome.session_id.as_str(),
-                            "status": {
-                                "state": if outcome.success { "completed" } else { "failed" },
-                                "message": {
-                                    "role": "agent",
-                                    "parts": [{ "kind": "text", "text": outcome.summary }],
-                                },
-                            },
-                            "artifacts": [{
-                                "name": "result",
-                                "parts": [{ "kind": "text", "text": transcript }],
-                            }],
-                        }),
-                    )
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            event = events.recv() => match event {
+                Ok(event) => forward(event),
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::debug!(missed, "an A2A stream fell behind the event bus");
                 }
-                Err(err) => rpc_error(request.id, -32603, &err.to_string()),
-            }
+                Err(broadcast::error::RecvError::Closed) => break run.await,
+            },
         }
+    };
 
-        // Sessions are not addressable after the fact: CUMA runs a goal to
-        // completion synchronously, so there is no task to look up later.
-        // Saying so beats returning an empty task a caller would poll forever.
-        "tasks/get" | "tasks/cancel" => rpc_error(
-            request.id,
-            -32601,
-            "CUMA runs goals synchronously; there is no task to address afterwards",
-        ),
-
-        other => rpc_error(request.id, -32601, &format!("unknown method {other:?}")),
+    // The orchestrator publishes an attempt's last output before returning;
+    // pick up whatever is still queued.
+    while let Ok(event) = events.try_recv() {
+        forward(event);
     }
+
+    match result {
+        Ok(outcome) => {
+            let transcript = outcome
+                .graph
+                .iter()
+                .filter_map(|task| {
+                    task.successful_outcome()
+                        .map(|o| format!("## {}\n{}", task.spec.description, o.output))
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            set(&|task| {
+                task.state = if outcome.success {
+                    TaskState::Completed
+                } else {
+                    TaskState::Failed
+                };
+                task.status_text = Some(outcome.summary.clone());
+                task.artifacts = if transcript.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![("result".to_owned(), transcript.clone())]
+                };
+            });
+        }
+        Err(err) => {
+            let message = err.to_string();
+            set(&|task| {
+                task.state = TaskState::Failed;
+                task.status_text = Some(message.clone());
+            });
+        }
+    }
+}
+
+/// Handle one JSON-RPC call against a fresh server.
+///
+/// Convenience for callers with no server to hold on to; task state does not
+/// outlive the call.
+pub async fn handle_rpc(orchestrator: Arc<Orchestrator>, body: &str) -> Value {
+    A2aServer::new(orchestrator, "http://localhost/")
+        .await
+        .handle_json(body)
+        .await
 }
 
 /// Serve CUMA over A2A on `address`.
 pub async fn serve(orchestrator: Orchestrator, address: SocketAddr, base_url: &str) -> Result<()> {
-    use axum::extract::{DefaultBodyLimit, State};
-    use axum::routing::{get, post};
-    use axum::{Json, Router};
-
-    let orchestrator = Arc::new(orchestrator);
-    let card = agent_card(&orchestrator, base_url).await;
-
-    let card_route = {
-        let card = card.clone();
-        get(move || {
-            let card = card.clone();
-            async move { Json(card) }
-        })
-    };
-
-    let app = Router::new()
-        .route(crate::card::AGENT_CARD_PATH, card_route)
-        .route(
-            "/",
-            post(
-                |State(orchestrator): State<Arc<Orchestrator>>, body: String| async move {
-                    Json(handle_rpc(&orchestrator, &body).await)
-                },
-            ),
-        )
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(Arc::clone(&orchestrator));
+    let server = Arc::new(A2aServer::new(Arc::new(orchestrator), base_url).await);
+    let app = server.router();
 
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -299,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_request_is_a_json_rpc_parse_error() {
         let orchestrator = orchestrator();
-        let response = handle_rpc(&orchestrator, "{ not json").await;
+        let response = handle_rpc(orchestrator, "{ not json").await;
 
         assert_eq!(response["error"]["code"], -32700);
     }
@@ -308,7 +861,7 @@ mod tests {
     async fn an_unknown_method_is_reported_as_such() {
         let orchestrator = orchestrator();
         let response = handle_rpc(
-            &orchestrator,
+            orchestrator,
             r#"{"jsonrpc":"2.0","id":1,"method":"agent/selfDestruct"}"#,
         )
         .await;
@@ -323,28 +876,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_lookup_explains_why_it_is_unavailable() {
-        // Returning an empty task a caller would poll forever is worse.
-        let orchestrator = orchestrator();
+    async fn an_unknown_task_is_reported_as_not_found_in_either_dialect() {
+        for method in ["GetTask", "tasks/get", "CancelTask", "tasks/cancel"] {
+            let response = handle_rpc(
+                orchestrator(),
+                &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"id":"x"}}}}"#),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32001, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_notification_configuration_is_refused_with_its_own_code() {
+        for method in [
+            "CreateTaskPushNotificationConfig",
+            "tasks/pushNotificationConfig/set",
+        ] {
+            let response = handle_rpc(
+                orchestrator(),
+                &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32003, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn there_is_no_extended_card() {
         let response = handle_rpc(
-            &orchestrator,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"x"}}"#,
+            orchestrator(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard"}"#,
         )
         .await;
+        assert_eq!(response["error"]["code"], -32007);
+    }
 
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("synchronously")
-        );
+    #[tokio::test]
+    async fn a_follow_up_message_to_a_task_is_refused_rather_than_misread() {
+        let response = handle_rpc(
+            orchestrator(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"taskId":"t","parts":[{"text":"more"}]}}}"#,
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32004);
     }
 
     #[tokio::test]
     async fn an_empty_message_is_an_invalid_params_error() {
         let orchestrator = orchestrator();
         let response = handle_rpc(
-            &orchestrator,
+            orchestrator,
             r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[]}}}"#,
         )
         .await;
@@ -356,7 +938,7 @@ mod tests {
     async fn the_request_id_is_echoed_back() {
         let orchestrator = orchestrator();
         let response = handle_rpc(
-            &orchestrator,
+            orchestrator,
             r#"{"jsonrpc":"2.0","id":"abc-123","method":"nope"}"#,
         )
         .await;
@@ -376,20 +958,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_card_does_not_claim_unimplemented_protocol_features() {
+    async fn the_card_claims_streaming_but_not_unimplemented_features() {
         let card = agent_card(&orchestrator(), "https://example.invalid/a2a").await;
 
-        assert!(!card.capabilities.streaming);
+        assert!(card.capabilities.streaming);
         assert!(!card.capabilities.push_notifications);
+        assert!(!card.capabilities.extended_agent_card);
+        assert_eq!(
+            card.jsonrpc_endpoint(),
+            Some(("https://example.invalid/a2a".into(), Dialect::V1))
+        );
     }
 
     /// An orchestrator with no agents, which is all these tests need.
-    fn orchestrator() -> Orchestrator {
-        Orchestrator::new(
+    fn orchestrator() -> Arc<Orchestrator> {
+        Arc::new(Orchestrator::new(
             cuma_config::Config::default(),
             Arc::new(NoPlanner),
             std::env::temp_dir(),
-        )
+        ))
     }
 
     struct NoPlanner;
