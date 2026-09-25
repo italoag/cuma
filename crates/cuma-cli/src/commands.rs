@@ -178,11 +178,9 @@ pub async fn run_goal(
     }
 
     if orchestrator.agents().is_empty().await {
-        return Err(MetaAgentError::Configuration(
-            "no agents are available. Configure one under [agents.*] in .cuma/config.toml, \
-             then run `cuma doctor` to check it."
-                .to_owned(),
-        ));
+        return Err(MetaAgentError::Configuration(harness::no_agents_reason(
+            &config,
+        )));
     }
 
     if dry_run {
@@ -442,10 +440,10 @@ pub async fn serve(
     }
 
     if orchestrator.agents().is_empty().await {
-        return Err(MetaAgentError::Configuration(
-            "refusing to serve with no agents registered; there would be nothing to route to"
-                .to_owned(),
-        ));
+        return Err(MetaAgentError::Configuration(format!(
+            "refusing to serve with nothing to route to — {}",
+            harness::no_agents_reason(&config)
+        )));
     }
 
     match protocol.to_ascii_lowercase().as_str() {
@@ -539,14 +537,15 @@ fn workspace_builder(
             }
 
             let (orchestrator, warnings) =
-                harness::build_orchestrator(config, workspace.clone()).await?;
+                harness::build_orchestrator(config.clone(), workspace.clone()).await?;
             for warning in &warnings {
                 eprintln!("warning ({}): {warning}", workspace.display());
             }
             if orchestrator.agents().is_empty().await {
                 return Err(MetaAgentError::Configuration(format!(
-                    "no agents are available for {}; there would be nothing to route to",
-                    workspace.display()
+                    "{}: {}",
+                    workspace.display(),
+                    harness::no_agents_reason(&config)
                 )));
             }
             Ok(orchestrator)
@@ -1240,10 +1239,7 @@ pub async fn doctor(
 
     let snapshot = orchestrator.agents().snapshot().await;
     if snapshot.is_empty() {
-        problems.push(
-            "no agents are registered; configure one under [agents.*] in .cuma/config.toml"
-                .to_owned(),
-        );
+        problems.push(harness::no_agents_reason(&config));
     } else {
         notes.push(format!(
             "agents: {} registered, {} routable",

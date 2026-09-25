@@ -312,6 +312,47 @@ pub fn shared_mcp_servers(
         .collect()
 }
 
+/// Why no agent is available, in words that point at the actual cause.
+///
+/// "Configure an agent" is wrong advice when agents are configured and were
+/// refused because `security.require_agent_sandbox` cannot be met.
+pub fn no_agents_reason(config: &Config) -> String {
+    no_agents_reason_under(
+        config,
+        &cuma_workspace::AgentSandbox::detect(&config.security),
+    )
+}
+
+fn no_agents_reason_under(config: &Config, sandbox: &cuma_workspace::AgentSandbox) -> String {
+    let local_configured = config
+        .agents
+        .values()
+        .any(|agent| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"));
+
+    if local_configured && sandbox.refuses_agents() {
+        match sandbox.level() {
+            cuma_workspace::AgentConfinementLevel::NetworkUnfiltered { runtime } => format!(
+                "no agents can run: security.require_agent_sandbox is set, and \
+                 security.network_allowlist can only be enforced by ai-jail, not {runtime}. \
+                 Install ai-jail, empty the allowlist, or unset require_agent_sandbox."
+            ),
+            _ => "no agents can run: security.require_agent_sandbox is set, and no sandbox \
+                  works here. Install ai-jail or bubblewrap (firejail also works; \
+                  sandbox-exec on macOS), or unset require_agent_sandbox to run agents \
+                  unconfined."
+                .to_owned(),
+        }
+    } else if local_configured {
+        "no agents are available: those configured under [agents.*] could not be \
+         registered (see the warnings above). Run `cuma doctor` for details."
+            .to_owned()
+    } else {
+        "no agents are available. Configure one under [agents.*] in .cuma/config.toml, \
+         then run `cuma doctor` to check it."
+            .to_owned()
+    }
+}
+
 /// Launches ACP agents inside the agent sandbox, confined to the directory
 /// each one works in.
 struct SandboxLauncher(cuma_workspace::AgentSandbox);
@@ -518,6 +559,37 @@ pub async fn build_orchestrator(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn refused_agents_are_explained_as_refused_not_as_missing() {
+        let mut config =
+            Config::from_toml("[agents.probe]\nprotocol = \"acp\"\ncommand = \"probe\"\n").unwrap();
+        config.security.require_agent_sandbox = true;
+        // No sandbox runtime on this imagined machine.
+        let nothing = cuma_workspace::AgentSandbox::with_runtime(&config.security, None);
+        let reason = no_agents_reason_under(&config, &nothing);
+        assert!(reason.contains("require_agent_sandbox"), "{reason}");
+        assert!(reason.contains("no sandbox works here"), "{reason}");
+
+        // An allowlist only ai-jail can enforce is its own reason.
+        let mut filtered = config.clone();
+        filtered.security.network_allowlist = vec!["api.anthropic.com".into()];
+        let bwrap = cuma_workspace::AgentSandbox::with_runtime(
+            &filtered.security,
+            Some(cuma_workspace::AgentRuntime::Bubblewrap),
+        );
+        let reason = no_agents_reason_under(&filtered, &bwrap);
+        assert!(reason.contains("network_allowlist"), "{reason}");
+        assert!(!reason.contains("Configure one"), "{reason}");
+
+        let empty = Config::default();
+        let none = cuma_workspace::AgentSandbox::with_runtime(&empty.security, None);
+        assert!(no_agents_reason_under(&empty, &none).contains("Configure one"));
+
+        config.security.require_agent_sandbox = false;
+        let unrequired = cuma_workspace::AgentSandbox::with_runtime(&config.security, None);
+        assert!(no_agents_reason_under(&config, &unrequired).contains("could not be registered"));
+    }
 
     #[test]
     fn only_the_start_directory_and_listed_roots_are_trusted() {
