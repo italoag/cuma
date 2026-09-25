@@ -71,7 +71,7 @@ if a plan or a repository ever grew large enough to matter.
 
 | Gap | Consequence |
 |---|---|
-| **Client MCP servers in CUMA-as-ACP** | An editor's `mcp_servers` in `session/new` are not forwarded to the agents CUMA delegates to; only `[mcp.*]` servers marked `share_with_agents` are. |
+| **Client MCP servers in CUMA-as-ACP** | An editor's `mcp_servers` in `session/new` are accepted and **silently dropped**; only `[mcp.*]` servers marked `share_with_agents` reach the agents CUMA delegates to. ACP requires every agent to accept stdio MCP servers from its client, so on this point CUMA is out of spec, and the editor cannot tell. See [the plan below](#next-editor-mcp-servers-for-the-agents-behind-cuma-as-acp). |
 | **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. CUMA never pauses for input, so multi-turn tasks are refused. A task interrupted by a restart is reported failed, not resumed. |
 | **A2A authentication beyond bearer tokens** | Both directions use bearer tokens from secret handles; there are no OAuth, OpenID Connect or mTLS flows. |
 | **Binary agents from the ACP registry** | `cuma agents add` configures npx and uvx agents; binary distributions are described (URL, SHA-256) for a person to install. |
@@ -82,9 +82,56 @@ if a plan or a repository ever grew large enough to matter.
 | **ACP per-turn token usage** | Read from `PromptResponse.usage`, which the ACP schema marks unstable; when absent, input comes from `UsageUpdate` and output is estimated, and the total is labelled estimated. |
 | **ratatui-bubbletea components** | The TUI is plain Ratatui; the Bubble Tea–style component crates were evaluated (see `DEPENDENCY_ANALYSIS.md`) and not adopted. |
 
+## Next: editor MCP servers for the agents behind CUMA-as-ACP
+
+Not a protocol limitation — an unbuilt path, with security decisions that
+should be made explicitly rather than by forwarding whatever arrives.
+
+**Why it is not a simple pass-through**
+
+1. *No path exists.* An ACP adapter's MCP servers are fixed when the
+   orchestrator is built — one per workspace, shared by its sessions — and
+   nothing carries per-session tools down to an execution. That needs a
+   protocol-neutral field on the execution request in `cuma-core`.
+2. *Secrets.* A stdio server from the editor carries `env` **values**, not
+   handles. Forwarding them puts the editor's tokens in messages CUMA writes
+   and in domain memory, against the rule that only handles are stored.
+3. *Not every agent can receive them.* An A2A agent is remote: it cannot
+   launch a local process, and sending it the editor's commands and env would
+   be a leak. A task needing these tools should prefer local ACP agents —
+   which makes this a routing concern, not only a transport one.
+4. *Control.* CUMA's own servers go through `cuma mcp proxy`, which enforces
+   `allowed_tools`; the editor's have no allowlist in CUMA.
+5. *HTTP and SSE.* CUMA advertises `mcpCapabilities.http/sse = false`.
+   Accepting them means knowing which downstream agents support them (from
+   their `initialize`) and leaving them out elsewhere.
+
+**Plan**
+
+- Keep each ACP session's `mcp_servers` (validated, count-capped) in memory
+  and pass them to every execution of that session. `env` values are never
+  persisted — not in `.cuma/acp-sessions/`, not in logs, not in the runtime
+  database; a reloaded session asks the editor again, which ACP already does
+  by sending `mcp_servers` with `session/load`.
+- Hand them only to local ACP agents, merged with CUMA's shared servers
+  (editor names win on collision, or are prefixed — to decide), never to A2A
+  agents.
+- Routing: when a session carries editor tools, prefer agents that will
+  receive them; say so in the explanation when one that will not is chosen.
+- Sandbox: keep the servers' commands readable and their env available to
+  the agent that launches them.
+- Decide item 4. Proposed: forward the editor's servers as they came — the
+  editor already chose to trust them — and keep the proxy for CUMA's own.
+- Until this lands, stop dropping silently: tell the editor, once per
+  session, that its MCP servers are not forwarded.
+
+**Size.** Medium: `cuma-core` (execution request), the orchestrator (per-run
+tool servers), `cuma-server-acp` (session state), `cuma-protocol-acp`
+(merge into `session/new`), the router (preference), and tests through the
+real ACP client SDK with a stdio MCP server fixture.
+
 ## Later
 
-- Forwarding an editor's MCP servers to the agents behind CUMA-as-ACP
 - A2A push notifications
 - Commit-pinned skill installs and a key revocation list
 - A web interface, as another event-bus subscriber
