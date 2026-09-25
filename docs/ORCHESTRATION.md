@@ -198,10 +198,14 @@ See [ADR-011](adr/ADR-011-workspace-isolation.md) and
 ## Workspace safety
 
 Before anything writes, CUMA detects the repository and — under
-`security.checkpoint_before_write` — saves the working tree with
-`git stash create`, which writes a recoverable commit **without** touching the
-tree. A checkpoint that reverted the tree would change the task the agent was
-given.
+`security.checkpoint_before_write` — saves the working tree, untracked files
+included, as a commit written through a temporary index and anchored under
+`refs/cuma/checkpoints/`. Nothing the user sees moves: not the tree, not the
+index, not a branch. A checkpoint that reverted the tree would change the task
+the agent was given. `git restore --source=<commit> --worktree --overlay -- .`
+brings the saved files back without deleting anything. CUMA's own state
+(`.cuma/runtime.db*`, `acp-sessions/`, `cache/`) is never checkpointed, and a
+`.cuma/.gitignore` keeps it out of `git status`.
 
 Agents run their own shell commands, so what confines them is the sandbox
 they are launched in (ai-jail, bubblewrap, `sandbox-exec` or firejail — see

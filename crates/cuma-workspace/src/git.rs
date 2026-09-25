@@ -44,7 +44,13 @@ impl Checkpoint {
         if !self.had_changes {
             return "nothing was uncommitted, so there is nothing to restore".to_owned();
         }
-        format!("git stash apply {}", self.commit)
+        // Brings back every file the checkpoint saved, untracked ones included.
+        // `--overlay`: files not in the checkpoint — created since, or CUMA's
+        // own state — are left alone rather than deleted.
+        format!(
+            "git restore --source={} --worktree --overlay -- .",
+            self.commit
+        )
     }
 }
 
@@ -124,10 +130,15 @@ impl GitWorkspace {
 
     /// Save the working tree so the user can get back to it.
     ///
-    /// Uses `git stash create`, which writes a commit **without** touching the
-    /// working tree or the stash list. The agent then works on exactly what was
-    /// there — a checkpoint that changed what the agent sees would alter the
-    /// task it was given.
+    /// A [`snapshot`](Self::snapshot): tracked, modified and untracked files,
+    /// `.gitignore` respected, committed through a temporary index **without**
+    /// touching the working tree, the index or any branch. The agent then works
+    /// on exactly what was there — a checkpoint that changed what the agent
+    /// sees would alter the task it was given.
+    ///
+    /// Not `git stash create`: it leaves untracked files out, so the new files
+    /// a user had not yet added — often the work most worth saving — were
+    /// never checkpointed, and it cannot run before the first commit.
     pub async fn checkpoint(&self, label: &str) -> Result<Checkpoint> {
         if !self.is_repository {
             return Err(MetaAgentError::Configuration(
@@ -151,9 +162,7 @@ impl GitWorkspace {
             });
         }
 
-        let commit = run_git(&self.root, &["stash", "create", label]).await?;
-        let commit = commit.trim().to_owned();
-
+        let commit = self.snapshot().await?;
         if commit.is_empty() {
             return Err(MetaAgentError::Other(
                 "git reported changes but produced no checkpoint commit".to_owned(),
@@ -288,6 +297,11 @@ impl GitWorkspace {
                 run_git_env(&self.root, &["read-tree", "HEAD"], &index_env, None).await?;
             }
             run_git_env(&self.root, &["add", "-A"], &index_env, None).await?;
+            // Then drop CUMA's own state. Not as `add` pathspec excludes: git
+            // refuses an exclude that names a file .gitignore already ignores.
+            let mut forget = vec!["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--"];
+            forget.extend(CUMA_STATE);
+            run_git_env(&self.root, &forget, &index_env, None).await?;
             let tree = run_git_env(&self.root, &["write-tree"], &index_env, None).await?;
             let mut args = vec!["commit-tree", tree.trim(), "-m", "cuma: workspace snapshot"];
             if has_head {
@@ -401,6 +415,32 @@ impl GitWorkspace {
 
         Ok(output.lines().map(str::to_owned).collect())
     }
+}
+
+/// CUMA's own machine state, never part of a snapshot or checkpoint: a
+/// binary database copied into every checkpoint and worktree is cost with no
+/// value, and it is not the user's work.
+const CUMA_STATE: [&str; 3] = [".cuma/runtime.db*", ".cuma/acp-sessions", ".cuma/cache"];
+
+/// What `.cuma/.gitignore` says, when CUMA writes one.
+pub const CUMA_STATE_GITIGNORE: &str = "\
+# Written by CUMA: its own machine state, which does not belong in version
+# control. config.toml and skills/ are yours to commit or not.
+runtime.db*
+acp-sessions/
+cache/
+";
+
+/// Make sure `<workspace>/.cuma/.gitignore` exists, so CUMA's state never
+/// shows up as the user's changes. An existing file is never touched.
+pub fn ensure_state_ignored(workspace: &Path) -> std::io::Result<bool> {
+    let directory = workspace.join(".cuma");
+    let path = directory.join(".gitignore");
+    if path.exists() || !directory.is_dir() {
+        return Ok(false);
+    }
+    std::fs::write(&path, CUMA_STATE_GITIGNORE)?;
+    Ok(true)
 }
 
 /// Make a string safe to use in a git ref.
@@ -681,7 +721,7 @@ mod tests {
 
         assert!(checkpoint.had_changes);
         assert!(!checkpoint.commit.is_empty());
-        assert!(checkpoint.restore_hint().contains("stash apply"));
+        assert!(checkpoint.restore_hint().contains(&checkpoint.commit));
 
         // The agent must see exactly what was there: a checkpoint that reverted
         // the tree would change the task it was given.
@@ -690,6 +730,137 @@ mod tests {
             .unwrap();
         assert_eq!(content, "edited", "the checkpoint must not revert anything");
         assert!(workspace.has_uncommitted_changes().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn new_files_nobody_has_added_yet_are_checkpointed_too() {
+        let Some((dir, workspace)) = repository().await else {
+            return;
+        };
+
+        // Only untracked work: exactly what `git stash create` skipped.
+        tokio::fs::write(dir.path().join("draft.rs"), "fn wip() {}")
+            .await
+            .unwrap();
+        let checkpoint = workspace.checkpoint("before writing").await.unwrap();
+        assert!(checkpoint.had_changes);
+
+        let saved = run_git(
+            dir.path(),
+            &["show", &format!("{}:draft.rs", checkpoint.commit)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved, "fn wip() {}");
+
+        // Nothing about the user's own state moved.
+        let status = run_git(dir.path(), &["status", "--porcelain"])
+            .await
+            .unwrap();
+        assert_eq!(
+            status.trim(),
+            "?? draft.rs",
+            "still untracked, index untouched"
+        );
+
+        // And the hint really restores it.
+        tokio::fs::remove_file(dir.path().join("draft.rs"))
+            .await
+            .unwrap();
+        let hint = checkpoint.restore_hint();
+        let args: Vec<&str> = hint.split_whitespace().skip(1).collect();
+        run_git(dir.path(), &args).await.unwrap();
+        let restored = tokio::fs::read_to_string(dir.path().join("draft.rs"))
+            .await
+            .unwrap();
+        assert_eq!(restored, "fn wip() {}");
+    }
+
+    #[tokio::test]
+    async fn cumas_own_state_is_never_checkpointed() {
+        for ignored in [false, true] {
+            cumas_own_state_is_left_out(ignored).await;
+        }
+    }
+
+    /// With and without the `.gitignore` CUMA writes: git treats ignored
+    /// paths differently, and both must leave the state out.
+    async fn cumas_own_state_is_left_out(ignored: bool) {
+        let Some((dir, workspace)) = repository().await else {
+            return;
+        };
+        let state = dir.path().join(".cuma");
+        tokio::fs::create_dir_all(state.join("cache"))
+            .await
+            .unwrap();
+        if ignored {
+            ensure_state_ignored(dir.path()).unwrap();
+        }
+        for file in [
+            "runtime.db",
+            "runtime.db-wal",
+            "cache/registry.json",
+            "config.toml",
+        ] {
+            tokio::fs::write(state.join(file), "x").await.unwrap();
+        }
+
+        let checkpoint = workspace.checkpoint("before writing").await.unwrap();
+        let files = run_git(
+            dir.path(),
+            &["ls-tree", "-r", "--name-only", &checkpoint.commit],
+        )
+        .await
+        .unwrap();
+        assert!(
+            files.contains(".cuma/config.toml"),
+            "configuration is the user's"
+        );
+        assert!(!files.contains("runtime.db"), "{files}");
+        assert!(!files.contains("cache/"), "{files}");
+    }
+
+    #[test]
+    fn the_state_gitignore_is_written_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !ensure_state_ignored(dir.path()).unwrap(),
+            "no .cuma, nothing to do"
+        );
+
+        std::fs::create_dir_all(dir.path().join(".cuma")).unwrap();
+        assert!(ensure_state_ignored(dir.path()).unwrap());
+        let written = std::fs::read_to_string(dir.path().join(".cuma/.gitignore")).unwrap();
+        assert!(written.contains("runtime.db*"));
+
+        std::fs::write(dir.path().join(".cuma/.gitignore"), "mine\n").unwrap();
+        assert!(!ensure_state_ignored(dir.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".cuma/.gitignore")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_no_commits_can_still_be_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        if run_git(dir.path(), &["init", "-q"]).await.is_err() {
+            return;
+        }
+        for (key, value) in [
+            ("user.email", "test@example.invalid"),
+            ("user.name", "Test"),
+        ] {
+            run_git(dir.path(), &["config", key, value]).await.unwrap();
+        }
+        tokio::fs::write(dir.path().join("first.txt"), "x")
+            .await
+            .unwrap();
+        let workspace = GitWorkspace::detect(dir.path()).await;
+
+        let checkpoint = workspace.checkpoint("before writing").await.unwrap();
+        assert!(checkpoint.had_changes);
+        assert!(!checkpoint.commit.is_empty());
     }
 
     #[tokio::test]

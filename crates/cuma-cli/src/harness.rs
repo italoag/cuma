@@ -498,6 +498,9 @@ pub async fn build_orchestrator(
     // happens so the next process can learn from this one.
     match cuma_persistence::RuntimeStore::open(&database_path(&config, &workspace)) {
         Ok(store) => {
+            if let Err(err) = cuma_workspace::git::ensure_state_ignored(&workspace) {
+                tracing::debug!(error = %err, "could not write .cuma/.gitignore");
+            }
             match store.load_routing_history() {
                 Ok(history) => orchestrator = orchestrator.with_history(history),
                 Err(err) => warnings.push(format!("could not load routing history: {err}")),
