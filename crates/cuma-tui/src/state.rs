@@ -103,6 +103,34 @@ impl TaskRow {
     }
 }
 
+/// One installed skill, as the Skills screen shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRow {
+    /// Its id.
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Its trust level, as a word.
+    pub trust: String,
+    /// Whether its instructions reach agents.
+    pub enabled: bool,
+    /// What it provides.
+    pub capabilities: Vec<String>,
+    /// Where it came from.
+    pub registry: String,
+}
+
+/// One recalled memory, as the Memory screen shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRow {
+    /// Its backend id (an ai-memory page path, typically).
+    pub id: String,
+    /// Its kind.
+    pub kind: String,
+    /// What it says.
+    pub content: String,
+}
+
 /// What keystrokes currently mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -162,6 +190,18 @@ pub struct AppState {
     pub notice: Option<String>,
     /// Agents, refreshed from the registry rather than from events.
     pub agents: Vec<cuma_core::AgentDescriptor>,
+    /// Installed skills, when a skill source is attached.
+    pub skills: Option<Vec<SkillRow>>,
+    /// The selected skill on the Skills screen.
+    pub skill_cursor: usize,
+    /// Whether a memory backend is attached.
+    pub memory_attached: bool,
+    /// The last memory query.
+    pub memory_query: Option<String>,
+    /// What it recalled.
+    pub memories: Vec<MemoryRow>,
+    /// Set while a search runs.
+    pub memory_searching: bool,
 }
 
 impl AppState {
@@ -387,6 +427,35 @@ impl AppState {
         self.scroll = 0;
     }
 
+    /// Replace the skill list, keeping the cursor in range.
+    pub fn set_skills(&mut self, skills: Vec<SkillRow>) {
+        self.skill_cursor = self.skill_cursor.min(skills.len().saturating_sub(1));
+        self.skills = Some(skills);
+    }
+
+    /// Move the skill cursor by `delta`, clamped to the list.
+    pub fn move_skill_cursor(&mut self, delta: isize) {
+        let len = self.skills.as_ref().map_or(0, Vec::len);
+        if len == 0 {
+            self.skill_cursor = 0;
+            return;
+        }
+        let next = self.skill_cursor.saturating_add_signed(delta);
+        self.skill_cursor = next.min(len - 1);
+    }
+
+    /// The skill under the cursor.
+    pub fn selected_skill(&self) -> Option<&SkillRow> {
+        self.skills.as_ref()?.get(self.skill_cursor)
+    }
+
+    /// Record a memory search's results.
+    pub fn set_memories(&mut self, query: String, memories: Vec<MemoryRow>) {
+        self.memory_query = Some(query);
+        self.memories = memories;
+        self.memory_searching = false;
+    }
+
     /// Scroll down by `lines`.
     pub fn scroll_down(&mut self, lines: u16) {
         self.scroll = self.scroll.saturating_add(lines);
@@ -402,7 +471,8 @@ impl AppState {
     /// Refused while a session is running: submitting a second goal mid-run
     /// would interleave two plans in one view model.
     pub fn begin_editing(&mut self) {
-        if self.running {
+        // Searching memory touches no plan, so it is allowed mid-session.
+        if self.running && self.screen != Screen::Memory {
             self.notice = Some("a session is already running".to_owned());
             return;
         }

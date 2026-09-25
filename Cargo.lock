@@ -733,6 +733,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "which",
 ]
 
 [[package]]
@@ -856,10 +857,13 @@ dependencies = [
  "async-trait",
  "cuma-config",
  "cuma-core",
+ "reqwest",
  "serde",
  "serde_json",
  "shell-words",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "which",
 ]
@@ -989,6 +993,7 @@ dependencies = [
 name = "cuma-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "crossterm",
  "cuma-core",
  "cuma-orchestrator",

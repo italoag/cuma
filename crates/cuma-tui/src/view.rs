@@ -180,12 +180,8 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Screen::Tasks => draw_tasks(frame, area, state),
         Screen::Agents => draw_agents(frame, area, state),
         Screen::Models => draw_models(frame, area, state),
-        Screen::Skills => {
-            draw_placeholder(frame, area, state, "Skills", "cuma skills search <query>")
-        }
-        Screen::Memory => {
-            draw_placeholder(frame, area, state, "Memory", "cuma memory search <query>")
-        }
+        Screen::Skills => draw_skills(frame, area, state),
+        Screen::Memory => draw_memory(frame, area, state),
         Screen::Usage => draw_usage(frame, area, state),
         Screen::Logs => draw_logs(frame, area, state),
         Screen::Configuration => draw_configuration(frame, area, state),
@@ -509,27 +505,120 @@ fn draw_configuration(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-fn draw_placeholder(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    _state: &AppState,
-    title: &str,
-    command: &str,
-) {
-    frame.render_widget(
-        Paragraph::new(vec![
+/// Lines for the Skills screen. Pure, so it can be tested without a terminal.
+pub fn skill_lines(state: &AppState) -> Vec<Line<'static>> {
+    let Some(skills) = &state.skills else {
+        return vec![Line::from(Span::styled(
+            "No skill manager is attached to this interface.",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    if skills.is_empty() {
+        return vec![
+            Line::from("No skills are installed."),
+            Line::from(""),
             Line::from(Span::styled(
-                format!("{title} are not browsable from the TUI yet."),
+                "Find some with: cuma skills search <query>, then cuma skills install <id>",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+    }
+
+    let mut lines = Vec::with_capacity(skills.len() + 2);
+    for (index, skill) in skills.iter().enumerate() {
+        let selected = index == state.skill_cursor;
+        let marker = if skill.enabled { "[x]" } else { "[ ]" };
+        let trust_colour = match skill.trust.as_str() {
+            "Trusted" => Color::Green,
+            "Verified" => Color::Cyan,
+            "Community" => Color::Yellow,
+            _ => Color::Red,
+        };
+        let mut style = Style::default();
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} {:<24}", skill.id), style),
+            Span::styled(
+                format!(" {:<10}", skill.trust),
+                Style::default().fg(trust_colour),
+            ),
+            Span::raw(format!(" {:<12}", skill.registry)),
+            Span::styled(
+                skill.capabilities.join(", "),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select   space enable/disable — an enabled skill's instructions accompany relevant tasks",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn draw_skills(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    frame.render_widget(
+        Paragraph::new(skill_lines(state))
+            .block(Block::default().borders(Borders::ALL).title(" Skills "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Lines for the Memory screen. Pure, so it can be tested without a terminal.
+pub fn memory_lines(state: &AppState) -> Vec<Line<'static>> {
+    if !state.memory_attached {
+        return vec![
+            Line::from(Span::styled(
+                "Long-term memory is off.",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
-            Line::from(format!("Use: {command}")),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {title} ")),
-        ),
+            Line::from("Enable it with [memory] enabled = true in .cuma/config.toml."),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    match (&state.memory_query, state.memory_searching) {
+        (_, true) => lines.push(Line::from(Span::styled(
+            "searching…",
+            Style::default().fg(Color::Cyan),
+        ))),
+        (Some(query), false) => lines.push(Line::from(format!(
+            "{} result{} for {query:?}",
+            state.memories.len(),
+            if state.memories.len() == 1 { "" } else { "s" }
+        ))),
+        (None, false) => lines.push(Line::from("Press / to search long-term memory.")),
+    }
+    lines.push(Line::from(""));
+
+    for memory in &state.memories {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", memory.id), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("({})", memory.kind),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        // Memory is written by agents and people; it is shown, never acted on.
+        for text in memory.content.lines().take(6) {
+            lines.push(Line::from(format!("  {text}")));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn draw_memory(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    frame.render_widget(
+        Paragraph::new(memory_lines(state))
+            .block(Block::default().borders(Borders::ALL).title(" Memory "))
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll, 0)),
         area,
     );
 }
@@ -573,6 +662,64 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    fn text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_skills_screen_marks_enabled_skills_and_explains_itself_when_empty() {
+        let mut state = AppState::new();
+        assert!(text(&skill_lines(&state)).contains("No skill manager"));
+        state.set_skills(Vec::new());
+        assert!(text(&skill_lines(&state)).contains("cuma skills install"));
+
+        state.set_skills(vec![crate::SkillRow {
+            id: "rust-debug".into(),
+            name: "Rust debugging".into(),
+            trust: "Trusted".into(),
+            enabled: true,
+            capabilities: vec!["debugging".into()],
+            registry: "local".into(),
+        }]);
+        let rendered = text(&skill_lines(&state));
+        assert!(rendered.contains("[x] rust-debug"));
+        assert!(rendered.contains("Trusted"));
+    }
+
+    #[test]
+    fn the_memory_screen_shows_results_and_its_state() {
+        let mut state = AppState::new();
+        assert!(text(&memory_lines(&state)).contains("memory is off"));
+
+        state.memory_attached = true;
+        assert!(text(&memory_lines(&state)).contains("Press / to search"));
+        state.memory_searching = true;
+        assert!(text(&memory_lines(&state)).contains("searching"));
+
+        state.set_memories(
+            "auth".into(),
+            vec![crate::MemoryRow {
+                id: "notes/auth.md".into(),
+                kind: "fact".into(),
+                content: "tokens live in src/auth.rs".into(),
+            }],
+        );
+        let rendered = text(&memory_lines(&state));
+        assert!(rendered.contains("1 result for \"auth\""));
+        assert!(rendered.contains("notes/auth.md"));
+        assert!(rendered.contains("tokens live in src/auth.rs"));
+    }
+
     use crate::state::TaskRow;
     use cuma_core::{AgentId, TaskId};
     use ratatui::Terminal;

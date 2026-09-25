@@ -35,6 +35,36 @@ pub enum Action {
     Redraw,
     /// Start a session with this goal.
     Submit(String),
+    /// Search long-term memory for this.
+    SearchMemory(String),
+    /// Turn this skill on or off.
+    ToggleSkill {
+        /// The skill.
+        id: String,
+        /// What it should become.
+        enabled: bool,
+    },
+}
+
+/// Installed skills, for the Skills screen.
+///
+/// Defined here, not taken from the skills crate, so the interface depends on
+/// what it shows rather than on how skills are managed.
+#[async_trait::async_trait]
+pub trait SkillSource: Send + Sync {
+    /// Every installed skill.
+    async fn skills(&self) -> Result<Vec<crate::SkillRow>>;
+    /// Turn a skill's instructions on or off.
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()>;
+}
+
+/// What the interface can show beyond the orchestrator's own state.
+#[derive(Default, Clone)]
+pub struct Sources {
+    /// Installed skills.
+    pub skills: Option<Arc<dyn SkillSource>>,
+    /// Long-term memory.
+    pub memory: Option<Arc<dyn cuma_core::ports::MemoryStore>>,
 }
 
 /// Translate a keystroke into an action, given the current mode.
@@ -56,6 +86,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
     match state.input_mode {
         InputMode::Editing => match key.code {
             KeyCode::Enter => match state.submit() {
+                Some(query) if state.screen == Screen::Memory => {
+                    state.memory_searching = true;
+                    Action::SearchMemory(query)
+                }
                 Some(goal) => Action::Submit(goal),
                 None => Action::Redraw,
             },
@@ -90,6 +124,23 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
             KeyCode::BackTab | KeyCode::Left => {
                 state.previous_screen();
                 Action::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') if state.screen == Screen::Skills => {
+                state.move_skill_cursor(1);
+                Action::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') if state.screen == Screen::Skills => {
+                state.move_skill_cursor(-1);
+                Action::Redraw
+            }
+            KeyCode::Char(' ') | KeyCode::Char('e') if state.screen == Screen::Skills => {
+                match state.selected_skill() {
+                    Some(skill) => Action::ToggleSkill {
+                        id: skill.id.clone(),
+                        enabled: !skill.enabled,
+                    },
+                    None => Action::None,
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 state.scroll_down(1);
@@ -128,17 +179,24 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
 /// The terminal is restored on every exit path, including an error, because
 /// leaving raw mode on makes the user's shell unusable.
 pub async fn run(orchestrator: Orchestrator) -> Result<()> {
+    run_with(orchestrator, Sources::default()).await
+}
+
+/// Run the interface with skills and memory to browse.
+pub async fn run_with(orchestrator: Orchestrator, sources: Sources) -> Result<()> {
     let orchestrator = Arc::new(orchestrator);
 
     let mut state = AppState::new();
     state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
+    state.memory_attached = sources.memory.is_some();
+    refresh_skills(&mut state, &sources).await;
 
     let events = orchestrator.events().subscribe();
 
     let mut terminal = ratatui::try_init()
         .map_err(|err| MetaAgentError::Other(format!("cannot initialize the terminal: {err}")))?;
 
-    let outcome = event_loop(&mut terminal, &mut state, orchestrator, events).await;
+    let outcome = event_loop(&mut terminal, &mut state, orchestrator, events, sources).await;
 
     // Restore before propagating, so an error message lands in a usable shell.
     let restored = ratatui::try_restore();
@@ -153,10 +211,13 @@ async fn event_loop(
     state: &mut AppState,
     orchestrator: Arc<Orchestrator>,
     mut events: EventSubscriber,
+    sources: Sources,
 ) -> Result<()> {
     let mut input = EventStream::new();
     let mut session: Option<tokio::task::JoinHandle<Result<cuma_orchestrator::SessionResult>>> =
         None;
+    type Recall = (String, Result<Vec<cuma_core::ports::MemoryEntry>>);
+    let mut recall: Option<tokio::task::JoinHandle<Recall>> = None;
     let mut redraw = true;
 
     loop {
@@ -188,6 +249,42 @@ async fn event_loop(
                                 session = Some(tokio::spawn(async move {
                                     orchestrator.run(&goal).await
                                 }));
+                            }
+                            redraw = true;
+                        }
+                        Action::SearchMemory(query) => {
+                            match &sources.memory {
+                                Some(memory) => {
+                                    if let Some(previous) = recall.take() {
+                                        previous.abort();
+                                    }
+                                    let memory = Arc::clone(memory);
+                                    recall = Some(tokio::spawn(async move {
+                                        let found = tokio::time::timeout(
+                                            MEMORY_TIMEOUT,
+                                            memory.recall(&query, 20),
+                                        )
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            Err(MetaAgentError::Memory("the search timed out".to_owned()))
+                                        });
+                                        (query, found)
+                                    }));
+                                }
+                                None => {
+                                    state.memory_searching = false;
+                                    state.notice = Some("no memory backend is configured".to_owned());
+                                }
+                            }
+                            redraw = true;
+                        }
+                        Action::ToggleSkill { id, enabled } => {
+                            if let Some(skills) = &sources.skills {
+                                state.notice = Some(match skills.set_enabled(&id, enabled).await {
+                                    Ok(()) => format!("{} {id}", if enabled { "enabled" } else { "disabled" }),
+                                    Err(err) => err.to_string(),
+                                });
+                                refresh_skills(state, &sources).await;
                             }
                             redraw = true;
                         }
@@ -236,6 +333,38 @@ async fn event_loop(
                 redraw = true;
             }
 
+            // Memory search completion.
+            finished = async {
+                match recall.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                recall = None;
+                match finished {
+                    Ok((query, Ok(entries))) => {
+                        let rows = entries
+                            .into_iter()
+                            .map(|entry| crate::MemoryRow {
+                                id: entry.id,
+                                kind: entry.kind,
+                                content: entry.content,
+                            })
+                            .collect();
+                        state.set_memories(query, rows);
+                    }
+                    Ok((query, Err(err))) => {
+                        state.set_memories(query, Vec::new());
+                        state.notice = Some(format!("memory search failed: {err}"));
+                    }
+                    Err(err) => {
+                        state.memory_searching = false;
+                        state.notice = Some(format!("memory search stopped: {err}"));
+                    }
+                }
+                redraw = true;
+            }
+
             // Idle repaint.
             () = tokio::time::sleep(IDLE_REDRAW) => redraw = true,
         }
@@ -246,8 +375,24 @@ async fn event_loop(
     if let Some(handle) = session {
         handle.abort();
     }
+    if let Some(handle) = recall {
+        handle.abort();
+    }
 
     Ok(())
+}
+
+/// How long a memory search may take before the interface gives up on it.
+const MEMORY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Re-read installed skills, when a source is attached.
+async fn refresh_skills(state: &mut AppState, sources: &Sources) {
+    if let Some(skills) = &sources.skills {
+        match skills.skills().await {
+            Ok(rows) => state.set_skills(rows),
+            Err(err) => state.notice = Some(format!("cannot list skills: {err}")),
+        }
+    }
 }
 
 /// Fold an event into the state, refreshing anything the event cannot carry.
@@ -446,6 +591,65 @@ mod tests {
         handle_key(&mut state, press(KeyCode::Char('i')));
         assert_eq!(state.input_mode, InputMode::Navigating);
         assert!(state.notice.unwrap().contains("already running"));
+    }
+
+    fn skills_state() -> AppState {
+        let mut state = AppState::new();
+        state.go_to(Screen::Skills);
+        let row = |id: &str, enabled: bool| crate::SkillRow {
+            id: id.into(),
+            name: id.into(),
+            trust: "Trusted".into(),
+            enabled,
+            capabilities: Vec::new(),
+            registry: "builtin".into(),
+        };
+        state.set_skills(vec![row("a", true), row("b", false)]);
+        state
+    }
+
+    #[test]
+    fn on_the_skills_screen_arrows_move_the_cursor_and_space_toggles() {
+        let mut state = skills_state();
+        handle_key(&mut state, press(KeyCode::Down));
+        handle_key(&mut state, press(KeyCode::Down));
+        assert_eq!(state.skill_cursor, 1, "the cursor stops at the last skill");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char(' '))),
+            Action::ToggleSkill {
+                id: "b".into(),
+                enabled: true
+            }
+        );
+        handle_key(&mut state, press(KeyCode::Up));
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('e'))),
+            Action::ToggleSkill {
+                id: "a".into(),
+                enabled: false
+            }
+        );
+    }
+
+    #[test]
+    fn on_the_memory_screen_enter_searches_instead_of_running_a_goal() {
+        let mut state = AppState::new();
+        state.go_to(Screen::Memory);
+        state.running = true;
+        handle_key(&mut state, press(KeyCode::Char('/')));
+        assert_eq!(
+            state.input_mode,
+            InputMode::Editing,
+            "searching is allowed mid-session"
+        );
+        for c in "auth".chars() {
+            handle_key(&mut state, press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::SearchMemory("auth".into())
+        );
+        assert!(state.memory_searching);
     }
 
     #[test]

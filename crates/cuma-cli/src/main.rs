@@ -185,7 +185,9 @@ async fn run() -> Result<()> {
         Some(Command::Serve { protocol, bind }) => {
             commands::serve(config, workspace, &protocol, &bind).await
         }
-        Some(Command::Agents { action }) => commands::agents(config, action, cli.json).await,
+        Some(Command::Agents { action }) => {
+            commands::agents(config, workspace, action, cli.json).await
+        }
         Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
         Some(Command::Skills { action }) => {
             commands::skills(config, workspace, action, cli.json).await

@@ -14,8 +14,27 @@ use std::sync::Arc;
 pub enum AgentAction {
     /// List registered agents and their health.
     List,
-    /// Re-run discovery and report what was found.
-    Discover,
+    /// Re-run discovery and report what was found. With `--registry`, list
+    /// the agents the ACP registry publishes instead.
+    Discover {
+        /// List the ACP registry's catalogue.
+        #[arg(long)]
+        registry: bool,
+        /// A registry other than the official one.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// Configure an agent from the ACP registry in `.cuma/config.toml`.
+    Add {
+        /// The agent's registry id.
+        id: String,
+        /// Use the preview channel.
+        #[arg(long)]
+        preview: bool,
+        /// A registry other than the official one.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
     /// Show one agent in detail.
     Show {
         /// The agent's id.
@@ -348,12 +367,61 @@ async fn explain_plan(
 
 /// Launch the TUI.
 pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
-    let (orchestrator, warnings) = harness::build_orchestrator(config, workspace).await?;
+    let (orchestrator, warnings) =
+        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
 
-    cuma_tui::run(orchestrator).await
+    let skills = if config.skills.enabled {
+        cuma_skills::from_config(&config.skills, &workspace)
+            .ok()
+            .map(|(manager, _)| Arc::new(TuiSkills(manager)) as Arc<dyn cuma_tui::SkillSource>)
+    } else {
+        None
+    };
+    let memory = config
+        .memory
+        .enabled
+        .then(|| harness::memory_store(&config, &workspace));
+
+    cuma_tui::run_with(orchestrator, cuma_tui::Sources { skills, memory }).await
+}
+
+/// The skill manager, as the TUI's Skills screen sees it.
+struct TuiSkills(cuma_skills::SkillManager);
+
+#[async_trait::async_trait]
+impl cuma_tui::SkillSource for TuiSkills {
+    async fn skills(&self) -> Result<Vec<cuma_tui::SkillRow>> {
+        Ok(self
+            .0
+            .installed()
+            .await
+            .into_iter()
+            .map(|skill| cuma_tui::SkillRow {
+                id: skill.manifest.id.to_string(),
+                name: skill.manifest.name,
+                trust: format!("{:?}", skill.manifest.trust),
+                enabled: skill.enabled,
+                capabilities: skill
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                registry: skill.registry,
+            })
+            .collect())
+    }
+
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        if self.0.set_enabled(&SkillId::new(id), enabled).await? {
+            Ok(())
+        } else {
+            Err(MetaAgentError::Skill(format!("{id} is not installed")))
+        }
+    }
 }
 
 /// Serve CUMA itself as an agent.
@@ -423,12 +491,31 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
 }
 
 /// Agent subcommands.
-pub async fn agents(config: Config, action: AgentAction, json: bool) -> Result<()> {
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+pub async fn agents(
+    config: Config,
+    workspace: PathBuf,
+    action: AgentAction,
+    json: bool,
+) -> Result<()> {
+    // The registry commands read a catalogue; they need no agents running.
+    match &action {
+        AgentAction::Discover {
+            registry: true,
+            url,
+        } => {
+            return registry_discover(&config, &workspace, url.as_deref(), json).await;
+        }
+        AgentAction::Add { id, preview, url } => {
+            return registry_add(&config, &workspace, id, *preview, url.as_deref()).await;
+        }
+        _ => {}
+    }
+
     let (orchestrator, warnings) = harness::build_orchestrator(config, workspace).await?;
 
     match action {
-        AgentAction::Discover => {
+        AgentAction::Add { .. } => Ok(()),
+        AgentAction::Discover { .. } => {
             for warning in &warnings {
                 println!("  ! {warning}");
             }
@@ -1352,4 +1439,164 @@ pub async fn mcp(config: Config, action: McpAction, json: bool) -> Result<()> {
             .await
         }
     }
+}
+
+/// Where the ACP registry is cached between runs.
+fn registry_cache(workspace: &std::path::Path) -> PathBuf {
+    workspace
+        .join(".cuma")
+        .join("cache")
+        .join("acp-registry.json")
+}
+
+/// `cuma agents discover --registry`.
+async fn registry_discover(
+    config: &Config,
+    workspace: &std::path::Path,
+    url: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use cuma_protocol_acp::registry::{Launch, REGISTRY_URL, fetch_registry};
+
+    let fetched = fetch_registry(url.unwrap_or(REGISTRY_URL), &registry_cache(workspace)).await?;
+    if let Some(reason) = &fetched.stale {
+        eprintln!("warning: showing the cached registry; the live one is unreachable ({reason})");
+    }
+
+    if json {
+        let rows: Vec<serde_json::Value> = fetched
+            .registry
+            .agents
+            .iter()
+            .map(|agent| {
+                serde_json::json!({
+                    "id": agent.id,
+                    "name": agent.name,
+                    "version": agent.version,
+                    "description": agent.description,
+                    "launch": agent.launch(false),
+                    "configured": config.agents.contains_key(&agent.id),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    let mut table = Table::new(&["Agent", "Version", "Launch", "Status", "Description"]);
+    for agent in &fetched.registry.agents {
+        let (launch, status) = match agent.launch(false) {
+            Launch::Command { launcher, .. } => {
+                let ready = which::which(&launcher).is_ok();
+                (
+                    launcher.clone(),
+                    if ready {
+                        "ready".to_owned()
+                    } else {
+                        format!("needs {launcher}")
+                    },
+                )
+            }
+            Launch::Binary { .. } => ("binary".to_owned(), "manual install".to_owned()),
+            Launch::Unsupported => ("-".to_owned(), "not for this platform".to_owned()),
+        };
+        let status = if config.agents.contains_key(&agent.id) {
+            "configured".to_owned()
+        } else {
+            status
+        };
+        let description: String = agent.description.chars().take(60).collect();
+        table.row(vec![
+            agent.id.clone(),
+            agent.version.clone(),
+            launch,
+            status,
+            description,
+        ]);
+    }
+    println!("{}", table.render());
+    println!("Add one with: cuma agents add <id>");
+    Ok(())
+}
+
+/// `cuma agents add <id>`.
+async fn registry_add(
+    config: &Config,
+    workspace: &std::path::Path,
+    id: &str,
+    preview: bool,
+    url: Option<&str>,
+) -> Result<()> {
+    use cuma_protocol_acp::registry::{Launch, REGISTRY_URL, config_entry, fetch_registry};
+
+    if config.agents.contains_key(id) {
+        return Err(MetaAgentError::Configuration(format!(
+            "an agent named {id:?} is already configured; edit its [agents.{id}] section instead"
+        )));
+    }
+
+    let fetched = fetch_registry(url.unwrap_or(REGISTRY_URL), &registry_cache(workspace)).await?;
+    let Some(agent) = fetched.registry.agents.iter().find(|a| a.id == id) else {
+        return Err(MetaAgentError::Configuration(format!(
+            "the ACP registry lists no agent {id:?}; see `cuma agents discover --registry`"
+        )));
+    };
+
+    let command = match agent.launch(preview) {
+        Launch::Command { command, launcher } => {
+            if which::which(&launcher).is_err() {
+                eprintln!("warning: {launcher} is not on PATH; install it before using {id}");
+            }
+            command
+        }
+        Launch::Binary {
+            archive,
+            sha256,
+            command,
+        } => {
+            // Downloading and unpacking an executable on someone's behalf is
+            // a step they should take knowingly, with the checksum in hand.
+            return Err(MetaAgentError::Configuration(format!(
+                "{id} is distributed as a binary. Download {archive}{}, unpack it, and add:\n\n\
+                 [agents.{id}]\nprotocol = \"acp\"\ncommand = \"/path/to/{command}\"",
+                sha256.map_or_else(String::new, |s| format!(" (sha256 {s})"))
+            )));
+        }
+        Launch::Unsupported => {
+            return Err(MetaAgentError::Configuration(format!(
+                "{id} publishes nothing this platform ({}) can run",
+                cuma_protocol_acp::registry::current_platform()
+            )));
+        }
+    };
+
+    let entry = config_entry(id, &command)?;
+    let path = workspace.join(".cuma").join("config.toml");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| MetaAgentError::Configuration(err.to_string()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains(&format!("[agents.{id}]")) {
+        return Err(MetaAgentError::Configuration(format!(
+            "{} already has [agents.{id}]",
+            path.display()
+        )));
+    }
+    std::fs::write(&path, format!("{existing}{entry}")).map_err(|err| {
+        MetaAgentError::Configuration(format!("cannot write {}: {err}", path.display()))
+    })?;
+
+    println!(
+        "added {id} ({} {}) to {}",
+        agent.name,
+        agent.version,
+        path.display()
+    );
+    println!("  command = {command}");
+    println!("Check it with: cuma agents list");
+    Ok(())
 }

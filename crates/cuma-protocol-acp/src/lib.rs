@@ -24,3 +24,4 @@ mod discovery;
 pub use adapter::{AcpAdapter, SharedMcpServer};
 pub use capabilities::{capabilities_from_initialize, well_known_agent_command};
 pub use discovery::AcpConfigDiscovery;
+pub mod registry;
