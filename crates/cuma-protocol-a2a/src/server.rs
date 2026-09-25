@@ -182,26 +182,80 @@ impl TaskMap {
             .count()
     }
 
-    /// Drop the oldest settled tasks until there is room for one more.
-    fn make_room(&mut self) {
+    /// Drop the oldest settled tasks until there is room for one more,
+    /// returning the ids dropped.
+    fn make_room(&mut self) -> Vec<String> {
+        let mut evicted = Vec::new();
         while self.entries.len() >= MAX_RETAINED_TASKS {
             let Some(position) = self.order.iter().position(|id| {
                 self.entries
                     .get(id)
                     .is_none_or(|e| settled(e.current().state))
             }) else {
-                return;
+                break;
             };
             if let Some(id) = self.order.remove(position) {
                 self.entries.remove(&id);
+                evicted.push(id);
             }
         }
+        evicted
+    }
+
+    /// Add a task that is not running.
+    fn insert_settled(&mut self, task: WireTask) {
+        let id = task.id.clone();
+        let (snapshot, _) = watch::channel(task);
+        let (updates, _) = broadcast::channel(16);
+        self.entries.insert(
+            id.clone(),
+            TaskEntry {
+                snapshot,
+                updates,
+                run: None,
+            },
+        );
+        self.order.push_back(id);
     }
 }
 
 /// Whether a task will not change again without the caller.
 fn settled(state: TaskState) -> bool {
     state.is_terminal() || state.is_interrupted()
+}
+
+/// Where the A2A server keeps its tasks so they outlive the process.
+///
+/// Tasks are handed over as their own A2A 1.0 JSON, with the fields a store
+/// might want to index alongside. The server never depends on the store
+/// succeeding: a write that fails costs durability, not the task.
+pub trait TaskStore: Send + Sync {
+    /// Save a task, replacing any earlier version of it.
+    fn save(&self, id: &str, context_id: &str, state: &str, body: &str) -> Result<()>;
+    /// The newest `limit` tasks, oldest first.
+    fn load(&self, limit: usize) -> Result<Vec<String>>;
+    /// Forget a task.
+    fn remove(&self, id: &str) -> Result<()>;
+}
+
+/// The status a task that was running when CUMA stopped is left in.
+const INTERRUPTED_BY_RESTART: &str = "CUMA restarted while this task was running, and it was \
+     not resumed: part of it may already have been carried out, so running it again \
+     unasked could repeat work. Send the message again to retry.";
+
+fn persist(store: Option<&Arc<dyn TaskStore>>, task: &WireTask) {
+    let Some(store) = store else {
+        return;
+    };
+    let body = task.to_json(Dialect::V1).to_string();
+    if let Err(err) = store.save(
+        &task.id,
+        &task.context_id,
+        task.state.render(Dialect::V1),
+        &body,
+    ) {
+        tracing::warn!(task = %task.id, error = %err, "could not persist an A2A task");
+    }
 }
 
 /// What a JSON-RPC call produced.
@@ -275,6 +329,7 @@ pub struct A2aServer {
     orchestrator: Arc<Orchestrator>,
     card: AgentCard,
     tasks: Arc<Mutex<TaskMap>>,
+    store: Option<Arc<dyn TaskStore>>,
 }
 
 impl A2aServer {
@@ -285,7 +340,50 @@ impl A2aServer {
             orchestrator,
             card,
             tasks: Arc::new(Mutex::new(TaskMap::default())),
+            store: None,
         }
+    }
+
+    /// Keep tasks in `store`, and take back the tasks it already holds.
+    ///
+    /// A task that was still running when the last process stopped is not
+    /// restarted: it may have been partly carried out, and repeating a goal
+    /// nobody re-sent could repeat its side effects. It is marked failed, with
+    /// the reason, so a caller polling it learns what happened.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn TaskStore>) -> Self {
+        let restored = match store.load(MAX_RETAINED_TASKS) {
+            Ok(bodies) => bodies,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not load persisted A2A tasks");
+                Vec::new()
+            }
+        };
+
+        {
+            let mut tasks = self.tasks();
+            for body in restored {
+                let Some(mut task) = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(wire::parse_task)
+                else {
+                    tracing::warn!("ignoring an unreadable persisted A2A task");
+                    continue;
+                };
+                if !settled(task.state) {
+                    task.state = TaskState::Failed;
+                    task.status_text = Some(INTERRUPTED_BY_RESTART.to_owned());
+                    task.timestamp = Some(chrono_now());
+                    persist(Some(&store), &task);
+                }
+                tasks.insert_settled(task);
+            }
+            tracing::info!(tasks = tasks.entries.len(), "restored A2A tasks");
+        }
+
+        self.store = Some(store);
+        self
     }
 
     /// The card this server publishes.
@@ -455,7 +553,13 @@ impl A2aServer {
                     format!("CUMA is already running {MAX_ACTIVE_TASKS} tasks; try again later"),
                 ));
             }
-            tasks.make_room();
+            for evicted in tasks.make_room() {
+                if let Some(store) = &self.store
+                    && let Err(err) = store.remove(&evicted)
+                {
+                    tracing::warn!(task = %evicted, error = %err, "could not forget an A2A task");
+                }
+            }
             tasks.entries.insert(
                 task_id.clone(),
                 TaskEntry {
@@ -466,12 +570,14 @@ impl A2aServer {
             );
             tasks.order.push_back(task_id.clone());
         }
+        persist(self.store.as_ref(), &snapshot.borrow());
 
         let handle = tokio::spawn(drive(
             Arc::clone(&self.orchestrator),
             goal,
             snapshot,
             updates,
+            self.store.clone(),
         ));
 
         if let Some(entry) = self.tasks().entries.get_mut(&task_id) {
@@ -614,6 +720,7 @@ impl A2aServer {
         };
         entry.snapshot.send_replace(cancelled.clone());
         let _ = entry.updates.send(TaskUpdate::Status(cancelled.clone()));
+        persist(self.store.as_ref(), &cancelled);
 
         rpc_result(id, cancelled.to_json(dialect))
     }
@@ -675,6 +782,7 @@ async fn drive(
     goal: String,
     snapshot: watch::Sender<WireTask>,
     updates: broadcast::Sender<TaskUpdate>,
+    store: Option<Arc<dyn TaskStore>>,
 ) {
     let session_id = SessionId::new(snapshot.borrow().id.clone());
 
@@ -683,7 +791,9 @@ async fn drive(
             change(task);
             task.timestamp = Some(chrono_now());
         });
-        let _ = updates.send(TaskUpdate::Status(snapshot.borrow().clone()));
+        let current = snapshot.borrow().clone();
+        persist(store.as_ref(), &current);
+        let _ = updates.send(TaskUpdate::Status(current));
     };
 
     // Subscribe before starting, and keep only this session's events: other
@@ -770,7 +880,21 @@ pub async fn handle_rpc(orchestrator: Arc<Orchestrator>, body: &str) -> Value {
 
 /// Serve CUMA over A2A on `address`.
 pub async fn serve(orchestrator: Orchestrator, address: SocketAddr, base_url: &str) -> Result<()> {
-    let server = Arc::new(A2aServer::new(Arc::new(orchestrator), base_url).await);
+    serve_with(orchestrator, None, address, base_url).await
+}
+
+/// Serve CUMA over A2A on `address`, keeping tasks in `store` when given.
+pub async fn serve_with(
+    orchestrator: Orchestrator,
+    store: Option<Arc<dyn TaskStore>>,
+    address: SocketAddr,
+    base_url: &str,
+) -> Result<()> {
+    let mut server = A2aServer::new(Arc::new(orchestrator), base_url).await;
+    if let Some(store) = store {
+        server = server.with_store(store);
+    }
+    let server = Arc::new(server);
     let app = server.router();
 
     let listener = tokio::net::TcpListener::bind(address)

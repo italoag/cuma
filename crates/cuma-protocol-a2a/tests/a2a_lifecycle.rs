@@ -550,3 +550,132 @@ async fn a_streaming_peer_is_followed_over_sse() {
         "chunks arrive as they stream"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Restarts
+// ---------------------------------------------------------------------------
+
+/// A task store kept in memory, standing in for the runtime database.
+#[derive(Default)]
+struct MemoryStore(std::sync::Mutex<Vec<(String, String)>>);
+
+impl cuma_protocol_a2a::TaskStore for MemoryStore {
+    fn save(&self, id: &str, _context: &str, _state: &str, body: &str) -> cuma_core::Result<()> {
+        let mut tasks = self.0.lock().unwrap();
+        match tasks.iter_mut().find(|(existing, _)| existing == id) {
+            Some(entry) => entry.1 = body.to_owned(),
+            None => tasks.push((id.to_owned(), body.to_owned())),
+        }
+        Ok(())
+    }
+    fn load(&self, limit: usize) -> cuma_core::Result<Vec<String>> {
+        let tasks = self.0.lock().unwrap();
+        let skip = tasks.len().saturating_sub(limit);
+        Ok(tasks
+            .iter()
+            .skip(skip)
+            .map(|(_, body)| body.clone())
+            .collect())
+    }
+    fn remove(&self, id: &str) -> cuma_core::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .retain(|(existing, _)| existing != id);
+        Ok(())
+    }
+}
+
+async fn call(server: &A2aServer, method: &str, params: Value) -> Value {
+    server
+        .handle_json(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn tasks_outlive_a_restart_and_an_interrupted_one_is_reported_not_rerun() {
+    let store = Arc::new(MemoryStore::default());
+
+    // The first process finishes one task and is still running another when
+    // it stops.
+    let first = A2aServer::new(
+        cuma_with(Behaviour::ok("done before")).await,
+        "http://localhost/",
+    )
+    .await
+    .with_store(store.clone());
+    let finished = call(&first, "SendMessage", v1_message("say hello")).await;
+    let finished_id = finished["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        finished["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let slow = A2aServer::new(
+        cuma_with(Behaviour::Slow {
+            delay: Duration::from_secs(30),
+            output: "never".into(),
+        })
+        .await,
+        "http://localhost/",
+    )
+    .await
+    .with_store(store.clone());
+    let mut params = v1_message("say hello");
+    params["configuration"] = json!({ "returnImmediately": true });
+    let running = call(&slow, "SendMessage", params).await;
+    let running_id = running["result"]["task"]["id"].as_str().unwrap().to_owned();
+    drop(slow);
+    drop(first);
+
+    // A new process on the same store.
+    let second = A2aServer::new(cuma_with(Behaviour::ok("x")).await, "http://localhost/")
+        .await
+        .with_store(store.clone());
+
+    let restored = call(&second, "GetTask", json!({ "id": finished_id })).await;
+    assert_eq!(
+        restored["result"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+    assert!(
+        restored["result"]["artifacts"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("done before"),
+        "a finished task keeps its result: {restored}"
+    );
+
+    let interrupted = call(&second, "GetTask", json!({ "id": running_id })).await;
+    assert_eq!(
+        interrupted["result"]["status"]["state"],
+        "TASK_STATE_FAILED"
+    );
+    assert!(
+        interrupted["result"]["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("restarted"),
+        "the caller is told why: {interrupted}"
+    );
+
+    let listed = call(&second, "ListTasks", json!({})).await;
+    assert_eq!(listed["result"]["totalSize"], 2);
+
+    // The interrupted state was written back, so a third process agrees.
+    let third = A2aServer::new(cuma_with(Behaviour::ok("x")).await, "http://localhost/")
+        .await
+        .with_store(store);
+    let again = call(&third, "GetTask", json!({ "id": running_id })).await;
+    assert_eq!(again["result"]["status"]["state"], "TASK_STATE_FAILED");
+    let cancel = call(&third, "CancelTask", json!({ "id": running_id })).await;
+    assert_eq!(
+        cancel["error"]["code"], -32002,
+        "a settled task cannot be cancelled"
+    );
+}

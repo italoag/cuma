@@ -468,7 +468,24 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
                 "serving {} agents over A2A on http://{address}",
                 orchestrator.agents().len().await
             );
-            cuma_protocol_a2a::serve(orchestrator, address, &format!("http://{address}")).await
+            // Tasks are kept in the runtime database, so a caller can still
+            // read a result after CUMA restarts.
+            let store = match cuma_persistence::RuntimeStore::open(&database) {
+                Ok(store) => {
+                    Some(Arc::new(A2aTasks(store)) as Arc<dyn cuma_protocol_a2a::TaskStore>)
+                }
+                Err(err) => {
+                    eprintln!("warning: A2A tasks will not survive a restart: {err}");
+                    None
+                }
+            };
+            cuma_protocol_a2a::serve_with(
+                orchestrator,
+                store,
+                address,
+                &format!("http://{address}"),
+            )
+            .await
         }
         "mcp" => {
             eprintln!(
@@ -487,6 +504,23 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
         other => Err(MetaAgentError::Configuration(format!(
             "cannot serve protocol {other:?}; expected \"acp\", \"a2a\" or \"mcp\""
         ))),
+    }
+}
+
+/// The runtime database, as the A2A server's task store.
+struct A2aTasks(cuma_persistence::RuntimeStore);
+
+impl cuma_protocol_a2a::TaskStore for A2aTasks {
+    fn save(&self, id: &str, context_id: &str, state: &str, body: &str) -> Result<()> {
+        self.0.save_a2a_task(id, context_id, state, body)
+    }
+
+    fn load(&self, limit: usize) -> Result<Vec<String>> {
+        self.0.load_a2a_tasks(limit)
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        self.0.delete_a2a_task(id)
     }
 }
 

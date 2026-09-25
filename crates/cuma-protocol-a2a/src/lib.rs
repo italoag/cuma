@@ -31,4 +31,7 @@ pub use card::{
     capabilities_from_card,
 };
 pub use client::{A2aAdapter, A2aDiscovery};
-pub use server::{A2aServer, Reply, TaskStream, agent_card, goal_from_params, handle_rpc, serve};
+pub use server::{
+    A2aServer, Reply, TaskStore, TaskStream, agent_card, goal_from_params, handle_rpc, serve,
+    serve_with,
+};

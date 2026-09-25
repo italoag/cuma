@@ -303,6 +303,48 @@ impl RuntimeStore {
         })
     }
 
+    /// Save an A2A task, keeping its original position among the others.
+    pub fn save_a2a_task(&self, id: &str, context_id: &str, state: &str, body: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO a2a_tasks (id, context_id, state, created_seq, updated_at, body)
+                 VALUES (?1, ?2, ?3,
+                         (SELECT COALESCE(MAX(created_seq), 0) + 1 FROM a2a_tasks),
+                         ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                     context_id = excluded.context_id,
+                     state      = excluded.state,
+                     updated_at = excluded.updated_at,
+                     body       = excluded.body",
+                params![id, context_id, state, chrono::Utc::now().to_rfc3339(), body],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The newest `limit` A2A tasks' bodies, oldest first.
+    pub fn load_a2a_tasks(&self, limit: usize) -> Result<Vec<String>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT body FROM (
+                     SELECT body, created_seq FROM a2a_tasks
+                     ORDER BY created_seq DESC LIMIT ?1
+                 ) ORDER BY created_seq ASC",
+            )?;
+            let rows = statement.query_map(params![limit], |row| row.get(0))?;
+            rows.collect()
+        })
+    }
+
+    /// Forget an A2A task.
+    pub fn delete_a2a_task(&self, id: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute("DELETE FROM a2a_tasks WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
     /// Every agent's last recorded health.
     pub fn agent_health(&self) -> Result<Vec<AgentHealthRecord>> {
         self.with_connection(|connection| {
@@ -868,5 +910,74 @@ mod tests {
             0,
             "orphaned attempts would skew every later report"
         );
+    }
+
+    #[test]
+    fn a2a_tasks_keep_their_order_when_updated_and_only_the_newest_are_loaded() {
+        let store = RuntimeStore::in_memory().unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .save_a2a_task(
+                    id,
+                    "ctx",
+                    "TASK_STATE_WORKING",
+                    &format!("{{\"id\":\"{id}\"}}"),
+                )
+                .unwrap();
+        }
+        // An update rewrites the body but not the task's place in line.
+        store
+            .save_a2a_task(
+                "a",
+                "ctx",
+                "TASK_STATE_COMPLETED",
+                r#"{"id":"a","done":true}"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.load_a2a_tasks(10).unwrap(),
+            vec![
+                r#"{"id":"a","done":true}"#,
+                r#"{"id":"b"}"#,
+                r#"{"id":"c"}"#
+            ]
+        );
+        assert_eq!(
+            store.load_a2a_tasks(2).unwrap(),
+            vec![r#"{"id":"b"}"#, r#"{"id":"c"}"#]
+        );
+
+        store.delete_a2a_task("b").unwrap();
+        assert_eq!(store.load_a2a_tasks(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_version_1_database_is_carried_forward_with_its_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.db");
+        {
+            // What an earlier build left behind: the v1 schema, with data.
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, goal TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, success INTEGER, summary TEXT);").unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, goal, started_at) VALUES ('old', 'g', 'now')",
+                    [],
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let store = RuntimeStore::open(&path).unwrap();
+        assert_eq!(
+            store.session_count().unwrap(),
+            1,
+            "existing history is kept"
+        );
+        store
+            .save_a2a_task("t", "c", "TASK_STATE_SUBMITTED", "{}")
+            .unwrap();
+        assert_eq!(store.load_a2a_tasks(5).unwrap().len(), 1);
     }
 }

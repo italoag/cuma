@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// The schema version this build expects.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Create or migrate the schema.
 ///
@@ -24,6 +24,21 @@ pub fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
 
+    // Each step brings a database from the version before it, so one written
+    // by any earlier build is carried forward rather than recreated.
+    if current < 1 {
+        migrate_to_v1(connection)?;
+    }
+    if current < 2 {
+        migrate_to_v2(connection)?;
+    }
+
+    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// The original schema: sessions, tasks, attempts, routing and health.
+fn migrate_to_v1(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         r"
         BEGIN;
@@ -113,8 +128,29 @@ pub fn migrate(connection: &Connection) -> rusqlite::Result<()> {
 
         COMMIT;
         ",
-    )?;
+    )
+}
 
-    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    Ok(())
+/// Tasks CUMA runs for A2A callers, so they outlive a restart.
+///
+/// Stored as the task's own A2A JSON: this table is the A2A server's memory,
+/// not a model of the domain, and the protocol already defines the shape.
+fn migrate_to_v2(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r"
+        BEGIN;
+
+        CREATE TABLE IF NOT EXISTS a2a_tasks (
+            id          TEXT PRIMARY KEY,
+            context_id  TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            created_seq INTEGER NOT NULL,
+            updated_at  TEXT NOT NULL,
+            body        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS a2a_tasks_by_age ON a2a_tasks (created_seq);
+
+        COMMIT;
+        ",
+    )
 }
