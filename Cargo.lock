@@ -1119,6 +1119,7 @@ dependencies = [
  "chrono",
  "cuma-config",
  "cuma-core",
+ "dirs",
  "serde",
  "serde_json",
  "tempfile",

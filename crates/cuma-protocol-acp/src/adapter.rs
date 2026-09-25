@@ -16,6 +16,7 @@ use cuma_core::{
     AgentDescriptor, AgentId, AgentProtocol, AttemptId, ErrorClass, ExecutionOutcome, Risk,
     TokenUsage,
 };
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -59,8 +60,35 @@ pub struct AcpAdapter {
     command: String,
     permission_policy: PermissionPolicy,
     mcp_servers: Vec<SharedMcpServer>,
-    /// A sandbox launcher the agent is started under, e.g. `ai-jail --exec … --`.
-    launch_prefix: Vec<String>,
+    /// Starts the agent inside a sandbox, e.g. `ai-jail --exec … --`.
+    launcher: Option<Arc<dyn AgentLauncher>>,
+    /// Environment variables the agent needs beyond a sandbox's baseline.
+    kept_env: Vec<String>,
+}
+
+/// Starts agents confined to the directory they work in.
+///
+/// Asked afresh for every launch: an agent working in a task's worktree must
+/// be able to write that worktree, not the directory CUMA started in.
+pub trait AgentLauncher: Send + Sync {
+    /// The command-line prefix for an agent working in `workspace`, keeping
+    /// the environment variables named in `keep_env` and able to read the
+    /// paths its own command names in `readable`.
+    fn prefix(&self, workspace: &Path, keep_env: &[String], readable: &[PathBuf]) -> Vec<String>;
+}
+
+/// A fixed prefix, whatever the workspace.
+struct FixedPrefix(Vec<String>);
+
+impl AgentLauncher for FixedPrefix {
+    fn prefix(
+        &self,
+        _workspace: &Path,
+        _keep_env: &[String],
+        _readable: &[PathBuf],
+    ) -> Vec<String> {
+        self.0.clone()
+    }
 }
 
 /// An MCP server to hand an agent in `session/new`.
@@ -97,28 +125,85 @@ impl AcpAdapter {
             command: command.into(),
             permission_policy: PermissionPolicy::AllowLowRisk,
             mcp_servers: Vec::new(),
-            launch_prefix: Vec::new(),
+            launcher: None,
+            kept_env: Vec::new(),
         }
     }
 
-    /// Launch the agent under `prefix` — a sandbox, typically.
+    /// Launch the agent under a fixed `prefix`.
     #[must_use]
-    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
-        self.launch_prefix = prefix;
+    pub fn with_launch_prefix(self, prefix: Vec<String>) -> Self {
+        if prefix.is_empty() {
+            return self;
+        }
+        self.with_launcher(Arc::new(FixedPrefix(prefix)))
+    }
+
+    /// Launch the agent through `launcher` — a sandbox, typically.
+    #[must_use]
+    pub fn with_launcher(mut self, launcher: Arc<dyn AgentLauncher>) -> Self {
+        self.launcher = Some(launcher);
         self
     }
 
-    /// The full command the agent is launched with, sandbox included.
-    pub fn launch_command(&self) -> String {
-        if self.launch_prefix.is_empty() {
-            self.command.clone()
-        } else {
-            format!(
-                "{} {}",
-                shell_words::join(&self.launch_prefix),
-                self.command
-            )
+    /// Keep these environment variables when the agent is sandboxed — the
+    /// secrets MCP servers it launches will look for, say.
+    #[must_use]
+    pub fn with_kept_env(mut self, names: Vec<String>) -> Self {
+        self.kept_env = names;
+        self
+    }
+
+    /// The full command an agent working in `workspace` is launched with,
+    /// sandbox included.
+    ///
+    /// Leading `NAME=value` assignments in the configured command set the
+    /// agent's environment. They are moved ahead of the sandbox — which would
+    /// otherwise try to run `NAME=value` as a program — and their names kept.
+    pub fn launch_command(&self, workspace: &Path) -> String {
+        let Some(launcher) = &self.launcher else {
+            return self.command.clone();
+        };
+        let Ok(parts) = shell_words::split(&self.command) else {
+            return self.command.clone();
+        };
+
+        let assignments: Vec<&String> = parts.iter().take_while(|p| is_assignment(p)).collect();
+        let program = &parts[assignments.len()..];
+        let mut keep = self.kept_env.clone();
+        keep.extend(
+            assignments
+                .iter()
+                .filter_map(|a| a.split_once('=').map(|(name, _)| name.to_owned())),
+        );
+
+        // The agent's program and any path its command names — a script in
+        // a project folder, a binary under $HOME — were chosen by whoever
+        // configured it, and must stay visible inside the sandbox.
+        let readable: Vec<PathBuf> = program
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| {
+                let path = Path::new(word);
+                if path.is_absolute() {
+                    Some(path.to_path_buf())
+                } else if index == 0 {
+                    which::which(word).ok()
+                } else {
+                    None
+                }
+            })
+            .filter(|path| path.exists())
+            .collect();
+
+        let prefix = launcher.prefix(workspace, &keep, &readable);
+        if prefix.is_empty() {
+            return self.command.clone();
         }
+        let mut words: Vec<&str> = assignments.iter().map(|a| a.as_str()).collect();
+        words.extend(prefix.iter().map(String::as_str));
+        words.extend(program.iter().map(String::as_str));
+        shell_words::join(words)
     }
 
     /// MCP servers to offer the agent in every session.
@@ -160,22 +245,35 @@ impl AcpAdapter {
         let agent = parts
             .first()
             .is_some_and(|binary| which::which(binary).is_ok());
-        let launcher = self
-            .launch_prefix
-            .first()
-            .is_none_or(|binary| which::which(binary).is_ok());
+        let here = std::env::current_dir().unwrap_or_default();
+        let launcher = self.launcher.as_ref().is_none_or(|launcher| {
+            launcher
+                .prefix(&here, &[], &[])
+                .first()
+                .is_none_or(|binary| which::which(binary).is_ok())
+        });
         agent && launcher
     }
 
-    /// Build the SDK's agent handle from the configured command.
-    fn spawn_handle(&self) -> Result<AcpAgent> {
-        AcpAgent::from_str(&self.launch_command()).map_err(|err| {
+    /// Build the SDK's agent handle for an agent working in `workspace`.
+    fn spawn_handle(&self, workspace: &Path) -> Result<AcpAgent> {
+        AcpAgent::from_str(&self.launch_command(workspace)).map_err(|err| {
             MetaAgentError::Configuration(format!(
                 "agent {}: cannot parse command {:?}: {err}",
                 self.id, self.command
             ))
         })
     }
+}
+
+/// Whether a command word is a `NAME=value` environment assignment.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Translate an ACP session notification into a protocol-agnostic update.
@@ -307,7 +405,7 @@ impl AgentAdapter for AcpAdapter {
         updates: mpsc::Sender<ExecutionUpdate>,
     ) -> Result<ExecutionOutcome> {
         let started = std::time::Instant::now();
-        let agent = self.spawn_handle()?;
+        let agent = self.spawn_handle(&request.workspace)?;
 
         let risk = request.task.spec.risk;
         let policy = self.permission_policy;
@@ -455,7 +553,9 @@ impl AcpAdapter {
     /// This is the expensive counterpart to [`AgentAdapter::describe`], called
     /// by discovery rather than on every routing decision.
     pub async fn refresh_capabilities(&self) -> Result<AgentDescriptor> {
-        let agent = self.spawn_handle()?;
+        // No task yet, so no workspace of its own: negotiation only
+        // exchanges capabilities, from where CUMA runs.
+        let agent = self.spawn_handle(&std::env::current_dir().unwrap_or_default())?;
         let agent_id = self.id.clone();
 
         let response = agent_client_protocol::Client
@@ -519,7 +619,7 @@ mod tests {
             "/work/my project".into(),
             "--".into(),
         ]);
-        let command = adapter.launch_command();
+        let command = adapter.launch_command(Path::new("/work"));
         assert_eq!(
             shell_words::split(&command).unwrap(),
             vec![
@@ -533,6 +633,43 @@ mod tests {
                 "@agentclientprotocol/claude-agent-acp@latest"
             ]
         );
+    }
+
+    #[test]
+    fn leading_assignments_go_ahead_of_the_sandbox_and_are_kept() {
+        struct Recording(std::sync::Mutex<Vec<String>>);
+        impl AgentLauncher for Recording {
+            fn prefix(&self, workspace: &Path, keep_env: &[String], _: &[PathBuf]) -> Vec<String> {
+                *self.0.lock().unwrap() = keep_env.to_vec();
+                vec![
+                    "bwrap".into(),
+                    "--chdir".into(),
+                    workspace.display().to_string(),
+                    "--".into(),
+                ]
+            }
+        }
+        let launcher = Arc::new(Recording(std::sync::Mutex::default()));
+        let adapter = AcpAdapter::new("codex", "RUST_LOG=debug codex-acp --flag")
+            .with_kept_env(vec!["GH_TOKEN".into()])
+            .with_launcher(launcher.clone());
+
+        let command = adapter.launch_command(Path::new("/work/task 1"));
+        assert_eq!(
+            shell_words::split(&command).unwrap(),
+            vec![
+                "RUST_LOG=debug",
+                "bwrap",
+                "--chdir",
+                "/work/task 1",
+                "--",
+                "codex-acp",
+                "--flag"
+            ]
+        );
+        assert_eq!(*launcher.0.lock().unwrap(), vec!["GH_TOKEN", "RUST_LOG"]);
+        // The SDK reads leading assignments as the process environment.
+        assert!(AcpAgent::from_str(&command).is_ok());
     }
 
     #[test]
@@ -675,7 +812,7 @@ mod tests {
     #[test]
     fn an_unparseable_command_is_a_configuration_error() {
         let adapter = AcpAdapter::new("broken", "unterminated 'quote");
-        let err = adapter.spawn_handle().unwrap_err();
+        let err = adapter.spawn_handle(Path::new("/w")).unwrap_err();
         assert_eq!(err.class(), ErrorClass::Configuration);
     }
 

@@ -23,6 +23,7 @@
 //!
 //! [`TaskGraph::ready_tasks`]: cuma_core::TaskGraph::ready_tasks
 
+pub mod confine;
 pub mod git;
 pub mod guard;
 pub mod index;
@@ -30,9 +31,10 @@ pub mod ownership;
 pub mod rtk;
 pub mod sandbox;
 
+pub use confine::{AgentConfinementLevel, AgentRuntime, AgentSandbox};
 pub use git::{Checkpoint, GitWorkspace, Worktree};
 pub use guard::{CommandGuard, CommandVerdict};
 pub use index::WorkspaceIndex;
 pub use ownership::{OwnershipLedger, WriteConflict, predict_writes};
 pub use rtk::{Rtk, RtkGain, RtkStatus, Saving, estimate_tokens, parse_gain};
-pub use sandbox::{AgentConfinement, Sandbox, SandboxStatus};
+pub use sandbox::{Sandbox, SandboxStatus};

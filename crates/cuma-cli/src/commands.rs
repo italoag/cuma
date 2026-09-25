@@ -1319,19 +1319,10 @@ pub async fn doctor(
         problems.push(sandbox.describe());
     }
 
-    let agent_sandbox = cuma_workspace::Sandbox::detect(&config.security);
-    let confinement = agent_sandbox.describe_agent_confinement();
-    if agent_sandbox
-        .agent_launch_prefix(
-            &workspace,
-            &cuma_workspace::AgentConfinement::from_config(&config.security),
-        )
-        .is_some()
-        || !config.security.sandbox
-    {
-        notes.push(confinement);
-    } else {
-        problems.push(confinement);
+    // A shortfall already reached `problems` through the build warnings.
+    let agent_sandbox = cuma_workspace::AgentSandbox::detect(&config.security);
+    if !agent_sandbox.level().is_shortfall() {
+        notes.push(agent_sandbox.describe());
     }
 
     let rtk = orchestrator.rtk_status();

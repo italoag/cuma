@@ -312,6 +312,42 @@ pub fn shared_mcp_servers(
         .collect()
 }
 
+/// Launches ACP agents inside the agent sandbox, confined to the directory
+/// each one works in.
+struct SandboxLauncher(cuma_workspace::AgentSandbox);
+
+impl cuma_protocol_acp::AgentLauncher for SandboxLauncher {
+    fn prefix(&self, workspace: &Path, keep_env: &[String], readable: &[PathBuf]) -> Vec<String> {
+        self.0
+            .launch_prefix(workspace, keep_env, readable)
+            .unwrap_or_default()
+    }
+}
+
+/// The variables shared MCP servers take their secrets from.
+///
+/// An agent launches `cuma mcp proxy`, which resolves `$VAR` references from
+/// its own environment — inherited from the agent — so a sandboxed agent
+/// must keep them, as an unsandboxed one always did.
+pub fn shared_mcp_secret_names(config: &Config) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .mcp
+        .values()
+        .filter(|server| server.enabled && server.share_with_agents)
+        .flat_map(|server| server.env.values())
+        .filter_map(|value| value.strip_prefix('$'))
+        .map(|name| {
+            name.trim_start_matches('{')
+                .trim_end_matches('}')
+                .to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Build the long-term memory store the configuration asks for.
 ///
 /// `ai-memory-mcp` talks to `ai-memory serve --transport stdio` (or the
@@ -384,18 +420,29 @@ pub async fn build_orchestrator(
     if !shared.is_empty() {
         tracing::info!(count = shared.len(), "offering MCP servers to ACP agents");
     }
-    let sandbox = cuma_workspace::Sandbox::detect(&config.security);
-    let confinement = cuma_workspace::AgentConfinement::from_config(&config.security);
-    let launch_prefix = sandbox
-        .agent_launch_prefix(&workspace, &confinement)
-        .unwrap_or_default();
-    if config.security.sandbox && launch_prefix.is_empty() {
-        warnings.push(sandbox.describe_agent_confinement());
+    let sandbox = cuma_workspace::AgentSandbox::detect(&config.security);
+    if sandbox.level().is_shortfall() {
+        warnings.push(sandbox.describe());
     }
-    let acp = AcpConfigDiscovery::new(config.clone())
+    let mut acp = AcpConfigDiscovery::new(config.clone())
         .with_mcp_servers(shared)
-        .with_launch_prefix(launch_prefix);
-    for adapter in acp.adapters() {
+        .with_kept_env(shared_mcp_secret_names(&config));
+    if sandbox.runtime().is_some() {
+        acp = acp.with_launcher(Arc::new(SandboxLauncher(sandbox.clone())));
+    }
+    let acp_adapters = if sandbox.refuses_agents() {
+        // Required confinement is not available: no local agent runs rather
+        // than one running unconfined.
+        warnings.push(
+            "security.require_agent_sandbox is set and agents cannot be fully confined here; \
+             local ACP agents are not registered"
+                .to_owned(),
+        );
+        Vec::new()
+    } else {
+        acp.adapters()
+    };
+    for adapter in acp_adapters {
         let id = adapter.agent_id().clone();
 
         // Negotiate capabilities where possible; register with configured

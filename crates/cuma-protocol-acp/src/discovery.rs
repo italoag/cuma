@@ -12,6 +12,7 @@ use cuma_config::Config;
 use cuma_core::error::Result;
 use cuma_core::ports::{AgentAdapter, AgentDiscovery};
 use cuma_core::{AgentDescriptor, AgentProtocol};
+use std::sync::Arc;
 
 /// Finds ACP agents declared in configuration.
 pub struct AcpConfigDiscovery {
@@ -24,7 +25,8 @@ pub struct AcpConfigDiscovery {
     /// MCP servers every discovered agent is offered.
     mcp_servers: Vec<crate::SharedMcpServer>,
     /// A sandbox launcher every discovered agent is started under.
-    launch_prefix: Vec<String>,
+    launcher: Option<Arc<dyn crate::AgentLauncher>>,
+    kept_env: Vec<String>,
 }
 
 impl AcpConfigDiscovery {
@@ -34,14 +36,22 @@ impl AcpConfigDiscovery {
             config,
             require_launchable: true,
             mcp_servers: Vec::new(),
-            launch_prefix: Vec::new(),
+            launcher: None,
+            kept_env: Vec::new(),
         }
     }
 
-    /// Start every discovered agent under `prefix`.
+    /// Start every discovered agent through `launcher`.
     #[must_use]
-    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
-        self.launch_prefix = prefix;
+    pub fn with_launcher(mut self, launcher: Arc<dyn crate::AgentLauncher>) -> Self {
+        self.launcher = Some(launcher);
+        self
+    }
+
+    /// Environment variables sandboxed agents keep beyond the baseline.
+    #[must_use]
+    pub fn with_kept_env(mut self, names: Vec<String>) -> Self {
+        self.kept_env = names;
         self
     }
 
@@ -82,7 +92,11 @@ impl AcpConfigDiscovery {
 
             let adapter = AcpAdapter::new(id.as_str(), command)
                 .with_mcp_servers(self.mcp_servers.clone())
-                .with_launch_prefix(self.launch_prefix.clone());
+                .with_kept_env(self.kept_env.clone());
+            let adapter = match &self.launcher {
+                Some(launcher) => adapter.with_launcher(Arc::clone(launcher)),
+                None => adapter,
+            };
 
             if self.require_launchable && !adapter.is_launchable() {
                 tracing::info!(
