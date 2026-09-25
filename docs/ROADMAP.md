@@ -2,19 +2,19 @@
 
 ## Where things stand
 
-711 tests passing, clippy clean with warnings denied, checked on the MSRV
+732 tests passing, clippy clean with warnings denied, checked on the MSRV
 (Rust 1.88) with and without the `otel` feature.
 
 | Milestone | State |
 |---|---|
 | 1 — Foundation | **Done** |
-| 2 — ACP | **Done** — client, server, `session/load`, `session/cancel`, registry discovery |
+| 2 — ACP | **Done** — client, server with a workspace per session, `session/load`, `session/cancel`, registry discovery |
 | 3 — Router | **Done** |
 | 4 — Orchestration | **Done** — including worktree isolation |
 | 5 — Resilience | **Done** |
 | 6 — Memory | **Done** — ai-memory over its CLI or its MCP server, handoffs included |
 | 7 — MCP | **Done** — client, server, allowlist-enforcing proxy shared with agents |
-| 8 — A2A | **Done** — 1.0 dialect with 0.3 fallback, task lifecycle, SSE |
+| 8 — A2A | **Done** — 1.0 dialect with 0.3 fallback, task lifecycle persisted across restarts, SSE |
 | 9 — Skills | **Done** — content digests, Ed25519 signatures, git and HTTPS registries |
 | 10 — TUI | **Done** |
 | 11 — Optimization | **Done** — RTK verified and measured, benchmarks |
@@ -40,7 +40,7 @@
 | Structured logging and tracing | **Done** | spans per command, session, task, attempt |
 | OpenTelemetry export | **Done** | `otel` feature |
 | Safe parallel execution | **Done** | ownership ledger, worktree isolation |
-| Sandboxing | **Done** | agents confined by ai-jail when present |
+| Sandboxing | **Done** | agents confined by ai-jail, bubblewrap, `sandbox-exec` or firejail |
 | RTK integration | **Done** | verified with `rtk gain`; measured savings reported |
 | CUMA as an ACP / A2A / MCP agent | **Done** | `cuma serve --protocol acp \| a2a \| mcp` |
 | Provider adapters | **Done** | `cuma-providers` |
@@ -70,12 +70,12 @@ if a plan or a repository ever grew large enough to matter.
 
 | Gap | Consequence |
 |---|---|
-| **Per-session workspaces in CUMA-as-ACP** | The `cwd` an editor sends is recorded and persisted, but the orchestrator works in the workspace it was started in. Serve from the project directory. |
 | **Client MCP servers in CUMA-as-ACP** | An editor's `mcp_servers` in `session/new` are not forwarded to the agents CUMA delegates to; only `[mcp.*]` servers marked `share_with_agents` are. |
-| **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. The task store is in memory, so a restart forgets tasks. CUMA never pauses for input, so multi-turn tasks are refused. |
+| **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. CUMA never pauses for input, so multi-turn tasks are refused. A task interrupted by a restart is reported failed, not resumed. |
 | **A2A authentication** | Outbound bearer tokens from a secret handle; no OAuth flows. The server does not authenticate callers — bind it to localhost or put it behind a proxy that does. |
 | **Binary agents from the ACP registry** | `cuma agents add` configures npx and uvx agents; binary distributions are described (URL, SHA-256) for a person to install. |
-| **Confining agents without ai-jail** | bubblewrap, firejail and `sandbox-exec` cannot confine an agent that needs its model API and its own credentials, so with only those installed agents run unconfined — and `cuma doctor` says so. |
+| **Network filtering without ai-jail** | bubblewrap, `sandbox-exec` and firejail confine the filesystem and environment but cannot filter by host; a `network_allowlist` is reported as not enforced. With no runtime installed at all, agents run unconfined unless `require_agent_sandbox` is set. |
+| **macOS confinement, exercised** | The `sandbox-exec` profile is unit-tested; the Linux runtimes were checked with a probe agent, macOS was not. |
 | **MCP connection reuse** | Each tool call launches the server, calls, and shuts it down. Correct and leak-free, slow for chatty tools; the ai-memory MCP backend pays this per recall. |
 | **Write prediction** | Grounded in a file index and dependency outputs, but still read from a task's description. A task naming no path claims the whole workspace, which is safe and serializing. |
 | **Skill revocation and pinning** | A trusted key cannot be revoked short of removing it from configuration, and git registries are not pinned to a commit in `installed.json`. |
@@ -84,8 +84,8 @@ if a plan or a repository ever grew large enough to matter.
 
 ## Later
 
-- Per-session workspaces, and forwarding an editor's MCP servers
-- A persistent A2A task store; push notifications
+- Forwarding an editor's MCP servers to the agents behind CUMA-as-ACP
+- A2A push notifications
 - Pooled MCP connections
 - Commit-pinned skill installs and a key revocation list
 - A web interface, as another event-bus subscriber

@@ -21,3 +21,4 @@ decision without a stated cost is a decision that has not been thought through.
 | [014](ADR-014-worktree-isolation.md) | Worktree isolation applies work back uncommitted | Accepted |
 | [015](ADR-015-a2a-dialects.md) | Speak A2A 1.0, fall back to 0.3, and run tasks as sessions | Accepted |
 | [016](ADR-016-mcp-sharing.md) | Agents reach shared MCP servers through CUMA's proxy | Accepted |
+| [017](ADR-017-workspaces-restarts-confinement.md) | Serve each directory, remember A2A tasks, confine agents everywhere | Accepted |

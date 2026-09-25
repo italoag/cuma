@@ -87,8 +87,11 @@ sandbox = true
 allow_destructive_operations = false
 checkpoint_before_write = true
 command_allowlist = []
-network_allowlist = []             # under ai-jail: hosts agents may reach; empty = open
-agent_env = []                     # variables forwarded into a sandboxed agent
+network_allowlist = []             # hosts agents may reach (enforced by ai-jail only); empty = open
+agent_env = []                     # variables a sandboxed agent keeps beyond the baseline
+agent_writable_paths = []          # places a sandboxed agent may also write; ~ expanded
+require_agent_sandbox = false      # refuse local agents that cannot be fully confined
+trusted_workspaces = []            # ACP session dirs whose own .cuma/config.toml applies; ~ expanded
 
 [limits]
 max_parallel_tasks = 4

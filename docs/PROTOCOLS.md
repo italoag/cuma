@@ -35,8 +35,9 @@ cached in `.cuma/cache/` and the cached copy used, marked stale, offline.
 
 **Lifecycle.** A process per execution: spawn → `initialize` → `session/new`
 (with any shared MCP servers) → `session/prompt` → shut down. See ADR-009 for
-why it is not reused. Under ai-jail the agent is launched inside the sandbox;
-see [SECURITY.md](SECURITY.md).
+why it is not reused. The agent is launched inside a sandbox — ai-jail,
+bubblewrap, `sandbox-exec` or firejail — confined to the directory it works in;
+see [SECURITY.md](SECURITY.md#agents-themselves).
 
 **Capabilities.** ACP negotiates *protocol* features, not what an agent is good
 at. The mapping is therefore partly read and partly assumed: `prompt.image`
@@ -149,11 +150,26 @@ cuma serve --protocol mcp                      # stdio; any MCP host calls CUMA 
 | MCP | `cuma_run`, `cuma_explain`, `cuma_agents` | — |
 
 Concurrent ACP sessions and A2A tasks each run as their own orchestrator
-session and see only their own events. ACP sessions are stored in
-`.cuma/acp-sessions/`, so an editor can `session/load` one after CUMA restarts;
-`load_session` is advertised only when that store exists. The A2A server does
-not authenticate callers: keep the default loopback bind, or put it behind a
-proxy that authenticates.
+session and see only their own events.
+
+**ACP sessions work where the editor says.** The `cwd` of `session/new` (and
+`session/load`) must be an absolute, existing directory, and each directory
+gets its own orchestrator — agents, ownership ledger, checkpoints, skills,
+memory and runtime database all rooted there — built the first time it is
+used and shared by every session in it. That directory's `.cuma/config.toml`
+applies if it is trusted (see [SECURITY.md](SECURITY.md)); otherwise CUMA's
+own configuration is used. Idle orchestrators beyond eight directories are
+dropped and rebuilt on demand. Sessions themselves are stored in
+`.cuma/acp-sessions/` of the directory CUMA was started in, so an editor can
+`session/load` one after a restart; `load_session` is advertised only when
+that store exists.
+
+**A2A tasks outlive a restart.** They are kept in the runtime database as their
+own A2A JSON. After a restart a finished task reads exactly as before; one that
+was running is reported `TASK_STATE_FAILED`, with the reason, rather than run
+again — part of it may already have happened. The A2A server does not
+authenticate callers: keep the default loopback bind, or put it behind a proxy
+that authenticates.
 
 Both under-claim deliberately — an unimplemented capability is advertised
 `false` rather than claimed, because an editor that relies on a capability CUMA

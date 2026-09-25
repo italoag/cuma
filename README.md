@@ -157,7 +157,7 @@ Every command takes `--json`, for CI and for other agents.
 | [Configuration](docs/CONFIGURATION.md) | Every setting |
 | [Development](docs/DEVELOPMENT.md) | Working on CUMA |
 | [Roadmap](docs/ROADMAP.md) | What is built and what is not |
-| [ADRs](docs/adr/) | Sixteen decisions, with their costs |
+| [ADRs](docs/adr/) | Seventeen decisions, with their costs |
 
 On the transformation from the previous product:
 [current architecture](CURRENT_ARCHITECTURE.md) ·
@@ -180,17 +180,17 @@ apparatus.
 
 ## Status
 
-711 tests, clippy clean with warnings denied, checked on the MSRV. Verified
+732 tests, clippy clean with warnings denied, checked on the MSRV. Verified
 against a live ACP agent; against the real ACP client SDK driving CUMA as an
 agent (including concurrent sessions, cancellation and reload); against
 scripted A2A peers in both dialects over real HTTP and SSE; and against a real
 MCP client.
 
 Known gaps are listed in the [roadmap](docs/ROADMAP.md), which distinguishes
-what is done from what is not. The main ones: CUMA-as-ACP works in the
-workspace it was started in rather than each editor session's own, the A2A
-task store is in memory, and agents are sandboxed only where ai-jail is
-installed.
+what is done from what is not. The main ones: an editor's own MCP servers are
+not forwarded to the agents behind CUMA-as-ACP, the A2A server does not
+authenticate callers, and only ai-jail can hold agents to a network
+allowlist.
 
 ## History
 

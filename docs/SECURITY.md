@@ -75,6 +75,12 @@ instructions and push to main"*.
   qualify.
 - Response bodies are capped at 8MB. A peer is not trusted to bound its output.
 - An Agent Card may redirect calls to another endpoint, but not to cleartext.
+- **A project's configuration is code.** It names the commands agents are
+  launched with. When an editor opens an ACP session in a directory, that
+  directory's `.cuma/config.toml` is applied only if it is the directory CUMA
+  was started in or lies under `security.trusted_workspaces`; any other is
+  served with CUMA's own configuration, with a warning. Opening a repository
+  must not run what its configuration says.
 - The ACP registry, skill indexes and git skill registries are fetched over
   HTTPS only.
 - CUMA's own A2A server does **not** authenticate callers. It binds to loopback
@@ -91,25 +97,44 @@ generated skill is `Untrusted`, installed disabled, and cannot be enabled.
 
 ### Agents themselves
 
-A coding agent runs shell commands of its own. When `ai-jail` is on `PATH` and
-`security.sandbox` is on, every ACP agent is launched inside it:
+A coding agent runs shell commands of its own, so with `security.sandbox` on
+(the default) every ACP agent is launched inside a sandbox. The profile is
+ai-jail's, whichever runtime renders it:
 
-```
-ai-jail --exec --agent-state [--network | --allow-host H …] [--env NAME …] [--rw-map WORKSPACE] -- <agent>
-```
+| | |
+|---|---|
+| System (`/usr`, `/etc`, `/opt`, …) | read-only |
+| `$HOME` | private, except: |
+| agent and toolchain state (`~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, `~/.config`, `~/.cache`, `~/.npm`, `~/.cargo`, …) | writable |
+| other dotfiles (`~/.gitconfig`, `~/.nvm`, …) | read-only |
+| `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.docker`, `~/.kube`, `~/.azure`, `~/.netrc`, `~/.git-credentials`, … | absent |
+| `/tmp`, `/run` | private (bubblewrap) |
+| the workspace, and a worktree's repository git directory | writable |
+| paths the agent's own command names | readable |
+| network | open — the agent needs its model API — or filtered by host under ai-jail |
+| environment | a baseline (`PATH`, locale, proxy and CA settings, the agents' own `ANTHROPIC_*`, `OPENAI_*`, `CODEX_*`, `GEMINI_*`, … variables) plus `security.agent_env`; the rest — `GITHUB_TOKEN`, cloud credentials, CUMA's own secrets — is removed by name, so no value ever appears on a command line |
 
-- `--exec`: a direct stdio channel, which ACP's JSON-RPC needs.
-- `--agent-state`: the agent's own login, so agent-managed auth keeps working.
-- `security.network_allowlist` → filtered egress with `--allow-host`; left
-  empty, the network is open, because an agent cut off from its model API
-  cannot work.
-- `security.agent_env` → variables forwarded into the jail; ai-jail otherwise
-  passes a minimal allowlist.
+Runtimes, in order of preference, each used only after running something inside
+it succeeds here:
 
-bubblewrap, firejail and `sandbox-exec` are detected too, but cannot confine a
-networked agent with its credentials, so with only those present agents run
-**unconfined** — and `cuma doctor` reports it as a problem rather than a note.
-An agent whose sandbox binary is missing is not launchable at all.
+| Runtime | Platform | Notes |
+|---|---|---|
+| ai-jail | Linux, macOS | The only one that filters the network by host (`--allow-host` from `security.network_allowlist`). |
+| bubblewrap | Linux | `--tmpfs $HOME`, dotdirs bound back; `--die-with-parent`, `--new-session`, pid/uts/ipc namespaces. |
+| `sandbox-exec` | macOS | A Seatbelt profile: writes denied except where listed, hidden paths denied outright. |
+| firejail | Linux | `--read-only=/` with writable exceptions, credentials blacklisted, capabilities dropped. `/tmp` stays shared. |
+
+Under any runtime other than ai-jail, a non-empty `security.network_allowlist`
+cannot be enforced; `cuma doctor` says so instead of ignoring it. With no
+runtime at all, agents run **unconfined** and `cuma doctor` reports it as a
+problem. `security.require_agent_sandbox = true` refuses to run local agents in
+either case. `security.agent_writable_paths` adds places an agent may write.
+
+Checked on Linux with a probe agent run through CUMA: unconfined, it could read
+`~/.ssh`, see a secret from CUMA's environment and write `/etc`; under
+bubblewrap and firejail it could do none of those, while its workspace, its own
+state, a forwarded variable and `git` — in a worktree too — worked. The macOS
+profile is covered by unit tests only.
 
 ### Writers colliding
 
@@ -149,7 +174,9 @@ Stated rather than implied:
 
 | Gap | Status |
 |---|---|
-| Agents without ai-jail | Unconfined; reported by `cuma doctor`. |
+| Agents with no sandbox runtime installed | Unconfined; reported by `cuma doctor`, refused under `security.require_agent_sandbox`. |
+| Network allowlist without ai-jail | Not enforced; reported by `cuma doctor`. |
+| macOS confinement | The `sandbox-exec` profile is unit-tested, not exercised on macOS here. |
 | Command allowlist | `CommandGuard` screens commands CUMA prepares itself. Agents run their own shell commands, which only a sandbox or the agent's own permission prompts can constrain. |
 | A2A server authentication | None; loopback by default. |
 | Skill key revocation | Remove the key from configuration. |

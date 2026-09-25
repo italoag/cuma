@@ -204,7 +204,8 @@ tree. A checkpoint that reverted the tree would change the task the agent was
 given.
 
 Agents run their own shell commands, so what confines them is the sandbox
-they are launched in (ai-jail, when present — see [SECURITY.md](SECURITY.md))
+they are launched in (ai-jail, bubblewrap, `sandbox-exec` or firejail — see
+[SECURITY.md](SECURITY.md#agents-themselves))
 and RTK hooks installed into the agents themselves (`rtk init`). Commands CUMA
 prepares itself go through one pipeline:
 

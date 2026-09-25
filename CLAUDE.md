@@ -28,7 +28,7 @@ ACP, A2A and MCP.
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 711 tests
+cargo test --workspace              # 732 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 
@@ -90,6 +90,15 @@ whatever it claims and whatever policy is set.
 **Dependency independence is not workspace independence.** Two tasks with no
 edge between them can both write the same file. `OwnershipLedger` gates the
 ready set; prediction is pessimistic on purpose.
+
+**A project's configuration is code.** It names agent commands. When serving
+ACP, a session directory's `.cuma/config.toml` applies only if it is trusted
+(the start directory, or under `security.trusted_workspaces`).
+
+**Agents run sandboxed.** ai-jail, else bubblewrap, `sandbox-exec` or firejail,
+all rendering one profile (`cuma-workspace::confine`). A runtime is used only
+after running something inside it succeeds. Environment variables are removed
+by name — never put a value on a command line.
 
 **Advertise only what is implemented.** When CUMA serves ACP or A2A, an
 unimplemented capability is reported `false` rather than claimed.
@@ -198,6 +207,6 @@ and what was done about it.
 
 `docs/ARCHITECTURE.md`, `PROTOCOLS.md`, `ROUTING.md`, `ORCHESTRATION.md`,
 `MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `OBSERVABILITY.md`, `CONFIGURATION.md`,
-`DEVELOPMENT.md`, `ROADMAP.md`, and sixteen ADRs in `docs/adr/`.
+`DEVELOPMENT.md`, `ROADMAP.md`, and seventeen ADRs in `docs/adr/`.
 
 `ROADMAP.md` distinguishes what is built from what is not. Keep it honest.

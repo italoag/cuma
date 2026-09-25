@@ -35,7 +35,7 @@ nothing locked or running.
 ## Consequences
 
 - A peer on either dialect works; a version bump costs one extra round trip.
-- The task store is in memory and bounded. A restart forgets tasks; the
-  roadmap records it.
+- The task store is bounded. It was in memory, so a restart forgot tasks;
+  since [ADR-017](ADR-017-workspaces-restarts-confinement.md) it is persisted.
 - Push notifications and the extended card are refused with their own error
   codes and advertised `false`.

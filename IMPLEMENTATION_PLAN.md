@@ -4,13 +4,13 @@ What is built, how it is verified, and what comes next.
 
 ## Current state
 
-711 tests passing across 20 crates. Clippy clean with warnings denied;
+732 tests passing across 20 crates. Clippy clean with warnings denied;
 checked on the MSRV (1.88) with and without the `otel` feature. Verified
 against a live ACP agent.
 
 ```
 $ cargo test --workspace
-PASSING: 711 | FAILING: 0
+PASSING: 732 | FAILING: 0
 ```
 
 ## Verification, by concern
@@ -46,6 +46,12 @@ Each row is a claim the architecture makes and the test that holds it to it.
 | Isolated work lands uncommitted, and work that no longer applies is kept | `worktree_isolation::…`, `git::changes_that_no_longer_apply_are_refused_and_nothing_lands` |
 | An MCP allowlist holds through the proxy | `tool_server::a_refused_tool_is_a_protocol_error`, plus the proxy smoke test below |
 | A tool called `rtk` that is not RTK is never used | `rtk::a_different_tool_called_rtk_is_not_used` |
+| Each ACP session works in the directory its client named | `acp_round_trip::each_session_works_in_the_directory_its_client_named` |
+| An untrusted project's configuration is never applied | `harness::an_untrusted_workspace_is_served_with_cumas_own_configuration` |
+| A2A tasks outlive a restart, and an interrupted one is reported, not re-run | `a2a_lifecycle::tasks_outlive_a_restart_and_an_interrupted_one_is_reported_not_rerun` |
+| Credentials in `$HOME` are never mounted for an agent | `confine::credentials_in_home_are_never_bound_and_agent_state_is_writable` |
+| Environment is reduced by name; values never reach a command line | `confine::only_the_baseline_and_named_variables_are_kept` |
+| A worktree's repository stays writable to git inside the sandbox | `confine::a_worktree_gets_its_repository_git_directory_writable` |
 
 ### The two "done" scenarios
 
