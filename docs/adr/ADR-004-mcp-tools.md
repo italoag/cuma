@@ -25,9 +25,15 @@ SDK.
 
 ## Two decisions worth naming
 
-**Connections are per-operation, not pooled.** A pool of child processes
-outliving the tasks that needed them is a leak waiting to happen. Tool
-*enumeration* is cached instead, which is where the repeated cost actually was.
+**Connections are kept, and bounded in time.** *Originally per-operation*, on
+the grounds that a pool of child processes outliving the tasks that needed
+them is a leak waiting to happen. In practice the repeated cost was the calls,
+not enumeration: the proxy agents talk to, and memory recall over MCP, paid a
+launch and a handshake per call (ten calls: 282 ms and ten processes). Now one
+connection per server is shared by concurrent calls; a server that exited is
+replaced on next use, a failed call is never repeated, and a connection idle
+for five minutes is shut down by a reaper that ends with the provider — which
+answers the leak concern directly (ten calls: 40 ms, one process).
 
 **Tool results are bounded and untrusted.** Output goes straight into an agent's
 context, so it is truncated at 32,000 characters with a visible marker — a

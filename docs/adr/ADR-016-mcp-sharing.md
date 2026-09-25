@@ -30,8 +30,8 @@ which exposes `cuma_run`, `cuma_explain` and `cuma_agents` to any MCP host.
 
 - An allowlist holds whoever the client is.
 - No secret appears in an ACP message.
-- Each tool call through the proxy launches the real server; connection reuse
-  is future work.
+- The proxy keeps its connection to the real server for as long as the
+  agent's session lasts (idle ones close after five minutes; see ADR-004).
 - Exposing `cuma_run` to an agent CUMA itself routes to would let the two
   delegate to each other until the budget stopped them, so CUMA's own MCP
   server is never shared automatically.

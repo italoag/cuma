@@ -92,6 +92,7 @@ agent_env = []                     # variables a sandboxed agent keeps beyond th
 agent_writable_paths = []          # places a sandboxed agent may also write; ~ expanded
 require_agent_sandbox = false      # refuse local agents that cannot be fully confined
 trusted_workspaces = []            # ACP session dirs whose own .cuma/config.toml applies; ~ expanded
+a2a_server_token_refs = []         # env vars holding bearer tokens A2A callers must present
 
 [limits]
 max_parallel_tasks = 4

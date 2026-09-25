@@ -7,7 +7,7 @@ Three protocols, three layers. They are not alternatives to each other.
 | Talks to | Local coding agents | Peer agents, often remote | Tools and resources |
 | Transport | stdio, JSON-RPC | HTTPS, JSON-RPC | stdio, JSON-RPC |
 | Discovery | Configured command, or the ACP registry | Agent Card | Configured command |
-| Authentication | **The agent's own** | Bearer token by handle | Environment by handle |
+| Authentication | **The agent's own** | Bearer token by handle, both directions | Environment by handle |
 | Implementation | Official Rust SDK | Native (see ADR-003) | Official `rmcp` SDK |
 
 ## ACP
@@ -167,9 +167,18 @@ that store exists.
 **A2A tasks outlive a restart.** They are kept in the runtime database as their
 own A2A JSON. After a restart a finished task reads exactly as before; one that
 was running is reported `TASK_STATE_FAILED`, with the reason, rather than run
-again — part of it may already have happened. The A2A server does not
-authenticate callers: keep the default loopback bind, or put it behind a proxy
-that authenticates.
+again — part of it may already have happened.
+
+**A2A callers can be required to authenticate.** With
+`security.a2a_server_token_refs` set — names of environment variables holding
+the tokens, several allowed for rotation — every call needs
+`Authorization: Bearer <token>`; anything else gets HTTP 401 with
+`WWW-Authenticate: Bearer`. The Agent Card stays public and declares the
+scheme in A2A 1.0 form (`securitySchemes`, `securityRequirements`). Without
+tokens, CUMA serves A2A only on a loopback address, unless
+`--allow-unauthenticated` says a proxy in front authenticates. Another CUMA
+reaches an authenticated one with `auth_secret_ref` naming the token's
+variable.
 
 Both under-claim deliberately — an unimplemented capability is advertised
 `false` rather than claimed, because an editor that relies on a capability CUMA

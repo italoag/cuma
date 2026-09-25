@@ -4,13 +4,13 @@ What is built, how it is verified, and what comes next.
 
 ## Current state
 
-732 tests passing across 20 crates. Clippy clean with warnings denied;
+746 tests passing across 20 crates. Clippy clean with warnings denied;
 checked on the MSRV (1.88) with and without the `otel` feature. Verified
 against a live ACP agent.
 
 ```
 $ cargo test --workspace
-PASSING: 732 | FAILING: 0
+PASSING: 746 | FAILING: 0
 ```
 
 ## Verification, by concern
@@ -52,6 +52,9 @@ Each row is a claim the architecture makes and the test that holds it to it.
 | Credentials in `$HOME` are never mounted for an agent | `confine::credentials_in_home_are_never_bound_and_agent_state_is_writable` |
 | Environment is reduced by name; values never reach a command line | `confine::only_the_baseline_and_named_variables_are_kept` |
 | A worktree's repository stays writable to git inside the sandbox | `confine::a_worktree_gets_its_repository_git_directory_writable` |
+| New, untracked work is checkpointed, and CUMA's own state is not | `git::new_files_nobody_has_added_yet_are_checkpointed_too`, `cumas_own_state_is_never_checkpointed` |
+| An authenticated A2A server refuses callers without its token | `a2a_lifecycle::an_authenticated_server_refuses_callers_without_its_token` |
+| One MCP server process answers every call; a dead one is replaced, its call not repeated | `provider::one_server_process_answers_every_call`, `a_server_that_died_is_replaced_and_the_failed_call_is_not_repeated` |
 
 ### The two "done" scenarios
 

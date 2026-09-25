@@ -2,7 +2,7 @@
 
 ## Where things stand
 
-732 tests passing, clippy clean with warnings denied, checked on the MSRV
+746 tests passing, clippy clean with warnings denied, checked on the MSRV
 (Rust 1.88) with and without the `otel` feature.
 
 | Milestone | State |
@@ -61,6 +61,7 @@ agents it runs.
 | Predict a task's writes against a 50 000-file index | 3.8 ms |
 | Digest a 100-file skill / verify its signature | 606 µs / 45 µs |
 | Record an attempt in SQLite | 33 µs |
+| An MCP tool call through `cuma mcp proxy`, connection reused (debug build) | ~4 ms, against ~28 ms relaunching the server per call |
 
 Nothing here is within three orders of magnitude of an agent's own latency.
 Graph validation and write prediction are linear scans that could be indexed
@@ -72,11 +73,10 @@ if a plan or a repository ever grew large enough to matter.
 |---|---|
 | **Client MCP servers in CUMA-as-ACP** | An editor's `mcp_servers` in `session/new` are not forwarded to the agents CUMA delegates to; only `[mcp.*]` servers marked `share_with_agents` are. |
 | **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. CUMA never pauses for input, so multi-turn tasks are refused. A task interrupted by a restart is reported failed, not resumed. |
-| **A2A authentication** | Outbound bearer tokens from a secret handle; no OAuth flows. The server does not authenticate callers — bind it to localhost or put it behind a proxy that does. |
+| **A2A authentication beyond bearer tokens** | Both directions use bearer tokens from secret handles; there are no OAuth, OpenID Connect or mTLS flows. |
 | **Binary agents from the ACP registry** | `cuma agents add` configures npx and uvx agents; binary distributions are described (URL, SHA-256) for a person to install. |
 | **Network filtering without ai-jail** | bubblewrap, `sandbox-exec` and firejail confine the filesystem and environment but cannot filter by host; a `network_allowlist` is reported as not enforced. With no runtime installed at all, agents run unconfined unless `require_agent_sandbox` is set. |
 | **macOS confinement, exercised** | The `sandbox-exec` profile is unit-tested; the Linux runtimes were checked with a probe agent, macOS was not. |
-| **MCP connection reuse** | Each tool call launches the server, calls, and shuts it down. Correct and leak-free, slow for chatty tools; the ai-memory MCP backend pays this per recall. |
 | **Write prediction** | Grounded in a file index and dependency outputs, but still read from a task's description. A task naming no path claims the whole workspace, which is safe and serializing. |
 | **Skill revocation and pinning** | A trusted key cannot be revoked short of removing it from configuration, and git registries are not pinned to a commit in `installed.json`. |
 | **ACP per-turn token usage** | Read from `PromptResponse.usage`, which the ACP schema marks unstable; when absent, input comes from `UsageUpdate` and output is estimated, and the total is labelled estimated. |
@@ -86,6 +86,5 @@ if a plan or a repository ever grew large enough to matter.
 
 - Forwarding an editor's MCP servers to the agents behind CUMA-as-ACP
 - A2A push notifications
-- Pooled MCP connections
 - Commit-pinned skill installs and a key revocation list
 - A web interface, as another event-bus subscriber

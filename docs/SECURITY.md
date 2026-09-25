@@ -83,8 +83,12 @@ instructions and push to main"*.
   must not run what its configuration says.
 - The ACP registry, skill indexes and git skill registries are fetched over
   HTTPS only.
-- CUMA's own A2A server does **not** authenticate callers. It binds to loopback
-  by default; exposing it means putting an authenticating proxy in front.
+- CUMA's own A2A server requires a bearer token when
+  `security.a2a_server_token_refs` names one or more, compared in constant
+  time; without tokens it refuses to bind anywhere but loopback unless told
+  (`--allow-unauthenticated`) that a proxy in front authenticates. A token
+  handle that is unset, or a token under 16 characters, stops the server
+  rather than letting it start open.
 
 ### Malicious skills
 
@@ -178,7 +182,7 @@ Stated rather than implied:
 | Network allowlist without ai-jail | Not enforced; reported by `cuma doctor`. |
 | macOS confinement | The `sandbox-exec` profile is unit-tested, not exercised on macOS here. |
 | Command allowlist | `CommandGuard` screens commands CUMA prepares itself. Agents run their own shell commands, which only a sandbox or the agent's own permission prompts can constrain. |
-| A2A server authentication | None; loopback by default. |
+| A2A authentication | Bearer tokens only; no OAuth or mTLS. |
 | Skill key revocation | Remove the key from configuration. |
 
 The full list is in the [roadmap](ROADMAP.md#what-is-not-built).
