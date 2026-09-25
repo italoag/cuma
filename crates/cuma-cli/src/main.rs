@@ -76,6 +76,11 @@ enum Command {
         /// Address to bind, for `--protocol a2a`.
         #[arg(long, default_value = "127.0.0.1:8420")]
         bind: String,
+
+        /// Serve A2A on a non-loopback address without authentication — only
+        /// behind a proxy that authenticates callers itself.
+        #[arg(long)]
+        allow_unauthenticated: bool,
     },
 
     /// Inspect and manage agents.
@@ -201,8 +206,20 @@ async fn run() -> Result<()> {
                 commands::run_goal(config, workspace, &goal, true, cli.json).await
             }
             Some(Command::Chat) | None => commands::chat(config, workspace).await,
-            Some(Command::Serve { protocol, bind }) => {
-                commands::serve(config, workspace, &protocol, &bind, &overrides).await
+            Some(Command::Serve {
+                protocol,
+                bind,
+                allow_unauthenticated,
+            }) => {
+                commands::serve(
+                    config,
+                    workspace,
+                    &protocol,
+                    &bind,
+                    allow_unauthenticated,
+                    &overrides,
+                )
+                .await
             }
             Some(Command::Agents { action }) => {
                 commands::agents(config, workspace, action, cli.json).await

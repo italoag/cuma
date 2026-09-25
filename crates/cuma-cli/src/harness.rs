@@ -312,6 +312,56 @@ pub fn shared_mcp_servers(
         .collect()
 }
 
+/// The shortest bearer token the A2A server accepts.
+const MIN_TOKEN_LEN: usize = 16;
+
+/// Resolve the A2A server's bearer tokens from their handles.
+///
+/// A handle that resolves to nothing, or to something short enough to guess,
+/// stops the server: starting open because a variable was unset is exactly
+/// the failure authentication exists to prevent.
+pub async fn a2a_server_tokens(config: &Config) -> Result<Vec<String>> {
+    let secrets = cuma_providers::EnvSecretStore::new();
+    let mut tokens = Vec::new();
+    for handle in &config.security.a2a_server_token_refs {
+        let token = cuma_core::ports::SecretStore::get(&secrets, handle)
+            .await?
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                MetaAgentError::Configuration(format!(
+                    "security.a2a_server_token_refs names {handle}, which is not set; \
+                     refusing to serve A2A without the authentication it asks for"
+                ))
+            })?;
+        if token.chars().count() < MIN_TOKEN_LEN {
+            return Err(MetaAgentError::Configuration(format!(
+                "the token in {handle} is shorter than {MIN_TOKEN_LEN} characters; \
+                 generate one with e.g. `openssl rand -hex 32`"
+            )));
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+/// Refuse to serve A2A beyond this machine without authentication, unless
+/// the operator said a proxy in front takes care of it.
+pub fn check_a2a_exposure(
+    address: std::net::SocketAddr,
+    authenticated: bool,
+    allow_unauthenticated: bool,
+) -> Result<()> {
+    if authenticated || allow_unauthenticated || address.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(MetaAgentError::Configuration(format!(
+        "refusing to serve A2A on {address} without authentication: anyone who can reach it \
+         could run goals on this machine. Set security.a2a_server_token_refs, bind to \
+         127.0.0.1, or pass --allow-unauthenticated if a proxy in front authenticates callers."
+    )))
+}
+
 /// Why no agent is available, in words that point at the actual cause.
 ///
 /// "Configure an agent" is wrong advice when agents are configured and were
@@ -559,6 +609,39 @@ pub async fn build_orchestrator(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn a2a_is_served_openly_only_on_loopback_or_when_explicitly_allowed() {
+        let local: std::net::SocketAddr = "127.0.0.1:8420".parse().unwrap();
+        let local6: std::net::SocketAddr = "[::1]:8420".parse().unwrap();
+        let exposed: std::net::SocketAddr = "0.0.0.0:8420".parse().unwrap();
+
+        assert!(check_a2a_exposure(local, false, false).is_ok());
+        assert!(check_a2a_exposure(local6, false, false).is_ok());
+        let refused = check_a2a_exposure(exposed, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("a2a_server_token_refs"), "{refused}");
+        assert!(check_a2a_exposure(exposed, true, false).is_ok());
+        assert!(check_a2a_exposure(exposed, false, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_token_handle_that_is_unset_or_weak_stops_the_server() {
+        let mut config = Config::default();
+        config.security.a2a_server_token_refs = vec!["CUMA_TEST_SURELY_UNSET_7c1d".into()];
+        let err = a2a_server_tokens(&config).await.unwrap_err().to_string();
+        assert!(err.contains("not set"), "{err}");
+
+        // Cargo sets these for every test binary: one short enough to be
+        // refused, one long enough to pass.
+        config.security.a2a_server_token_refs = vec!["CARGO_PKG_VERSION_MAJOR".into()];
+        let err = a2a_server_tokens(&config).await.unwrap_err().to_string();
+        assert!(err.contains("shorter"), "{err}");
+
+        config.security.a2a_server_token_refs = vec!["CARGO_MANIFEST_DIR".into()];
+        assert_eq!(a2a_server_tokens(&config).await.unwrap().len(), 1);
+    }
 
     #[test]
     fn refused_agents_are_explained_as_refused_not_as_missing() {

@@ -105,6 +105,13 @@ pub struct AgentCard {
     /// Default output MIME types.
     #[serde(default)]
     pub default_output_modes: Vec<String>,
+    /// How to authenticate, by scheme name — OpenAPI-style security schemes
+    /// in their ProtoJSON form, e.g. `{"httpAuthSecurityScheme": {"scheme": "Bearer"}}`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub security_schemes: serde_json::Map<String, serde_json::Value>,
+    /// Which schemes a caller must satisfy: `[{"schemes": {"<name>": {"list": []}}}]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_requirements: Vec<serde_json::Value>,
 
     /// 0.3: the primary endpoint.
     #[serde(default, skip_serializing)]

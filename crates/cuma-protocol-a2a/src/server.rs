@@ -330,6 +330,30 @@ pub struct A2aServer {
     card: AgentCard,
     tasks: Arc<Mutex<TaskMap>>,
     store: Option<Arc<dyn TaskStore>>,
+    /// Bearer tokens a caller may present. Empty: calls are not authenticated.
+    bearer_tokens: Vec<String>,
+}
+
+/// The name the bearer scheme is published under in the Agent Card.
+const BEARER_SCHEME: &str = "bearer";
+
+/// Whether `a` and `b` are equal, in time that depends only on their length.
+///
+/// A token compared with `==` returns at the first differing byte, which lets
+/// a caller find it a byte at a time by timing refusals.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+/// The token of an `Authorization: Bearer <token>` header. The scheme name is
+/// case-insensitive (RFC 7235).
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
 impl A2aServer {
@@ -341,7 +365,47 @@ impl A2aServer {
             card,
             tasks: Arc::new(Mutex::new(TaskMap::default())),
             store: None,
+            bearer_tokens: Vec::new(),
         }
+    }
+
+    /// Require callers to present one of `tokens` as a bearer token.
+    ///
+    /// Several are accepted so a token can be rotated without downtime. The
+    /// Agent Card declares the requirement, as A2A 1.0 describes, and stays
+    /// readable without credentials: it is how a caller learns what to send.
+    #[must_use]
+    pub fn with_bearer_tokens(mut self, tokens: Vec<String>) -> Self {
+        self.bearer_tokens = tokens.into_iter().filter(|t| !t.is_empty()).collect();
+        if self.bearer_tokens.is_empty() {
+            self.card.security_schemes.clear();
+            self.card.security_requirements.clear();
+        } else {
+            self.card.security_schemes.insert(
+                BEARER_SCHEME.to_owned(),
+                json!({ "httpAuthSecurityScheme": {
+                    "scheme": "Bearer",
+                    "description": "A token issued by whoever runs this CUMA."
+                } }),
+            );
+            self.card.security_requirements =
+                vec![json!({ "schemes": { BEARER_SCHEME: { "list": [] } } })];
+        }
+        self
+    }
+
+    /// Whether a call carrying `headers` may proceed.
+    pub fn is_authorized(&self, headers: &axum::http::HeaderMap) -> bool {
+        if self.bearer_tokens.is_empty() {
+            return true;
+        }
+        let Some(presented) = bearer_token(headers) else {
+            return false;
+        };
+        // Every token is compared, so timing does not reveal which matched.
+        self.bearer_tokens.iter().fold(false, |ok, token| {
+            ok | same_secret(presented.as_bytes(), token.as_bytes())
+        })
     }
 
     /// Keep tasks in `store`, and take back the tasks it already holds.
@@ -739,21 +803,36 @@ impl A2aServer {
             async move { Json(card) }
         });
 
-        let rpc = post(|State(server): State<Arc<Self>>, body: String| async move {
-            match server.handle(&body).await {
-                Reply::Json(value) => Json(value).into_response(),
-                Reply::Stream(stream) => {
-                    let events = futures::stream::unfold(stream, |mut stream| async move {
-                        let value = stream.next().await?;
-                        let event = Event::default().data(value.to_string());
-                        Some((Ok::<_, std::convert::Infallible>(event), stream))
-                    });
-                    Sse::new(events)
-                        .keep_alive(KeepAlive::default())
-                        .into_response()
+        let rpc = post(
+            |State(server): State<Arc<Self>>, headers: axum::http::HeaderMap, body: String| async move {
+                if !server.is_authorized(&headers) {
+                    // Missing and wrong credentials alike: 401, before the body
+                    // is even parsed.
+                    return (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        [(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            "Bearer realm=\"cuma\"",
+                        )],
+                        "a bearer token is required; see the Agent Card's securitySchemes\n",
+                    )
+                        .into_response();
                 }
-            }
-        });
+                match server.handle(&body).await {
+                    Reply::Json(value) => Json(value).into_response(),
+                    Reply::Stream(stream) => {
+                        let events = futures::stream::unfold(stream, |mut stream| async move {
+                            let value = stream.next().await?;
+                            let event = Event::default().data(value.to_string());
+                            Some((Ok::<_, std::convert::Infallible>(event), stream))
+                        });
+                        Sse::new(events)
+                            .keep_alive(KeepAlive::default())
+                            .into_response()
+                    }
+                }
+            },
+        );
 
         Router::new()
             .route(crate::card::AGENT_CARD_PATH, card_route)
@@ -894,6 +973,11 @@ pub async fn serve_with(
     if let Some(store) = store {
         server = server.with_store(store);
     }
+    serve_server(server, address).await
+}
+
+/// Serve an already-configured server on `address`.
+pub async fn serve_server(server: A2aServer, address: SocketAddr) -> Result<()> {
     let server = Arc::new(server);
     let app = server.router();
 

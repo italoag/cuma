@@ -169,6 +169,10 @@ impl Config {
             self.security.trusted_workspaces,
             other.security.trusted_workspaces
         );
+        merge_collection!(
+            self.security.a2a_server_token_refs,
+            other.security.a2a_server_token_refs
+        );
 
         // --- limits -------------------------------------------------------
         merge_field!(

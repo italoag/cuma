@@ -428,6 +428,7 @@ pub async fn serve(
     workspace: PathBuf,
     protocol: &str,
     bind: &str,
+    allow_unauthenticated: bool,
     overrides: &harness::CliOverrides,
 ) -> Result<()> {
     let database = harness::database_path(&config, &workspace);
@@ -491,13 +492,27 @@ pub async fn serve(
                     None
                 }
             };
-            cuma_protocol_a2a::serve_with(
-                orchestrator,
-                store,
-                address,
+            let tokens = harness::a2a_server_tokens(&config).await?;
+            harness::check_a2a_exposure(address, !tokens.is_empty(), allow_unauthenticated)?;
+            if tokens.is_empty() {
+                eprintln!("A2A callers are not authenticated");
+            } else {
+                eprintln!(
+                    "A2A callers must present one of {} bearer token(s)",
+                    tokens.len()
+                );
+            }
+
+            let mut server = cuma_protocol_a2a::A2aServer::new(
+                Arc::new(orchestrator),
                 &format!("http://{address}"),
             )
             .await
+            .with_bearer_tokens(tokens);
+            if let Some(store) = store {
+                server = server.with_store(store);
+            }
+            cuma_protocol_a2a::serve_server(server, address).await
         }
         "mcp" => {
             eprintln!(

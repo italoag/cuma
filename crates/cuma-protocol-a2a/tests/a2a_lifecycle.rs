@@ -679,3 +679,127 @@ async fn tasks_outlive_a_restart_and_an_interrupted_one_is_reported_not_rerun() 
         "a settled task cannot be cancelled"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/// A variable cargo always sets for a test binary, standing in for a token:
+/// the client resolves its handle from the environment, and tests may not
+/// modify the environment.
+const TOKEN_HANDLE: &str = "CARGO_MANIFEST_DIR";
+
+async fn serve_cuma_with_token(behaviour: Behaviour, token: &str) -> String {
+    let orchestrator = cuma_with(behaviour).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let server = Arc::new(
+        A2aServer::new(orchestrator, &base)
+            .await
+            .with_bearer_tokens(vec!["an-older-token-still-valid".into(), token.to_owned()]),
+    );
+    let router = server.router();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    base
+}
+
+#[tokio::test]
+async fn an_authenticated_server_refuses_callers_without_its_token() {
+    let token = std::env::var(TOKEN_HANDLE).unwrap();
+    let base = serve_cuma_with_token(Behaviour::ok("hello"), &token).await;
+    let http = reqwest::Client::new();
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": { "id": "x" } });
+
+    for header in [
+        None,
+        Some("Bearer wrong".to_owned()),
+        Some(format!("Basic {token}")),
+    ] {
+        let mut request = http.post(&base).json(&call);
+        if let Some(header) = &header {
+            request = request.header("authorization", header);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 401, "{header:?} must be refused");
+        assert_eq!(
+            response.headers()["www-authenticate"].to_str().unwrap(),
+            "Bearer realm=\"cuma\""
+        );
+    }
+
+    // Either configured token works, and the scheme name is case-insensitive.
+    for header in [
+        format!("Bearer {token}"),
+        format!("bearer {token}"),
+        "Bearer an-older-token-still-valid".to_owned(),
+    ] {
+        let response = http
+            .post(&base)
+            .header("authorization", &header)
+            .json(&call)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], -32001,
+            "authenticated, and the task is simply unknown"
+        );
+    }
+
+    // The card stays public and says what to send.
+    let card: Value = http
+        .get(format!("{base}.well-known/agent-card.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"],
+        "Bearer"
+    );
+    assert_eq!(
+        card["securityRequirements"][0]["schemes"]["bearer"]["list"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn cuma_reaches_an_authenticated_cuma_with_a_token_from_a_handle() {
+    let token = std::env::var(TOKEN_HANDLE).unwrap();
+    let base = serve_cuma_with_token(Behaviour::ok("authenticated hello"), &token).await;
+
+    let (updates, _rx) = mpsc::channel(64);
+    let with_token = A2aAdapter::new("remote", base.clone())
+        .unwrap()
+        .with_auth_handle(TOKEN_HANDLE);
+    let outcome = with_token.execute(request(10_000), updates).await.unwrap();
+    assert!(outcome.success, "{:?}", outcome.failure_reason);
+    assert!(outcome.output.contains("authenticated hello"));
+
+    let (updates, _rx) = mpsc::channel(64);
+    let without = A2aAdapter::new("remote", base).unwrap();
+    let refused = without.execute(request(10_000), updates).await;
+    let class = match refused {
+        Ok(outcome) => outcome.failure_class,
+        Err(err) => Some(err.class()),
+    };
+    assert_eq!(
+        class,
+        Some(ErrorClass::AuthenticationFailure),
+        "a refusal is an auth failure, not a retry"
+    );
+}
+
+#[test]
+fn an_unauthenticated_server_publishes_no_security_requirement() {
+    let card = cuma_protocol_a2a::AgentCard::new("cuma", "http://localhost/");
+    let json = serde_json::to_value(&card).unwrap();
+    assert!(json.get("securitySchemes").is_none());
+    assert!(json.get("securityRequirements").is_none());
+}

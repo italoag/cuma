@@ -495,6 +495,11 @@ pub struct SecurityConfig {
     /// is served with CUMA's own configuration unless listed here, so that
     /// opening a repository in an editor cannot run what its config says.
     pub trusted_workspaces: Vec<String>,
+    /// Handles of the bearer tokens callers of `cuma serve --protocol a2a`
+    /// must present — names of environment variables, never the tokens. Any
+    /// one is accepted, so a token can be rotated. Empty: no authentication,
+    /// which is only allowed on a loopback address.
+    pub a2a_server_token_refs: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -512,6 +517,7 @@ impl Default for SecurityConfig {
             agent_writable_paths: Vec::new(),
             require_agent_sandbox: false,
             trusted_workspaces: Vec::new(),
+            a2a_server_token_refs: Vec::new(),
         }
     }
 }
