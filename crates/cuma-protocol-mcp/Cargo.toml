@@ -21,6 +21,8 @@ shell-words.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+which.workspace = true
+futures.workspace = true
 
 
 [lints]

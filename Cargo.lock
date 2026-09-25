@@ -970,12 +970,14 @@ dependencies = [
  "async-trait",
  "cuma-config",
  "cuma-core",
+ "futures",
  "rmcp",
  "serde",
  "serde_json",
  "shell-words",
  "tokio",
  "tracing",
+ "which",
 ]
 
 [[package]]
