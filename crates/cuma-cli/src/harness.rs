@@ -67,8 +67,11 @@ pub fn apply_cli_overrides(
 ///
 /// `--json` switches to structured output, which is what CI and other agents
 /// want; a human at a terminal gets the readable formatter.
-pub fn init_tracing(config: &Config, verbosity: u8, json: bool) {
-    use tracing_subscriber::EnvFilter;
+pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, Registry};
 
     let level = match verbosity {
         0 => config.telemetry.log_level.clone(),
@@ -81,19 +84,111 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) {
 
     // Logs go to stderr so that `--json` output on stdout stays parseable when
     // both are enabled.
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-
-    let installed = if json || config.telemetry.json_logs {
-        builder.json().try_init().is_ok()
+    let fmt_layer = if json || config.telemetry.json_logs {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .boxed()
     } else {
-        builder.with_target(false).try_init().is_ok()
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .boxed()
     };
 
-    if !installed {
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
+    let mut layers: Vec<Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>> =
+        vec![filter.boxed(), fmt_layer];
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
+    let mut telemetry = Telemetry::default();
+    let mut deferred_warning = None;
+
+    if let Some(endpoint) = &config.telemetry.otlp_endpoint {
+        #[cfg(feature = "otel")]
+        match otel::layer(endpoint) {
+            Ok((layer, provider)) => {
+                layers.push(layer);
+                telemetry.provider = Some(provider);
+            }
+            Err(err) => deferred_warning = Some(format!("OTLP export is off: {err}")),
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            deferred_warning = Some(format!(
+                "telemetry.otlp_endpoint = {endpoint:?} is set, but this build has no OTLP \
+                 support; rebuild with `--features otel`"
+            ));
+        }
+    }
+
+    if tracing_subscriber::registry()
+        .with(layers)
+        .try_init()
+        .is_err()
+    {
         // A second init in the same process is not an error worth failing on.
         tracing::debug!("a tracing subscriber was already installed");
+    }
+    if let Some(warning) = deferred_warning {
+        tracing::warn!("{warning}");
+    }
+    telemetry
+}
+
+/// Keeps trace export alive for the process, and flushes it on the way out.
+#[derive(Default)]
+pub struct Telemetry {
+    #[cfg(feature = "otel")]
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl Drop for Telemetry {
+    fn drop(&mut self) {
+        #[cfg(feature = "otel")]
+        if let Some(provider) = self.provider.take() {
+            // Spans still batched would otherwise be lost with the process.
+            if let Err(err) = provider.shutdown() {
+                eprintln!("warning: could not flush traces: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+mod otel {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig as _;
+    use tracing_subscriber::{Layer as _, Registry};
+
+    /// A tracing layer exporting spans to an OTLP/HTTP collector.
+    pub(super) fn layer(
+        endpoint: &str,
+    ) -> Result<
+        (
+            Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>,
+            opentelemetry_sdk::trace::SdkTracerProvider,
+        ),
+        String,
+    > {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|err| err.to_string())?;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name("cuma")
+                    .build(),
+            )
+            .build();
+
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("cuma"))
+            .boxed();
+        Ok((layer, provider))
     }
 }
 

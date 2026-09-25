@@ -242,6 +242,7 @@ impl Orchestrator {
     /// *before* starting a run and keeps only events carrying its own id;
     /// choosing the id up front is what makes that filter possible without a
     /// race.
+    #[tracing::instrument(name = "session", skip_all, fields(session = %session_id))]
     pub async fn run_session(&self, session_id: SessionId, goal: &str) -> Result<SessionResult> {
         if let Some(recorder) = &self.recorder {
             recorder.session_started(&session_id, goal);
@@ -639,6 +640,7 @@ impl Orchestrator {
     ///
     /// Returns `Ok(true)` when the task completed, `Ok(false)` when it failed
     /// after exhausting its options.
+    #[tracing::instrument(name = "task", skip_all, fields(task = %task_id))]
     async fn execute_task(
         &self,
         session_id: &SessionId,
@@ -1221,6 +1223,11 @@ impl Orchestrator {
 
     /// Assemble context and hand the task to its adapter.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "attempt",
+        skip_all,
+        fields(task = %task.id, agent = %agent_id, model = model_id.map(tracing::field::display))
+    )]
     async fn invoke_adapter(
         &self,
         session_id: &SessionId,

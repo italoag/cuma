@@ -552,6 +552,10 @@ pub struct TelemetryConfig {
     pub json_logs: bool,
     /// Where to write the runtime database.
     pub database_path: Option<String>,
+    /// An OTLP/HTTP collector to export traces to, e.g.
+    /// `http://localhost:4318/v1/traces`. Needs a build with the `otel`
+    /// feature; without one, setting it produces a warning, not traces.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for TelemetryConfig {
@@ -560,6 +564,7 @@ impl Default for TelemetryConfig {
             log_level: "info".to_owned(),
             json_logs: false,
             database_path: None,
+            otlp_endpoint: None,
         }
     }
 }

@@ -170,37 +170,59 @@ async fn run() -> Result<()> {
         cli.max_cost,
     )?;
 
-    harness::init_tracing(&config, cli.verbose, cli.json);
+    // Held for the whole run: dropping it flushes exported traces.
+    let _telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
 
-    match cli.command {
-        Some(Command::Run { goal, dry_run }) => {
-            let goal = goal.join(" ");
-            commands::run_goal(config, workspace, &goal, dry_run, cli.json).await
-        }
-        Some(Command::Explain { goal }) => {
-            let goal = goal.join(" ");
-            commands::run_goal(config, workspace, &goal, true, cli.json).await
-        }
-        Some(Command::Chat) | None => commands::chat(config, workspace).await,
-        Some(Command::Serve { protocol, bind }) => {
-            commands::serve(config, workspace, &protocol, &bind).await
-        }
-        Some(Command::Agents { action }) => {
-            commands::agents(config, workspace, action, cli.json).await
-        }
-        Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
-        Some(Command::Skills { action }) => {
-            commands::skills(config, workspace, action, cli.json).await
-        }
-        Some(Command::Memory { action }) => {
-            commands::memory(config, workspace, action, cli.json).await
-        }
-        Some(Command::Mcp { action }) => commands::mcp(config, action, cli.json).await,
-        Some(Command::Usage { by_model }) => {
-            commands::usage(config, workspace, by_model, cli.json).await
-        }
-        Some(Command::Doctor) => {
-            commands::doctor(config, workspace, loaded.sources, cli.json).await
+    let command = match &cli.command {
+        None | Some(Command::Chat) => "chat",
+        Some(Command::Run { .. }) => "run",
+        Some(Command::Explain { .. }) => "explain",
+        Some(Command::Serve { .. }) => "serve",
+        Some(Command::Agents { .. }) => "agents",
+        Some(Command::Models { .. }) => "models",
+        Some(Command::Skills { .. }) => "skills",
+        Some(Command::Mcp { .. }) => "mcp",
+        Some(Command::Memory { .. }) => "memory",
+        Some(Command::Usage { .. }) => "usage",
+        Some(Command::Doctor) => "doctor",
+    };
+
+    // One root span per invocation, so every session, task and attempt it
+    // runs nests under the command that caused it.
+    use tracing::Instrument as _;
+    async move {
+        match cli.command {
+            Some(Command::Run { goal, dry_run }) => {
+                let goal = goal.join(" ");
+                commands::run_goal(config, workspace, &goal, dry_run, cli.json).await
+            }
+            Some(Command::Explain { goal }) => {
+                let goal = goal.join(" ");
+                commands::run_goal(config, workspace, &goal, true, cli.json).await
+            }
+            Some(Command::Chat) | None => commands::chat(config, workspace).await,
+            Some(Command::Serve { protocol, bind }) => {
+                commands::serve(config, workspace, &protocol, &bind).await
+            }
+            Some(Command::Agents { action }) => {
+                commands::agents(config, workspace, action, cli.json).await
+            }
+            Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
+            Some(Command::Skills { action }) => {
+                commands::skills(config, workspace, action, cli.json).await
+            }
+            Some(Command::Memory { action }) => {
+                commands::memory(config, workspace, action, cli.json).await
+            }
+            Some(Command::Mcp { action }) => commands::mcp(config, action, cli.json).await,
+            Some(Command::Usage { by_model }) => {
+                commands::usage(config, workspace, by_model, cli.json).await
+            }
+            Some(Command::Doctor) => {
+                commands::doctor(config, workspace, loaded.sources, cli.json).await
+            }
         }
     }
+    .instrument(tracing::info_span!("cuma", command))
+    .await
 }

@@ -80,6 +80,7 @@ dirs = "6"
 shell-words = "1"
 ed25519-dalek = "3.0"
 sha2 = "0.11"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 base64 = "0.23"
 which = "8"
 # `tempdir` is deprecated; `tempfile` is its maintained successor.

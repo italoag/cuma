@@ -31,6 +31,15 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # OTLP export is behind a feature; keep it compiling and lint-clean.
+      - name: Clippy (otel feature)
+        run: cargo clippy -p cuma-cli --features otel --all-targets -- -D warnings
+
+      # Benchmarks are not run in CI (shared runners make timings noise), but
+      # they must keep compiling.
+      - name: Benchmarks compile
+        run: cargo bench --workspace --no-run
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

@@ -193,6 +193,7 @@ impl Config {
             d.telemetry.json_logs
         );
         merge_option!(self.telemetry.database_path, other.telemetry.database_path);
+        merge_option!(self.telemetry.otlp_endpoint, other.telemetry.otlp_endpoint);
     }
 }
 

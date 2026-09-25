@@ -25,6 +25,7 @@ reqwest.workspace = true
 shell-words.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 
@@ -32,3 +33,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "integrity"
+harness = false
