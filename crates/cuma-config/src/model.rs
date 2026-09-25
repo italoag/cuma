@@ -478,6 +478,23 @@ pub struct SecurityConfig {
     /// passes a minimal allowlist by default; name API-key variables here only
     /// when an agent authenticates that way rather than with its own login.
     pub agent_env: Vec<String>,
+    /// Paths a sandboxed agent may write besides its workspace, the temporary
+    /// directory and the usual agent and toolchain state under `$HOME`
+    /// (`~/.claude`, `~/.codex`, `~/.cache`, `~/.npm`…). `~` is expanded.
+    pub agent_writable_paths: Vec<String>,
+    /// Refuse to run agents that cannot be confined, rather than warn.
+    ///
+    /// Off by default so a machine with no sandbox still works; `cuma doctor`
+    /// reports unconfined agents either way.
+    pub require_agent_sandbox: bool,
+    /// Directories whose own `.cuma/config.toml` is applied when an editor
+    /// opens a session there over ACP. `~` is expanded; subdirectories count.
+    ///
+    /// A project's configuration names the commands agents are launched with,
+    /// so it is code. The directory CUMA was started in is trusted; any other
+    /// is served with CUMA's own configuration unless listed here, so that
+    /// opening a repository in an editor cannot run what its config says.
+    pub trusted_workspaces: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -492,6 +509,9 @@ impl Default for SecurityConfig {
             command_allowlist: Vec::new(),
             network_allowlist: Vec::new(),
             agent_env: Vec::new(),
+            agent_writable_paths: Vec::new(),
+            require_agent_sandbox: false,
+            trusted_workspaces: Vec::new(),
         }
     }
 }

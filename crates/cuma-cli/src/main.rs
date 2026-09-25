@@ -162,13 +162,13 @@ async fn run() -> Result<()> {
 
     // CLI flags are the highest-precedence layer, applied after every file and
     // environment variable.
-    harness::apply_cli_overrides(
-        &mut config,
-        cli.strategy.as_deref(),
-        cli.agent.as_deref(),
-        cli.model.as_deref(),
-        cli.max_cost,
-    )?;
+    let overrides = harness::CliOverrides {
+        strategy: cli.strategy.clone(),
+        agent: cli.agent.clone(),
+        model: cli.model.clone(),
+        max_cost: cli.max_cost,
+    };
+    overrides.apply(&mut config)?;
 
     // Held for the whole run: dropping it flushes exported traces.
     let _telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
@@ -202,7 +202,7 @@ async fn run() -> Result<()> {
             }
             Some(Command::Chat) | None => commands::chat(config, workspace).await,
             Some(Command::Serve { protocol, bind }) => {
-                commands::serve(config, workspace, &protocol, &bind).await
+                commands::serve(config, workspace, &protocol, &bind, &overrides).await
             }
             Some(Command::Agents { action }) => {
                 commands::agents(config, workspace, action, cli.json).await

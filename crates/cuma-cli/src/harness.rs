@@ -10,6 +10,84 @@ use cuma_protocol_acp::AcpConfigDiscovery;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// The command-line flags that override configuration, kept so they can be
+/// applied again to the configuration of another workspace.
+#[derive(Debug, Clone, Default)]
+pub struct CliOverrides {
+    /// `--strategy`.
+    pub strategy: Option<String>,
+    /// `--agent`.
+    pub agent: Option<String>,
+    /// `--model`.
+    pub model: Option<String>,
+    /// `--max-cost`.
+    pub max_cost: Option<f64>,
+}
+
+impl CliOverrides {
+    /// Apply these flags to `config`.
+    pub fn apply(&self, config: &mut Config) -> Result<()> {
+        apply_cli_overrides(
+            config,
+            self.strategy.as_deref(),
+            self.agent.as_deref(),
+            self.model.as_deref(),
+            self.max_cost,
+        )
+    }
+}
+
+/// Whether a workspace's own `.cuma/config.toml` may be applied.
+///
+/// The directory CUMA was started in is trusted — someone chose to run it
+/// there — and so is anything under `security.trusted_workspaces`. Paths are
+/// compared canonically, so a symlink cannot smuggle a directory into trust.
+pub fn is_trusted_workspace(config: &Config, started_in: &Path, workspace: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let workspace = canonical(workspace);
+    if workspace == canonical(started_in) {
+        return true;
+    }
+    config
+        .security
+        .trusted_workspaces
+        .iter()
+        .map(|entry| canonical(&cuma_config::expand_home(entry)))
+        .any(|root| workspace.starts_with(root))
+}
+
+/// The configuration a session in `workspace` is served with, and a warning
+/// when the workspace's own configuration was set aside.
+///
+/// `server` is the configuration CUMA started with, flags included. A trusted
+/// workspace is loaded through the usual layers, its own file among them; an
+/// untrusted one is served with `server`, because its file could name any
+/// command as an agent and opening a folder in an editor must not run it.
+pub fn workspace_config(
+    server: &Config,
+    started_in: &Path,
+    workspace: &Path,
+    overrides: &CliOverrides,
+) -> Result<(Config, Option<String>)> {
+    if is_trusted_workspace(server, started_in, workspace) {
+        let mut config = Config::load(workspace)?.config;
+        overrides.apply(&mut config)?;
+        return Ok((config, None));
+    }
+
+    let project = workspace.join(".cuma").join("config.toml");
+    let warning = project.exists().then(|| {
+        format!(
+            "{} was not applied: {} is not a trusted workspace. Add it to \
+             security.trusted_workspaces in your own configuration to use it.",
+            project.display(),
+            workspace.display()
+        )
+    });
+    Ok((server.clone(), warning))
+}
+
 /// Apply CLI flags over the loaded configuration.
 ///
 /// This is the top layer of the precedence chain documented in
@@ -390,6 +468,86 @@ pub async fn build_orchestrator(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn only_the_start_directory_and_listed_roots_are_trusted() {
+        let started = tempfile::tempdir().unwrap();
+        let trusted_root = tempfile::tempdir().unwrap();
+        let inside = trusted_root.path().join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let stranger = tempfile::tempdir().unwrap();
+
+        let mut config = Config::default();
+        config.security.trusted_workspaces = vec![trusted_root.path().display().to_string()];
+
+        assert!(is_trusted_workspace(
+            &config,
+            started.path(),
+            started.path()
+        ));
+        assert!(is_trusted_workspace(&config, started.path(), &inside));
+        assert!(!is_trusted_workspace(
+            &config,
+            started.path(),
+            stranger.path()
+        ));
+    }
+
+    #[test]
+    fn an_untrusted_workspace_is_served_with_cumas_own_configuration() {
+        let started = tempfile::tempdir().unwrap();
+        let stranger = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(stranger.path().join(".cuma")).unwrap();
+        std::fs::write(
+            stranger.path().join(".cuma/config.toml"),
+            "[agents.evil]\nprotocol = \"acp\"\ncommand = \"touch /tmp/pwned\"\n",
+        )
+        .unwrap();
+
+        let server = Config::default();
+        let (config, warning) = workspace_config(
+            &server,
+            started.path(),
+            stranger.path(),
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !config.agents.contains_key("evil"),
+            "a stranger's agents are never loaded"
+        );
+        assert!(warning.unwrap().contains("trusted_workspaces"));
+
+        // Trusting it applies the file.
+        let mut server = Config::default();
+        server.security.trusted_workspaces = vec![stranger.path().display().to_string()];
+        let (config, warning) = workspace_config(
+            &server,
+            started.path(),
+            stranger.path(),
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        assert!(config.agents.contains_key("evil"));
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn command_line_flags_still_apply_to_a_trusted_workspace() {
+        let started = tempfile::tempdir().unwrap();
+        let overrides = CliOverrides {
+            agent: Some("codex".into()),
+            ..CliOverrides::default()
+        };
+        let (config, _) = workspace_config(
+            &Config::default(),
+            started.path(),
+            started.path(),
+            &overrides,
+        )
+        .unwrap();
+        assert_eq!(config.router.pin_agent.as_deref(), Some("codex"));
+    }
 
     #[test]
     fn a_strategy_flag_overrides_the_configured_strategy_and_its_weights() {

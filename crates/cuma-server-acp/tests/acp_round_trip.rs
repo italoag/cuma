@@ -589,3 +589,134 @@ async fn loading_an_unknown_session_is_an_error() {
 
     assert!(result, "an unknown session must not load");
 }
+
+// ---------------------------------------------------------------------------
+// Working directories
+// ---------------------------------------------------------------------------
+
+/// An agent that answers with the workspace it was asked to work in.
+struct WhereAmI(AgentDescriptor);
+
+#[async_trait::async_trait]
+impl cuma_core::ports::AgentAdapter for WhereAmI {
+    fn agent_id(&self) -> &cuma_core::AgentId {
+        &self.0.id
+    }
+    async fn describe(&self) -> cuma_core::Result<AgentDescriptor> {
+        Ok(self.0.clone())
+    }
+    async fn execute(
+        &self,
+        request: cuma_core::ports::ExecutionRequest,
+        updates: tokio::sync::mpsc::Sender<cuma_core::ports::ExecutionUpdate>,
+    ) -> cuma_core::Result<cuma_core::ExecutionOutcome> {
+        let output = format!("WORKING IN {}", request.workspace.display());
+        let _ = updates
+            .send(cuma_core::ports::ExecutionUpdate::Text {
+                content: output.clone(),
+            })
+            .await;
+        Ok(cuma_core::ExecutionOutcome {
+            attempt_id: cuma_core::AttemptId::generate(),
+            agent_id: self.0.id.clone(),
+            model_id: request.model.clone(),
+            success: true,
+            output,
+            changed_files: Vec::new(),
+            tokens: cuma_core::TokenUsage::estimated(10, 10),
+            latency_ms: 1,
+            failure_class: None,
+            failure_reason: None,
+            reported_cost_usd: None,
+        })
+    }
+}
+
+async fn located_orchestrator(root: std::path::PathBuf) -> Orchestrator {
+    let mut orchestrator =
+        Orchestrator::new(Config::default(), Arc::new(HeuristicPlanner::new()), root);
+    orchestrator
+        .add_agent(Arc::new(WhereAmI(descriptor("where"))))
+        .await
+        .unwrap();
+    orchestrator
+}
+
+#[tokio::test]
+async fn each_session_works_in_the_directory_its_client_named() {
+    let started_in = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+
+    let build: cuma_server_acp::Builder =
+        Arc::new(|path| Box::pin(async move { Ok(located_orchestrator(path).await) }));
+    let workspaces = cuma_server_acp::Workspaces::per_directory(
+        started_in.path().to_path_buf(),
+        located_orchestrator(std::fs::canonicalize(started_in.path()).unwrap()).await,
+        build,
+    );
+
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let _ = cuma_server_acp::serve_workspaces(
+            workspaces,
+            cuma_server_acp::SessionRegistry::new(),
+            byte_streams(server_side),
+        )
+        .await;
+    });
+    let transcripts = Transcripts::default();
+
+    let (a_dir, b_dir) = (
+        project_a.path().to_path_buf(),
+        project_b.path().to_path_buf(),
+    );
+    let (a, b, refused) = with_client(client_side, &transcripts, async |connection| {
+        connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let a = connection
+            .send_request(NewSessionRequest::new(a_dir.clone()))
+            .block_task()
+            .await?
+            .session_id;
+        let b = connection
+            .send_request(NewSessionRequest::new(b_dir.clone()))
+            .block_task()
+            .await?
+            .session_id;
+        let refused = connection
+            .send_request(NewSessionRequest::new("relative/path"))
+            .block_task()
+            .await
+            .err()
+            .map(|err| err.message);
+
+        let first =
+            connection.send_request(PromptRequest::new(a.clone(), text("explain the code")));
+        let second =
+            connection.send_request(PromptRequest::new(b.clone(), text("explain the code")));
+        first.block_task().await?;
+        second.block_task().await?;
+        Ok((a.to_string(), b.to_string(), refused))
+    })
+    .await;
+
+    let all = transcripts.lock().unwrap().clone();
+    let canonical_a = std::fs::canonicalize(project_a.path()).unwrap();
+    let canonical_b = std::fs::canonicalize(project_b.path()).unwrap();
+    let transcript_a = all.get(&a).cloned().unwrap_or_default();
+    let transcript_b = all.get(&b).cloned().unwrap_or_default();
+
+    assert!(
+        transcript_a.contains(&format!("WORKING IN {}", canonical_a.display())),
+        "session A worked elsewhere:\n{transcript_a}"
+    );
+    assert!(
+        transcript_b.contains(&format!("WORKING IN {}", canonical_b.display())),
+        "session B worked elsewhere:\n{transcript_b}"
+    );
+    let refused = refused.expect("a relative directory is refused");
+    assert!(refused.contains("absolute"), "{refused}");
+}

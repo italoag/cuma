@@ -26,9 +26,11 @@
 
 mod session;
 mod translate;
+mod workspaces;
 
 pub use session::{SessionRegistry, SessionState, Turn};
 pub use translate::{advertised_capabilities, event_to_session_update, stop_reason_for};
+pub use workspaces::{BuildFuture, Builder, Workspaces};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
@@ -66,6 +68,14 @@ pub async fn serve_stdio_with(orchestrator: Orchestrator, sessions: SessionRegis
     serve_with(orchestrator, sessions, Stdio::new()).await
 }
 
+/// Serve over stdio, each session in the working directory its client named.
+pub async fn serve_stdio_workspaces(
+    workspaces: Workspaces,
+    sessions: SessionRegistry,
+) -> Result<()> {
+    serve_workspaces(workspaces, sessions, Stdio::new()).await
+}
+
 /// Serve over an arbitrary transport, so tests can drive it in-process.
 pub async fn serve<T>(orchestrator: Orchestrator, transport: T) -> Result<()>
 where
@@ -79,7 +89,8 @@ fn chunk(text: &str) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_owned())))
 }
 
-/// Serve over an arbitrary transport with a caller-supplied session registry.
+/// Serve over an arbitrary transport with a caller-supplied session registry,
+/// every session on one orchestrator.
 pub async fn serve_with<T>(
     orchestrator: Orchestrator,
     sessions: SessionRegistry,
@@ -88,13 +99,38 @@ pub async fn serve_with<T>(
 where
     T: agent_client_protocol::ConnectTo<Agent>,
 {
-    let orchestrator = Arc::new(orchestrator);
+    serve_workspaces(Workspaces::fixed(orchestrator), sessions, transport).await
+}
+
+/// An error an ACP client can show its user.
+fn client_error(code: i32, err: &MetaAgentError) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(code, err.to_string())
+}
+
+/// JSON-RPC's code for a request the server understood but cannot accept.
+const INVALID_PARAMS: i32 = -32602;
+/// JSON-RPC's code for a failure on the server's side.
+const INTERNAL_ERROR: i32 = -32603;
+
+/// Serve over an arbitrary transport, choosing an orchestrator per session
+/// from `workspaces`.
+pub async fn serve_workspaces<T>(
+    workspaces: Workspaces,
+    sessions: SessionRegistry,
+    transport: T,
+) -> Result<()>
+where
+    T: agent_client_protocol::ConnectTo<Agent>,
+{
+    let workspaces = Arc::new(workspaces);
     let loadable = sessions.is_persistent();
 
     let new_session_sessions = sessions.clone();
+    let new_session_workspaces = Arc::clone(&workspaces);
     let load_sessions = sessions.clone();
+    let load_workspaces = Arc::clone(&workspaces);
     let cancel_sessions = sessions.clone();
-    let prompt_orchestrator = Arc::clone(&orchestrator);
+    let prompt_workspaces = Arc::clone(&workspaces);
     let prompt_sessions = sessions.clone();
 
     Agent
@@ -117,43 +153,86 @@ where
         )
         // --- session/new --------------------------------------------------
         .on_receive_request(
-            async move |request: NewSessionRequest, responder, _connection| {
-                let session_id = new_session_sessions.create(request.cwd.clone()).await;
-                tracing::info!(session = %session_id, cwd = ?request.cwd, "ACP session created");
+            async move |request: NewSessionRequest, responder, connection| {
+                let sessions = new_session_sessions.clone();
+                let workspaces = Arc::clone(&new_session_workspaces);
 
-                responder.respond(NewSessionResponse::new(session_id))
+                // Preparing a workspace can mean negotiating with every agent
+                // configured for it; that must not hold up other sessions.
+                connection.spawn(async move {
+                    let prepared = match workspaces.validate(&request.cwd) {
+                        Ok(path) => workspaces
+                            .orchestrator(Some(&path))
+                            .await
+                            .map(|_| path)
+                            .map_err(|err| client_error(INTERNAL_ERROR, &err)),
+                        Err(err) => Err(client_error(INVALID_PARAMS, &err)),
+                    };
+                    let answer = match prepared {
+                        Ok(path) => {
+                            let session_id = sessions.create(path.clone()).await;
+                            tracing::info!(session = %session_id, cwd = %path.display(), "ACP session created");
+                            responder.respond(NewSessionResponse::new(session_id))
+                        }
+                        Err(err) => {
+                            tracing::warn!(cwd = %request.cwd.display(), error = %err.message, "refused a session");
+                            responder.respond_with_error(err)
+                        }
+                    };
+                    if let Err(err) = answer {
+                        tracing::warn!(error = %err, "could not answer session/new");
+                    }
+                    Ok(())
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
         // --- session/load -------------------------------------------------
         .on_receive_request(
             async move |request: LoadSessionRequest, responder, connection| {
-                let Some(state) = load_sessions
-                    .load(&request.session_id, request.cwd.clone())
-                    .await
-                else {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::resource_not_found(Some(
-                            request.session_id.to_string(),
-                        )),
-                    );
-                };
+                let sessions = load_sessions.clone();
+                let workspaces = Arc::clone(&load_workspaces);
 
-                // The protocol asks for the whole conversation to be replayed
-                // as notifications before the response.
-                for turn in &state.turns {
-                    let _ = connection.send_notification(SessionNotification::new(
-                        request.session_id.clone(),
-                        SessionUpdate::UserMessageChunk(chunk(&turn.prompt)),
-                    ));
-                    let _ = connection.send_notification(SessionNotification::new(
-                        request.session_id.clone(),
-                        SessionUpdate::AgentMessageChunk(chunk(&turn.response)),
-                    ));
-                }
+                connection.clone().spawn(async move {
+                    let path = match workspaces.validate(&request.cwd) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let _ = responder.respond_with_error(client_error(INVALID_PARAMS, &err));
+                            return Ok(());
+                        }
+                    };
+                    let Some(state) = sessions.load(&request.session_id, path.clone()).await else {
+                        let _ = responder.respond_with_error(
+                            agent_client_protocol::Error::resource_not_found(Some(
+                                request.session_id.to_string(),
+                            )),
+                        );
+                        return Ok(());
+                    };
+                    if let Err(err) = workspaces.orchestrator(Some(&path)).await {
+                        let _ = responder.respond_with_error(client_error(INTERNAL_ERROR, &err));
+                        return Ok(());
+                    }
 
-                tracing::info!(session = %request.session_id, turns = state.turns.len(), "ACP session loaded");
-                responder.respond(LoadSessionResponse::new())
+                    // The protocol asks for the whole conversation to be
+                    // replayed as notifications before the response.
+                    for turn in &state.turns {
+                        let _ = connection.send_notification(SessionNotification::new(
+                            request.session_id.clone(),
+                            SessionUpdate::UserMessageChunk(chunk(&turn.prompt)),
+                        ));
+                        let _ = connection.send_notification(SessionNotification::new(
+                            request.session_id.clone(),
+                            SessionUpdate::AgentMessageChunk(chunk(&turn.response)),
+                        ));
+                    }
+
+                    tracing::info!(session = %request.session_id, turns = state.turns.len(), cwd = %path.display(), "ACP session loaded");
+                    if let Err(err) = responder.respond(LoadSessionResponse::new()) {
+                        tracing::warn!(error = %err, "could not answer session/load");
+                    }
+                    Ok(())
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -179,15 +258,30 @@ where
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                let orchestrator = Arc::clone(&prompt_orchestrator);
+                let workspaces = Arc::clone(&prompt_workspaces);
                 let sessions = prompt_sessions.clone();
 
                 // The connection handles one message at a time; a prompt that
                 // ran here would stall every other session — and the very
                 // `session/cancel` meant to stop it — until it finished.
                 connection.clone().spawn(async move {
-                    let stop = run_prompt(&orchestrator, &sessions, &connection, &session_id, &goal)
-                        .await;
+                    let workspace = sessions.workspace(&session_id).await;
+                    let stop = match workspaces.orchestrator(workspace.as_deref()).await {
+                        Ok(orchestrator) => {
+                            run_prompt(&orchestrator, &sessions, &connection, &session_id, &goal).await
+                        }
+                        Err(err) => {
+                            // A workspace whose orchestrator was dropped while
+                            // idle, and whose configuration has since broken.
+                            let _ = connection.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(chunk(&format!(
+                                    "This session's workspace could not be prepared: {err}\n"
+                                ))),
+                            ));
+                            StopReason::EndTurn
+                        }
+                    };
                     if let Err(err) = responder.respond(PromptResponse::new(stop)) {
                         tracing::warn!(error = %err, "could not answer a prompt");
                     }

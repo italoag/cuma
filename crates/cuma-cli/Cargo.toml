@@ -50,6 +50,9 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
 tracing-opentelemetry = { version = "0.34", optional = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 # Export traces over OTLP/HTTP (`telemetry.otlp_endpoint`). Off by default: it

@@ -425,9 +425,16 @@ impl cuma_tui::SkillSource for TuiSkills {
 }
 
 /// Serve CUMA itself as an agent.
-pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &str) -> Result<()> {
+pub async fn serve(
+    config: Config,
+    workspace: PathBuf,
+    protocol: &str,
+    bind: &str,
+    overrides: &harness::CliOverrides,
+) -> Result<()> {
     let database = harness::database_path(&config, &workspace);
-    let (orchestrator, warnings) = harness::build_orchestrator(config, workspace.clone()).await?;
+    let (orchestrator, warnings) =
+        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
 
     // Warnings go to stderr: stdout carries the protocol.
     for warning in &warnings {
@@ -453,8 +460,15 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
                 .parent()
                 .map_or_else(|| workspace.join(".cuma"), std::path::Path::to_path_buf)
                 .join("acp-sessions");
-            cuma_server_acp::serve_stdio_with(
+            // Each session works in the directory its editor names, with an
+            // orchestrator of its own, built the first time it is needed.
+            let workspaces = cuma_server_acp::Workspaces::per_directory(
+                workspace.clone(),
                 orchestrator,
+                workspace_builder(config, workspace, overrides.clone()),
+            );
+            cuma_server_acp::serve_stdio_workspaces(
+                workspaces,
                 cuma_server_acp::SessionRegistry::persistent(sessions_dir),
             )
             .await
@@ -505,6 +519,39 @@ pub async fn serve(config: Config, workspace: PathBuf, protocol: &str, bind: &st
             "cannot serve protocol {other:?}; expected \"acp\", \"a2a\" or \"mcp\""
         ))),
     }
+}
+
+/// Builds the orchestrator for a directory an ACP client opens a session in.
+fn workspace_builder(
+    server: Config,
+    started_in: PathBuf,
+    overrides: harness::CliOverrides,
+) -> cuma_server_acp::Builder {
+    Arc::new(move |workspace: PathBuf| {
+        let server = server.clone();
+        let started_in = started_in.clone();
+        let overrides = overrides.clone();
+        Box::pin(async move {
+            let (config, set_aside) =
+                harness::workspace_config(&server, &started_in, &workspace, &overrides)?;
+            if let Some(warning) = set_aside {
+                eprintln!("warning: {warning}");
+            }
+
+            let (orchestrator, warnings) =
+                harness::build_orchestrator(config, workspace.clone()).await?;
+            for warning in &warnings {
+                eprintln!("warning ({}): {warning}", workspace.display());
+            }
+            if orchestrator.agents().is_empty().await {
+                return Err(MetaAgentError::Configuration(format!(
+                    "no agents are available for {}; there would be nothing to route to",
+                    workspace.display()
+                )));
+            }
+            Ok(orchestrator)
+        }) as cuma_server_acp::BuildFuture
+    })
 }
 
 /// The runtime database, as the A2A server's task store.

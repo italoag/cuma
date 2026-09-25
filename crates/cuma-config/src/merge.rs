@@ -156,6 +156,19 @@ impl Config {
             other.security.network_allowlist
         );
         merge_collection!(self.security.agent_env, other.security.agent_env);
+        merge_collection!(
+            self.security.agent_writable_paths,
+            other.security.agent_writable_paths
+        );
+        merge_field!(
+            self.security.require_agent_sandbox,
+            other.security.require_agent_sandbox,
+            d.security.require_agent_sandbox
+        );
+        merge_collection!(
+            self.security.trusted_workspaces,
+            other.security.trusted_workspaces
+        );
 
         // --- limits -------------------------------------------------------
         merge_field!(

@@ -206,6 +206,11 @@ impl Orchestrator {
         self
     }
 
+    /// The workspace every session of this orchestrator works in.
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
     /// The event bus, for subscribing.
     pub fn events(&self) -> &EventBus {
         &self.events

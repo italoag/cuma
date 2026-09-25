@@ -99,10 +99,33 @@ pub fn global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("cuma").join("config.toml"))
 }
 
+/// Expand a leading `~` to the home directory.
+///
+/// Configuration names paths the way people type them. Only `~` and `~/…` are
+/// expanded; `~user` is left alone rather than guessed at.
+pub fn expand_home(path: &str) -> PathBuf {
+    match (path.strip_prefix('~'), dirs::home_dir()) {
+        (Some(""), Some(home)) => home,
+        (Some(rest), Some(home)) if rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory_and_nothing_else_is_touched() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/code"), home.join("code"));
+        assert_eq!(expand_home("~other/code"), PathBuf::from("~other/code"));
+        assert_eq!(expand_home("/abs/~/x"), PathBuf::from("/abs/~/x"));
+    }
 
     #[test]
     fn an_empty_config_file_is_valid_and_yields_defaults() {
