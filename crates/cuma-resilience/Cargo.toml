@@ -1,0 +1,22 @@
+[package]
+name = "cuma-resilience"
+description = "Retry, backoff, circuit breaking and failure classification for CUMA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cuma-core.workspace = true
+serde.workspace = true
+tracing.workspace = true
+rand.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true
