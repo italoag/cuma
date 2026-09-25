@@ -99,7 +99,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 
 # --- tui ---
 ratatui = "0.30"
-ratatui-tea = "0.2"
 # `event-stream` gives crossterm an async EventStream. Declared here rather
 # than relying on ratatui's re-export so the feature is actually enabled;
 # cargo unifies it with the copy ratatui-crossterm pulls in.

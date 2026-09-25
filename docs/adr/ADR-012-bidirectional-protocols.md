@@ -74,3 +74,13 @@ server holds session state (working directory, a bounded turn history) that must
 not drift into duplicating the orchestrator's. A2A is synchronous, which suits
 delegation and rules out long-poll patterns until the task lifecycle is
 implemented.
+
+
+## Amendment (2026-09)
+
+Both servers now claim more, because more is implemented: ACP advertises
+`load_session` when sessions are persisted and handles `session/cancel`; A2A
+advertises `streaming` and runs a task lifecycle. The rule is unchanged — only
+what exists is advertised; push notifications and the extended card are still
+`false`. A third surface, MCP (`cuma serve --protocol mcp`), follows the same
+rule. See [ADR-015](ADR-015-a2a-dialects.md) and [ADR-016](ADR-016-mcp-sharing.md).

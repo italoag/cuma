@@ -4,12 +4,13 @@ What is built, how it is verified, and what comes next.
 
 ## Current state
 
-380 tests passing across 17 crates. Zero build warnings. Verified against a
-live ACP agent.
+711 tests passing across 20 crates. Clippy clean with warnings denied;
+checked on the MSRV (1.88) with and without the `otel` feature. Verified
+against a live ACP agent.
 
 ```
 $ cargo test --workspace
-PASSING: 380 | FAILING: 0
+PASSING: 711 | FAILING: 0
 ```
 
 ## Verification, by concern
@@ -32,6 +33,19 @@ Each row is a claim the architecture makes and the test that holds it to it.
 | History overturns a static preference | `router::observed_history_can_overturn_a_static_preference` |
 | Routing history survives a restart | `persistence::routing_history_survives_a_restart` |
 | Every decision is explainable after the fact | `orchestrator::every_routing_decision_is_explainable_after_the_fact` |
+| A fallback names the agent that takes over, and the handoff is kept | `end_to_end::a_failing_agent_falls_back_…`, `a_handoff_is_kept_in_long_term_memory_with_its_receiver` |
+| Every front end's sessions are recorded | `recorder::every_step_of_a_session_reaches_the_database` |
+| Concurrent ACP sessions see only their own work | `acp_round_trip::concurrent_sessions_see_only_their_own_work` |
+| An ACP prompt can be cancelled, and a session reloaded after a restart | `a_client_can_cancel_a_running_prompt`, `a_persisted_session_can_be_loaded_by_a_new_process` |
+| An A2A peer asking for input is not a success | `a2a_lifecycle::a_peer_asking_for_input_is_a_failure_not_a_success` |
+| A 0.3-only A2A peer is still reached | `a2a_lifecycle::a_peer_that_only_speaks_0_3_is_reached_by_falling_back` |
+| An abandoned remote task is cancelled | `a2a_lifecycle::an_abandoned_remote_task_is_cancelled` |
+| Claimed checksums and signatures earn nothing | `validation::claimed_checksums_and_signatures_earn_nothing` |
+| A tampered signed skill is not installed, and a failing update keeps the old one | `manager::a_skill_whose_signature_does_not_match_is_not_installed`, `an_update_that_fails_verification_keeps_the_installed_version` |
+| Two spellings of one file conflict | `ownership::two_spellings_of_one_file_now_conflict` |
+| Isolated work lands uncommitted, and work that no longer applies is kept | `worktree_isolation::…`, `git::changes_that_no_longer_apply_are_refused_and_nothing_lands` |
+| An MCP allowlist holds through the proxy | `tool_server::a_refused_tool_is_a_protocol_error`, plus the proxy smoke test below |
+| A tool called `rtk` that is not RTK is never used | `rtk::a_different_tool_called_rtk_is_not_used` |
 
 ### The two "done" scenarios
 
@@ -76,61 +90,37 @@ Recorded because they are the argument for having written them:
 4. **A separator-only line in an LLM plan parsed into a task** whose description
    was a stray pipe character.
 
-## Next, in order
+Found while completing the protocols and persistence:
 
-Ordered by what unblocks the most.
+5. **The ACP server ran each prompt inside the connection's dispatch loop**,
+   blocking every other message — so `session/cancel` could never cancel, and a
+   second session waited for the first.
+6. **ACP and A2A servers forwarded every session's events to every client.**
+   Fixed by choosing the session id before a run starts and filtering on it.
+7. **Every attempt insert failed under foreign keys**: attempts referenced task
+   rows written only at the end of a session. And `INSERT OR REPLACE` on
+   sessions and tasks deleted and reinserted rows, cascading away their
+   children.
+8. **A failure the breaker still rated healthy was recorded as a success.**
+9. **Skills were validated by the fields their manifest claimed**, and
+   installed into a manager that lived as long as one command.
+10. **The ai-memory adapter called a CLI command that does not exist** (`add`)
+    and parsed none of the fields `search` actually returns.
+11. **Aborting a run leaked ownership claims** — now released on drop.
+12. **Output printed while a session ran was dropped** by aborting the printer
+    before the bus drained.
 
-### 1. TUI event loop — Milestone 10
+The manual checks that complement the tests — an MCP proxy driven by a raw
+JSON-RPC client, the skills signing loop from `keygen` to a refused tampered
+update, the TUI driven in a pseudo-terminal, OTLP spans received by a local
+listener, the ACP registry read from its cache — are the kind of thing a unit
+test mocks away.
 
-The state machine (`cuma_tui::AppState`) and the view functions are written and
-tested without a terminal. What remains is the crossterm loop: subscribe, fold,
-draw, handle keys.
+## Next
 
-*Why first:* it is the only unfinished item whose design is already settled.
-
-### 2. CUMA as an ACP server
-
-The primary architectural goal. An editor selects one agent; behind it, the
-whole routing apparatus.
-
-```
-JetBrains ──ACP──> CUMA ──┬──ACP──> Codex
-                          ├──ACP──> Claude Code
-                          └──A2A──> remote architect
-```
-
-The client half is done and the SDK supports the agent role. This is a new
-`cuma-server-acp` crate that implements `Agent` and forwards to the orchestrator.
-
-### 3. Safe parallel execution
-
-`TaskGraph::ready_tasks` already computes the parallel frontier correctly; the
-orchestrator runs it sequentially because concurrent writers to one workspace
-corrupt each other. The missing piece is isolation: git worktrees per task, file
-ownership tracking, and merge coordination.
-
-*Not a scheduling problem. A safety problem.*
-
-### 4. RTK integration
-
-Detect on `PATH`, wrap shell-heavy tool calls, record tokens saved. The config
-surface and the usage counter already exist.
-
-### 5. Provider adapters
-
-A concrete `LlmProvider` so `LlmPlanner` has something to call. Behind the port,
-in a `cuma-providers` crate — never scattered through the domain.
-
-### 6. Sandbox enforcement
-
-`security.sandbox` is configured and unenforced. Wire `sandbox_command` into
-agent and skill execution.
-
-### 7. Skill creation
-
-Generating a skill that does not exist, testing it, validating it, registering
-it. The highest-risk feature in the brief, deliberately last, and gated behind
-`skills.allow_creation = false` by default.
+Every item this section used to list — the TUI loop, CUMA as an ACP server,
+safe parallel execution, RTK, providers, sandbox enforcement, skill creation —
+is built. What remains is in the [roadmap](docs/ROADMAP.md#what-is-not-built).
 
 ## Standing constraints
 

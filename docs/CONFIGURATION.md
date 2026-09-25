@@ -54,10 +54,19 @@ protocol = "a2a"
 endpoint = "https://architect.example/a2a"
 auth_secret_ref = "CUMA_ARCHITECT_TOKEN"   # a handle, never a token
 
+[mcp.git]                          # any number of [mcp.<name>] servers
+command = "uvx"
+args = ["mcp-server-git"]
+env = { TOKEN = "$SOME_VAR" }      # $VAR is resolved from CUMA's environment
+allowed_tools = []                 # empty means every tool
+share_with_agents = false          # hand it to ACP agents, through `cuma mcp proxy`
+enabled = true
+
 [memory]
 enabled = false                    # off by default; an optional external binary
-backend = "ai-memory-cli"          # ai-memory-cli | none
+backend = "ai-memory-cli"          # ai-memory-cli | ai-memory-mcp | none
 command = "ai-memory"
+mcp_server = "memory"              # ai-memory-mcp: use [mcp.memory] instead of launching `command`
 recall_limit = 8
 
 [rtk]
@@ -66,26 +75,33 @@ enabled = "auto"                   # auto | always | never
 [skills]
 enabled = true
 auto_install = "trusted-only"      # never | trusted-only | verified
-registries = ["builtin", "local"]
+registries = ["builtin", "local"]  # also "git+https://…" and "https://…/index.json"
+install_dir = ".cuma/skills"
 allow_creation = false
+
+[skills.trusted_keys]              # key id → base64 Ed25519 public key
+acme = "base64-public-key"
 
 [security]
 sandbox = true
 allow_destructive_operations = false
 checkpoint_before_write = true
 command_allowlist = []
-network_allowlist = []
+network_allowlist = []             # under ai-jail: hosts agents may reach; empty = open
+agent_env = []                     # variables forwarded into a sandboxed agent
 
 [limits]
 max_parallel_tasks = 4
 max_retries = 3
 task_timeout_secs = 600
 max_cost_usd = 10.0
+isolation = "shared"               # shared | worktree
 
 [telemetry]
 log_level = "info"                 # error | warn | info | debug | trace
 json_logs = false
 database_path = ".cuma/runtime.db"
+otlp_endpoint = "http://localhost:4318/v1/traces"   # needs a build with --features otel
 ```
 
 ## Environment variables

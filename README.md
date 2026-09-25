@@ -127,13 +127,15 @@ adapters automatically. Any command that speaks ACP over stdio works.
 |---|---|
 | `cuma run "<goal>"` | Plan, route and execute |
 | `cuma explain "<goal>"` | Plan and route without executing |
-| `cuma agents list \| show \| discover` | Agents and their health |
+| `cuma agents list \| show \| discover [--registry] \| add <id>` | Agents, their health, and the ACP registry |
 | `cuma models list` | Models and pricing |
-| `cuma skills search \| inspect \| install` | Skills |
+| `cuma skills search \| inspect \| install \| enable \| update \| sign …` | Verified skills |
+| `cuma mcp list \| tools \| call \| proxy` | MCP servers |
 | `cuma memory status \| search` | Long-term memory |
 | `cuma usage [--by-model]` | Tokens, cost, outcomes |
 | `cuma serve --protocol acp` | Be an agent an editor can select |
 | `cuma serve --protocol a2a` | Be an agent other systems can delegate to |
+| `cuma serve --protocol mcp` | Be tools any MCP host can call |
 | `cuma chat` | Interactive TUI |
 | `cuma doctor` | Check the installation |
 
@@ -155,7 +157,7 @@ Every command takes `--json`, for CI and for other agents.
 | [Configuration](docs/CONFIGURATION.md) | Every setting |
 | [Development](docs/DEVELOPMENT.md) | Working on CUMA |
 | [Roadmap](docs/ROADMAP.md) | What is built and what is not |
-| [ADRs](docs/adr/) | Twelve decisions, with their costs |
+| [ADRs](docs/adr/) | Sixteen decisions, with their costs |
 
 On the transformation from the previous product:
 [current architecture](CURRENT_ARCHITECTURE.md) ·
@@ -178,14 +180,17 @@ apparatus.
 
 ## Status
 
-564 tests, zero warnings. Verified against a live ACP agent, and against the
-real ACP client SDK driving CUMA as an agent.
+711 tests, clippy clean with warnings denied, checked on the MSRV. Verified
+against a live ACP agent; against the real ACP client SDK driving CUMA as an
+agent (including concurrent sessions, cancellation and reload); against
+scripted A2A peers in both dialects over real HTTP and SSE; and against a real
+MCP client.
 
-Known gaps are listed in the [roadmap](docs/ROADMAP.md) — it distinguishes what
-is done from what is not, rather than implying. The main ones: skill signatures
-are checked for presence but not cryptographically verified, A2A is synchronous
-(no streaming or task lifecycle), and write prediction over-serializes tasks
-whose description names no paths.
+Known gaps are listed in the [roadmap](docs/ROADMAP.md), which distinguishes
+what is done from what is not. The main ones: CUMA-as-ACP works in the
+workspace it was started in rather than each editor session's own, the A2A
+task store is in memory, and agents are sandboxed only where ai-jail is
+installed.
 
 ## History
 

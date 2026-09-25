@@ -67,3 +67,11 @@ approval under the default policy. That is the intended trade. Signature
 *verification* is not yet implemented — presence is checked, cryptographic
 validation is not, which is why `Verified` currently means "claims integrity
 metadata" rather than "integrity proven". This is a known gap, not a claim.
+
+
+## Amendment (2026-09)
+
+The gap named above is closed, and it was worse than stated: `Verified` was
+granted for the mere presence of the fields, which contradicted this record's
+own principle. Trust now comes from a content digest and an Ed25519 signature
+checked at install time. See [ADR-013](ADR-013-skill-evidence.md).

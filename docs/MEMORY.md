@@ -45,14 +45,37 @@ recall_limit = 8
 Off by default. A harness that fails to start because an optional binary is
 missing is a worse default than one that starts without recall.
 
+Over MCP, which adds claim-once handoffs:
+
+```toml
+[memory]
+enabled = true
+backend = "ai-memory-mcp"   # launches `ai-memory serve --transport stdio`
+# mcp_server = "memory"     # …or use a configured [mcp.memory] server instead
+```
+
+The commands behind each backend are listed in
+[ADR-005](adr/ADR-005-ai-memory.md#interfaces-used).
+
 ## Where it is used
 
 **Planning.** Relevant memories are recalled and passed to the planner, so a
 plan reflects what earlier sessions learned.
 
-**Context.** Recalled memories lead the prompt, ahead of the task description.
+**Tasks.** Each task recalls up to three memories about itself, once, before
+its first attempt. They are appended to the prompt under *Recalled from
+long-term memory*, bounded to 2 000 characters and labelled as background
+notes, not instructions — memory is written by agents and people, and is data.
 
 **Recording.** A completed task records what worked.
+
+**Handoffs.** When a task falls back to another agent, the handoff is passed to
+the new agent directly and also kept in memory (`record_handoff`), so a person
+or a later session can find it. Over MCP it is an ai-memory handoff; over the
+CLI, which cannot begin one, it is a page.
+
+**Browsing.** The TUI's Memory screen searches with `/`; `cuma memory search`
+does the same from the shell.
 
 ## Degradation
 

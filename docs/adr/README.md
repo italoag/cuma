@@ -17,3 +17,7 @@ decision without a stated cost is a decision that has not been thought through.
 | [010](ADR-010-event-driven-runtime.md) | An event bus between the runtime and every interface | Accepted |
 | [011](ADR-011-workspace-isolation.md) | File ownership, not dependency order, gates parallelism | Accepted |
 | [012](ADR-012-bidirectional-protocols.md) | CUMA serves the same protocols it consumes | Accepted |
+| [013](ADR-013-skill-evidence.md) | A skill's evidence is its digest and a signature, checked at install | Accepted |
+| [014](ADR-014-worktree-isolation.md) | Worktree isolation applies work back uncommitted | Accepted |
+| [015](ADR-015-a2a-dialects.md) | Speak A2A 1.0, fall back to 0.3, and run tasks as sessions | Accepted |
+| [016](ADR-016-mcp-sharing.md) | Agents reach shared MCP servers through CUMA's proxy | Accepted |

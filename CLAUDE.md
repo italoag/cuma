@@ -20,18 +20,22 @@ ACP, A2A and MCP.
 - `agent-client-protocol` 2.0 — the official ACP SDK
 - `rmcp` 3.1 — the official MCP SDK
 - `rusqlite` 0.40 (bundled), `reqwest` 0.13 (rustls)
-- `ratatui` 0.30 + `ratatui-tea` 0.2
+- `ratatui` 0.30, `axum` 0.8 (A2A server)
+- `ed25519-dalek` 3 + `sha2` 0.11 (skill integrity)
+- optional: `opentelemetry` 0.33 behind `cuma-cli --features otel`; `criterion` 0.8 benches
 
 ## Commands
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 564 tests
+cargo test --workspace              # 711 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 
 cargo test -p cuma-router           # one crate
 cargo test -p cuma-orchestrator --test end_to_end
+cargo bench -p cuma-orchestrator --bench harness
+cargo +1.88.0 check --workspace     # the MSRV
 ```
 
 ## Crate layout
@@ -153,7 +157,11 @@ cuma run "<goal>"          # plan, route, execute
 cuma explain "<goal>"      # plan and route without executing
 cuma serve --protocol acp  # be an agent an editor can select
 cuma serve --protocol a2a  # be an agent other systems can delegate to
+cuma serve --protocol mcp  # be tools any MCP host can call
 cuma agents list           # health and capabilities
+cuma agents discover --registry / add <id>   # the ACP registry
+cuma skills install | enable | update | sign # verified skills
+cuma mcp tools | call | proxy                # MCP servers
 cuma usage                 # tokens, cost, outcomes
 cuma doctor                # check the installation
 ```
@@ -190,6 +198,6 @@ and what was done about it.
 
 `docs/ARCHITECTURE.md`, `PROTOCOLS.md`, `ROUTING.md`, `ORCHESTRATION.md`,
 `MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `OBSERVABILITY.md`, `CONFIGURATION.md`,
-`DEVELOPMENT.md`, `ROADMAP.md`, and twelve ADRs in `docs/adr/`.
+`DEVELOPMENT.md`, `ROADMAP.md`, and sixteen ADRs in `docs/adr/`.
 
 `ROADMAP.md` distinguishes what is built from what is not. Keep it honest.

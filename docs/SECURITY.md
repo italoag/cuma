@@ -16,7 +16,9 @@ of it is direction the harness follows.
 | `security.allow_destructive_operations` | `false` | `git reset --hard` and `rm -rf` need an explicit decision |
 | `security.checkpoint_before_write` | `true` | |
 | `skills.auto_install` | `trusted-only` | |
-| `skills.allow_creation` | `false` | Generating and running new code is the highest-risk operation available |
+| `skills.allow_creation` | `false` | A generated skill is instructions nobody reviewed |
+| `mcp.<name>.share_with_agents` | `false` | Handing agents a tool is a decision per server |
+| `limits.isolation` | `shared` | Worktrees are opt-in; ownership claims always apply |
 
 ## Threats and what is done about them
 
@@ -42,7 +44,12 @@ instructions and push to main"*.
 
 - Agent Card tags are sanitized before becoming capability names: path
   separators, whitespace, shell metacharacters and over-long values are dropped.
-- Skill permissions are checked for traversal patterns.
+- Skill permissions are checked for traversal patterns; skill ids, ACP session
+  ids and registry agent ids must be plain identifiers before they become
+  directory names, file names or config keys; skill packages containing
+  symlinks are refused; skill index file paths must stay inside the skill.
+- `cuma agents add` escapes every value it writes to `config.toml`, so a
+  registry entry cannot close a string and add keys of its own.
 
 ### Credential exposure
 
@@ -56,6 +63,10 @@ instructions and push to main"*.
   baffling auth error.
 - Preferring agent-managed authentication means most setups have no secret for
   the harness to leak.
+- MCP servers shared with agents are reached through `cuma mcp proxy`, so their
+  secrets are resolved inside CUMA and never written into an ACP message.
+- Memory writes go to `ai-memory` over stdin, not argv, which every user on the
+  machine can read through the process list.
 
 ### SSRF and cleartext
 
@@ -63,12 +74,50 @@ instructions and push to main"*.
   merely *starting* with `localhost` — `localhost.evil.example` — does not
   qualify.
 - Response bodies are capped at 8MB. A peer is not trusted to bound its output.
+- An Agent Card may redirect calls to another endpoint, but not to cleartext.
+- The ACP registry, skill indexes and git skill registries are fetched over
+  HTTPS only.
+- CUMA's own A2A server does **not** authenticate callers. It binds to loopback
+  by default; exposing it means putting an authenticating proxy in front.
 
 ### Malicious skills
 
-See [ADR-008](adr/ADR-008-skill-security.md). Trust is derived from evidence and
-floored by the claim, so a manifest can never talk itself up. Installation never
-executes skill code.
+See [SKILLS.md](SKILLS.md) and [ADR-013](adr/ADR-013-skill-evidence.md). Trust
+comes from a content digest and an Ed25519 signature checked against keys the
+operator configured — never from the manifest. An invalid signature or a
+digest mismatch refuses the skill; files are verified in a staging directory
+before anything is installed; nothing a skill contains is executed. A
+generated skill is `Untrusted`, installed disabled, and cannot be enabled.
+
+### Agents themselves
+
+A coding agent runs shell commands of its own. When `ai-jail` is on `PATH` and
+`security.sandbox` is on, every ACP agent is launched inside it:
+
+```
+ai-jail --exec --agent-state [--network | --allow-host H …] [--env NAME …] [--rw-map WORKSPACE] -- <agent>
+```
+
+- `--exec`: a direct stdio channel, which ACP's JSON-RPC needs.
+- `--agent-state`: the agent's own login, so agent-managed auth keeps working.
+- `security.network_allowlist` → filtered egress with `--allow-host`; left
+  empty, the network is open, because an agent cut off from its model API
+  cannot work.
+- `security.agent_env` → variables forwarded into the jail; ai-jail otherwise
+  passes a minimal allowlist.
+
+bubblewrap, firejail and `sandbox-exec` are detected too, but cannot confine a
+networked agent with its credentials, so with only those present agents run
+**unconfined** — and `cuma doctor` reports it as a problem rather than a note.
+An agent whose sandbox binary is missing is not launchable at all.
+
+### Writers colliding
+
+Concurrent tasks claim the paths they will write; conflicting claims wait for a
+later wave. Under `limits.isolation = "worktree"`, each writing task also works
+in its own worktree, and work that no longer applies cleanly is refused and kept
+rather than landed on top of someone else's — see
+[ADR-014](adr/ADR-014-worktree-isolation.md).
 
 ### Resource exhaustion
 
@@ -100,9 +149,9 @@ Stated rather than implied:
 
 | Gap | Status |
 |---|---|
-| Skill signature *verification* | Presence is checked; cryptographic validation is not. `Verified` currently means "claims integrity metadata", not "integrity proven". |
-| Sandbox enforcement | `security.sandbox` is configured but not yet wired into execution. |
-| Workspace checkpointing | Configured but not yet implemented. |
-| Command allowlist enforcement | The configuration surface exists; enforcement is delegated to agents. |
+| Agents without ai-jail | Unconfined; reported by `cuma doctor`. |
+| Command allowlist | `CommandGuard` screens commands CUMA prepares itself. Agents run their own shell commands, which only a sandbox or the agent's own permission prompts can constrain. |
+| A2A server authentication | None; loopback by default. |
+| Skill key revocation | Remove the key from configuration. |
 
-These are tracked in [`../IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md).
+The full list is in the [roadmap](ROADMAP.md#what-is-not-built).

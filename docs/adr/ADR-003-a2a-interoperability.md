@@ -63,3 +63,12 @@ one crate.
 **Costs.** Streaming, push notifications and the full task lifecycle are not
 implemented — the subset covers delegation, not every A2A feature. Spec changes
 must be tracked by hand until the SDK is adopted.
+
+
+## Amendment (2026-09)
+
+The slice grew: the implementation now speaks A2A 1.0 — `SendMessage`,
+`SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+`SubscribeToTask` — with a 0.3 fallback, written against `a2a.proto` rather
+than memory. `a2a-rs` is at 0.10.0 and still needs Rust 1.96, so the
+provisional decision stands. See [ADR-015](ADR-015-a2a-dialects.md).

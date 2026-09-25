@@ -59,6 +59,10 @@ The goal is maximum useful information per token sent. A task receives:
 3. Its own description
 4. **Completed dependencies' outputs**, truncated
 5. Its own previous failures
+6. What long-term memory knows about *this task* — up to three memories,
+   recalled once, labelled as background notes rather than instructions
+7. The instructions of enabled skills providing the capabilities it needs,
+   labelled by trust (see [SKILLS.md](SKILLS.md))
 
 Not: the session transcript, the whole plan, or sibling task outputs. A sibling
 running in parallel has nothing this task needs.
@@ -138,6 +142,19 @@ Previous agent: codex (handed over because: rate limited)
 Empty sections are omitted. The whole point is spending as few tokens as
 possible.
 
+Two events make a fallback visible: `FallbackSelected { from, to }` names the
+agent that actually takes over — the routing probe that decided a reroute was
+possible already chose it — and `HandoffPerformed` is published on the pass
+where the new agent receives the handoff. The handoff is also kept in
+long-term memory (see [MEMORY.md](MEMORY.md)).
+
+## Recording
+
+Every step is written to the runtime database as it happens — session start,
+each routing decision with its explanation, each attempt, each change in an
+agent's health, the final state of every task — through the `SessionRecorder`
+port. Front ends differ; the record does not.
+
 ## Deadlines
 
 Enforced by the orchestrator with `tokio::time::timeout`, not delegated to
@@ -155,16 +172,28 @@ independence.** Two tasks with no edge between them can both edit
 - Writing tasks claim the paths they will write, on **prefixes** — a task
   owning `src/auth/` conflicts with one owning `src/auth/token.rs`.
 - A conflicting task is **deferred**, not failed: it runs in a later wave.
-- Prediction is **pessimistic**. A description naming no paths claims the whole
-  workspace. A false serialization costs latency; a false parallelization costs
-  the user's work.
+- Prediction is **grounded and pessimistic**. Paths named in a description are
+  resolved against an index of the workspace's files — so "fix auth.rs" and
+  "edit src/auth.rs" claim the same file — and files a task's dependencies
+  changed are claimed too. A description naming no paths still claims the
+  whole workspace. A false serialization costs latency; a false
+  parallelization costs the user's work.
 - Read-only tasks never contend.
 - `max_parallel_tasks` bounds the wave.
 
-Claims are released when a task reaches a terminal state, successful or not —
-a failed task that kept its claims would lock those paths for the session.
+Claims are released when a task reaches a terminal state, successful or not,
+and also when a run is aborted mid-wave — a cancelled ACP prompt or A2A task —
+because the release happens on drop. A task that kept its claims would lock
+those paths for every later session.
 
-See [ADR-011](adr/ADR-011-workspace-isolation.md).
+**Worktree isolation** (`limits.isolation = "worktree"`) adds a second layer
+for when prediction is wrong: each writing task runs in a detached worktree
+built from a snapshot of the live tree, and its work is applied back as
+uncommitted changes. Work that no longer applies fails the task and is kept in
+its worktree for a manual merge. Nothing is committed on the user's behalf.
+
+See [ADR-011](adr/ADR-011-workspace-isolation.md) and
+[ADR-014](adr/ADR-014-worktree-isolation.md).
 
 ## Workspace safety
 
@@ -174,12 +203,16 @@ Before anything writes, CUMA detects the repository and — under
 tree. A checkpoint that reverted the tree would change the task the agent was
 given.
 
-Commands agents run are screened, then wrapped:
+Agents run their own shell commands, so what confines them is the sandbox
+they are launched in (ai-jail, when present — see [SECURITY.md](SECURITY.md))
+and RTK hooks installed into the agents themselves (`rtk init`). Commands CUMA
+prepares itself go through one pipeline:
 
 ```
 screen (refuse destructive) ──> RTK (filter output) ──> sandbox (confine)
 ```
 
-The order matters. Screening first means a refused command is never wrapped or
-spawned; RTK before the sandbox means the sandbox confines the whole pipeline
-rather than RTK escaping it.
+Screening first means a refused command is never wrapped or spawned; RTK
+before the sandbox means the sandbox confines the whole pipeline rather than
+RTK escaping it. RTK is used only once `rtk gain` proves the binary is RTK and
+not the unrelated crate of the same name.

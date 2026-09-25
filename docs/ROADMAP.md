@@ -2,87 +2,90 @@
 
 ## Where things stand
 
-380 tests passing, zero build warnings, verified against a live ACP agent.
+711 tests passing, clippy clean with warnings denied, checked on the MSRV
+(Rust 1.88) with and without the `otel` feature.
 
 | Milestone | State |
 |---|---|
 | 1 — Foundation | **Done** |
-| 2 — ACP | **Done** |
+| 2 — ACP | **Done** — client, server, `session/load`, `session/cancel`, registry discovery |
 | 3 — Router | **Done** |
-| 4 — Orchestration | **Done** |
+| 4 — Orchestration | **Done** — including worktree isolation |
 | 5 — Resilience | **Done** |
-| 6 — Memory | **Done** |
-| 7 — MCP | **Done** |
-| 8 — A2A | **Done** |
-| 9 — Skills | **Done** |
+| 6 — Memory | **Done** — ai-memory over its CLI or its MCP server, handoffs included |
+| 7 — MCP | **Done** — client, server, allowlist-enforcing proxy shared with agents |
+| 8 — A2A | **Done** — 1.0 dialect with 0.3 fallback, task lifecycle, SSE |
+| 9 — Skills | **Done** — content digests, Ed25519 signatures, git and HTTPS registries |
 | 10 — TUI | **Done** |
-| 11 — Optimization | **Done** |
+| 11 — Optimization | **Done** — RTK verified and measured, benchmarks |
 
 ## Acceptance criteria
 
-Against the product definition, stated honestly.
+| Criterion | State | Where |
+|---|---|---|
+| A single meta-agent as the interface | **Done** | CLI, TUI, ACP, A2A, MCP servers |
+| ACP agent support | **Done** | `cuma-protocol-acp` |
+| A2A agent support | **Done** | `cuma-protocol-a2a` |
+| MCP tool support | **Done** | `cuma-protocol-mcp` |
+| Agent, model and capability registries | **Done** | `cuma-registry` |
+| Planning and decomposition | **Done** | `cuma-planner` |
+| Explainable multi-dimensional routing | **Done** | `cuma-router` |
+| Retry, fallback, circuit breaker, replan | **Done** | `cuma-resilience`, orchestrator |
+| Health monitoring, persisted | **Done** | `agent_health` table |
+| Long-term memory | **Done** | `cuma-memory` |
+| Agent handoff | **Done** | `AgentHandoff`, `HandoffPerformed`, ai-memory handoffs |
+| Skill discovery, installation, security | **Done** | `cuma-skills` |
+| Skill creation | **Done** | generated skills install disabled and `Untrusted` |
+| Usage tracking, reported vs estimated | **Done** | `Known<T>`, `TokenUsage.reported`, `cost_reported` |
+| Structured logging and tracing | **Done** | spans per command, session, task, attempt |
+| OpenTelemetry export | **Done** | `otel` feature |
+| Safe parallel execution | **Done** | ownership ledger, worktree isolation |
+| Sandboxing | **Done** | agents confined by ai-jail when present |
+| RTK integration | **Done** | verified with `rtk gain`; measured savings reported |
+| CUMA as an ACP / A2A / MCP agent | **Done** | `cuma serve --protocol acp \| a2a \| mcp` |
+| Provider adapters | **Done** | `cuma-providers` |
+| Tests, mock agents, benchmarks | **Done** | `cuma-testkit`, `benches/` |
 
-| Criterion | State |
+## Measured overhead
+
+From `cargo bench` on a development machine; what CUMA costs on top of the
+agents it runs.
+
+| Step | Time |
 |---|---|
-| A single meta-agent as the interface | **Done** (CLI; TUI partial) |
-| ACP agent support | **Done** |
-| A2A agent support | **Done** |
-| MCP tool support | **Done** |
-| Agent registry | **Done** |
-| Model registry | **Done** |
-| Capability discovery | **Done** |
-| Task planning and decomposition | **Done** |
-| Intelligent routing | **Done** |
-| Cost / quality / health routing | **Done** |
-| Retry | **Done** |
-| Fallback | **Done** |
-| Circuit breaker | **Done** |
-| Health monitoring | **Done** |
-| Long-term memory | **Done** |
-| Agent handoff | **Done** |
-| Skill discovery | **Done** |
-| Skill installation | **Done** |
-| Skill security | **Done** |
-| Usage tracking | **Done** |
-| Cost estimation | **Done** |
-| Token statistics | **Done** |
-| Structured logging | **Done** |
-| Security boundaries | **Done** |
-| Unit tests | **Done** |
-| Integration tests | **Done** |
-| Mock agents | **Done** |
-| Architecture documentation | **Done** |
-| ADRs | **Done** |
-| CLI headless | **Done** |
-| Safe parallel execution | **Done** |
-| TUI | **Done** |
-| RTK integration | **Done** |
-| Skill creation | **Done** |
-| CUMA as an ACP agent | **Done** |
-| CUMA as an A2A agent | **Done** |
-| Sandboxing | **Done** |
-| Provider adapters | **Done** |
+| Route one task across 5 / 50 / 200 agents | 9 µs / 108 µs / 521 µs |
+| Publish 1 000 events to 4 subscribers | 121 µs |
+| Ready set of a 200-task graph | 12 µs |
+| Validate a 200-task graph | 1.3 ms |
+| Assemble a task's context | 0.3 µs |
+| Predict a task's writes against a 50 000-file index | 3.8 ms |
+| Digest a 100-file skill / verify its signature | 606 µs / 45 µs |
+| Record an attempt in SQLite | 33 µs |
+
+Nothing here is within three orders of magnitude of an agent's own latency.
+Graph validation and write prediction are linear scans that could be indexed
+if a plan or a repository ever grew large enough to matter.
 
 ## What is not built
 
-Stated plainly rather than implied.
-
 | Gap | Consequence |
 |---|---|
-| **Skill signature verification** | Presence of a checksum and signature is checked; neither is cryptographically validated. `Verified` currently means "claims integrity metadata", not "integrity proven". |
-| **A2A streaming and task lifecycle** | `message/send` runs synchronously; `tasks/get` and `tasks/cancel` report that there is nothing to address afterwards. The Agent Card does not claim streaming. |
-| **ACP `session/load`** | No resume path, so a session cannot be restored mid-flight. Advertised as `false` rather than claimed. |
-| **Worktree-per-task execution** | Worktrees are implemented and tested; the orchestrator isolates by file ownership instead. Ownership is sufficient for correctness; worktrees would raise the achievable parallelism. |
-| **Write prediction quality** | Paths are guessed from a task's description, so an unpredictable task claims the whole workspace and over-serializes. Better prediction is the main lever on achievable parallelism. |
-| **Remote skill registries** | The `SkillRegistry` trait supports multiple backends; only built-in and local-directory registries exist. |
-| **OpenTelemetry export** | `tracing` is the substrate, so this is a subscriber change rather than an instrumentation change. |
-| **Benchmarks** | No measurements for routing, context selection or registry lookup. |
+| **Per-session workspaces in CUMA-as-ACP** | The `cwd` an editor sends is recorded and persisted, but the orchestrator works in the workspace it was started in. Serve from the project directory. |
+| **Client MCP servers in CUMA-as-ACP** | An editor's `mcp_servers` in `session/new` are not forwarded to the agents CUMA delegates to; only `[mcp.*]` servers marked `share_with_agents` are. |
+| **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. The task store is in memory, so a restart forgets tasks. CUMA never pauses for input, so multi-turn tasks are refused. |
+| **A2A authentication** | Outbound bearer tokens from a secret handle; no OAuth flows. The server does not authenticate callers — bind it to localhost or put it behind a proxy that does. |
+| **Binary agents from the ACP registry** | `cuma agents add` configures npx and uvx agents; binary distributions are described (URL, SHA-256) for a person to install. |
+| **Confining agents without ai-jail** | bubblewrap, firejail and `sandbox-exec` cannot confine an agent that needs its model API and its own credentials, so with only those installed agents run unconfined — and `cuma doctor` says so. |
+| **MCP connection reuse** | Each tool call launches the server, calls, and shuts it down. Correct and leak-free, slow for chatty tools; the ai-memory MCP backend pays this per recall. |
+| **Write prediction** | Grounded in a file index and dependency outputs, but still read from a task's description. A task naming no path claims the whole workspace, which is safe and serializing. |
+| **Skill revocation and pinning** | A trusted key cannot be revoked short of removing it from configuration, and git registries are not pinned to a commit in `installed.json`. |
+| **ACP per-turn token usage** | Read from `PromptResponse.usage`, which the ACP schema marks unstable; when absent, input comes from `UsageUpdate` and output is estimated, and the total is labelled estimated. |
+| **ratatui-bubbletea components** | The TUI is plain Ratatui; the Bubble Tea–style component crates were evaluated (see `DEPENDENCY_ANALYSIS.md`) and not adopted. |
 
 ## Later
 
-- CUMA as an A2A server
-- Remote skill registries and signature verification
-- OpenTelemetry export
-- Session reuse across tasks (ACP `session/load`)
-- Benchmarks for routing, context selection and registry lookup
+- Per-session workspaces, and forwarding an editor's MCP servers
+- A persistent A2A task store; push notifications
+- Pooled MCP connections
+- Commit-pinned skill installs and a key revocation list
 - A web interface, as another event-bus subscriber
