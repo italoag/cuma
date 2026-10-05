@@ -1,0 +1,11 @@
+# Third-party images the sandboxes use, mirrored to ghcr.io/italoag/<target>
+# by .github/workflows/sandbox-images.yml — for networks that can reach
+# ghcr.io but not the registries these come from. Pinned; bump deliberately.
+#
+# <source>                                                       <target>
+registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.5    cuma-agent-sandbox-controller:v1.0.5
+docker.io/opensandbox/execd:v1.1.0                               cuma-opensandbox-execd:v1.1.0
+docker.io/opensandbox/egress:v1.1.7                              cuma-opensandbox-egress:v1.1.7
+public.ecr.aws/docker/library/node:22-alpine3.22                 cuma-node:22-alpine3.22
+public.ecr.aws/docker/library/node:22-bookworm-slim              cuma-node:22-bookworm-slim
+public.ecr.aws/docker/library/alpine:3.22                        cuma-alpine:3.22

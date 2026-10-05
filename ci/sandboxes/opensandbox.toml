@@ -1,0 +1,40 @@
+# opensandbox-server configuration for the pipeline's live test: the Docker
+# runtime on the runner, bridge networking, sandboxes reached through the
+# server's proxy. @API_KEY@ is replaced at start-up.
+[server]
+host = "127.0.0.1"
+port = 8080
+api_key = "@API_KEY@"
+max_sandbox_timeout_seconds = 3600
+
+[proxy]
+resolve_internal = true
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+
+[storage]
+allowed_host_paths = []
+
+[store]
+type = "sqlite"
+path = "/tmp/opensandbox/opensandbox.db"
+
+[docker]
+network_mode = "bridge"
+port_range_min = 40000
+port_range_max = 60000
+no_new_privileges = true
+pids_limit = 4096
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns"
+readiness_timeout_seconds = 30.0

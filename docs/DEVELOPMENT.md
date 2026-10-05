@@ -106,6 +106,48 @@ Behaviour varies per attempt, which is what makes retry and fallback testable.
 
 **Every new failure mode gets a mock before it gets a handler.**
 
+### Live sandbox tests
+
+Each sandbox provider has a test that runs an ACP agent inside the real
+thing — `crates/cuma-sandbox/tests/live_<kind>.rs`. Without its variables a
+live test passes having done nothing, so `cargo test` never needs a sandbox.
+
+| Test | Needs | Variables |
+|---|---|---|
+| `live_docker` | a container engine | `CUMA_LIVE_DOCKER_IMAGE` |
+| `live_microsandbox` | `msb`; KVM or Apple Silicon | `CUMA_LIVE_MICROSANDBOX_IMAGE` |
+| `live_wasmer` | `wasmer` | `CUMA_LIVE_WASMER_PACKAGE` (`wasmer/bash`), `CUMA_LIVE_WASMER_PROGRAM` |
+| `live_agentos` | node, `@rivet-dev/agentos-core` | `CUMA_LIVE_AGENTOS_MODULES` (its `node_modules`) |
+| `live_kubernetes` | a cluster with agent-sandbox, `kubectl` | `CUMA_LIVE_KUBERNETES_IMAGE`, `…_NAMESPACE`, `…_CONTEXT` |
+| `live_opensandbox` | a running `opensandbox-server` | `CUMA_LIVE_OPENSANDBOX_URL`, `…_IMAGE`, `…_KEY_REF`, `CUMA_LIVE_CUMA_BIN` |
+| `live_e2b` | CubeSandbox or E2B | `CUMA_LIVE_E2B_API_URL`, `…_DOMAIN`, `…_TEMPLATE`, `…_KEY_REF`, `…_ENVD_SCHEME`, `CUMA_LIVE_CUMA_BIN` |
+| `live_arcbox` | ArcBox (`abctl`) | `CUMA_LIVE_ARCBOX_IMAGE`, `CUMA_LIVE_ARCBOX_PROGRAM` |
+| `live_firecracker` | Linux with KVM, e2fsprogs, python3 | `CUMA_LIVE_FIRECRACKER_KERNEL`, `…_ROOTFS`, `…_BIN` |
+
+Images need only `sh`, `sed` and `tar` (`node` too for OpenSandbox's stdio
+tunnel): `ci/sandboxes/images/sandbox-test` builds one.
+`ci/sandboxes/firecracker-assets.sh <dir>` fetches Firecracker and a kernel
+and builds a root filesystem with `cuma-init`. `*_KEY_REF` variables name the
+variable that holds a key, never the key; `CUMA_LIVE_CUMA_BIN` is the `cuma`
+the stdio bridge runs as (default `target/debug/cuma`).
+
+The [Sandboxes workflow](../.github/workflows/sandboxes.yml) runs every test
+on pull requests that touch the sandbox code, and by hand. Two jobs need
+self-hosted runners, and stay off until enabled:
+
+| Job | Runner labels | Repository settings |
+|---|---|---|
+| `arcbox` | `self-hosted, macOS, ARM64, arcbox` — Apple Silicon, ArcBox installed | variable `CUMA_ARCBOX_RUNNER=true`; optional `CUMA_ARCBOX_IMAGE` |
+| `cubesandbox` | `self-hosted, linux, X64, cubesandbox` — reaches a CubeSandbox deployment | variables `CUMA_CUBESANDBOX_RUNNER=true`, `CUMA_CUBE_API_URL`, `CUMA_CUBE_DOMAIN`, `CUMA_CUBE_TEMPLATE`, optional `CUMA_CUBE_ENVD_SCHEME`; secret `CUMA_CUBE_API_KEY` |
+
+Self-hosted jobs never run a pull request from a fork. The
+[Sandbox images workflow](../.github/workflows/sandbox-images.yml) publishes
+`ghcr.io/italoag/cuma-sandbox-test` and `ghcr.io/italoag/cuma-agent-node`, and
+mirrors `ci/sandboxes/mirror.txt` as `ghcr.io/italoag/cuma-*`. Check each
+package's visibility on GitHub after its first publication: a private one
+needs `docker login ghcr.io` wherever it is pulled. Lint workflows with
+`actionlint` (custom runner labels are declared in `.github/actionlint.yaml`).
+
 ## Adding things
 
 ### A protocol
