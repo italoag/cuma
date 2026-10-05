@@ -224,11 +224,14 @@ impl Execd<'_> {
     /// Upload `bytes` as `path`.
     async fn upload(&self, path: &str, bytes: &[u8], mode: u32) -> Result<()> {
         let boundary = format!("cuma-{}", uuid::Uuid::new_v4().simple());
-        let metadata = json!({ "path": path, "mode": mode }).to_string();
+        // execd reads the mode's decimal digits as octal: 0o644 is sent as 644.
+        let digits: u32 = format!("{mode:o}").parse().unwrap_or(644);
+        let metadata = json!({ "path": path, "mode": digits }).to_string();
         let mut body = Vec::with_capacity(bytes.len() + 512);
+        // Both parts are files to execd, the metadata included.
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\n\
                  Content-Type: application/json\r\n\r\n{metadata}\r\n\
                  --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload\"\r\n\
                  Content-Type: application/octet-stream\r\n\r\n"
@@ -951,7 +954,8 @@ mod tests {
         text.replace("/tmp/", &format!("{}/tmp/", fake.root.display()))
     }
 
-    fn multipart_parts(headers: &HeaderMap, body: &[u8]) -> HashMap<String, Vec<u8>> {
+    /// The parts of a multipart body, and which were sent as files.
+    fn multipart_parts(headers: &HeaderMap, body: &[u8]) -> HashMap<String, (bool, Vec<u8>)> {
         let ct = headers["content-type"].to_str().unwrap();
         let boundary = format!("--{}", ct.split("boundary=").nth(1).unwrap());
         let text = body;
@@ -975,7 +979,7 @@ mod tests {
                 .next()
                 .unwrap()
                 .to_owned();
-            parts.insert(name, content.to_vec());
+            parts.insert(name, (head.contains("filename="), content.to_vec()));
             rest = &rest[content_start + next..];
         }
         parts
@@ -1015,10 +1019,21 @@ mod tests {
                 post(|State(f): State<Fake>, headers: HeaderMap, body: Bytes| async move {
                     assert_eq!(headers["x-execd-access-token"], "t");
                     let parts = multipart_parts(&headers, &body);
-                    let metadata: Value = serde_json::from_slice(&parts["metadata"]).unwrap();
+                    // As execd: both parts are read as files, and the mode's
+                    // decimal digits as octal.
+                    let (Some((true, metadata)), Some((true, file))) =
+                        (parts.get("metadata"), parts.get("file"))
+                    else {
+                        return axum::http::StatusCode::BAD_REQUEST;
+                    };
+                    let metadata: Value = serde_json::from_slice(metadata).unwrap();
+                    let mode = metadata["mode"].as_u64().unwrap().to_string();
+                    if u32::from_str_radix(&mode, 8).is_err() {
+                        return axum::http::StatusCode::BAD_REQUEST;
+                    }
                     let path = rerooted(&f, metadata["path"].as_str().unwrap());
                     std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
-                    std::fs::write(&path, &parts["file"]).unwrap();
+                    std::fs::write(&path, file).unwrap();
                     axum::http::StatusCode::OK
                 }),
             )
