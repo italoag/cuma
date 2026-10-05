@@ -31,7 +31,8 @@ env:
   MICROSANDBOX_VERSION: 0.7.6
   WASMER_VERSION: v7.5.0
   AGENTOS_VERSION: 0.2.22
-  OPENSANDBOX_SERVER_VERSION: 1.1.0
+  # The PyPI wheel of 1.1.0 lacks a generated module; the image is whole.
+  OPENSANDBOX_SERVER_IMAGE: opensandbox/server:release-1.1.0
   FIRECRACKER_VERSION: v1.17.0
   TEST_IMAGE: cuma-sandbox-test:ci
 
@@ -169,9 +170,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sandboxes
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Serve the test image from a local registry
         run: |
           docker run -d --name registry -p 5000:5000 registry:2
@@ -179,15 +177,18 @@ jobs:
           docker push "$OPENSANDBOX_IMAGE"
       - name: Start opensandbox-server
         run: |
-          pip install "opensandbox-server==${OPENSANDBOX_SERVER_VERSION}"
-          mkdir -p /tmp/opensandbox
           sed "s/@API_KEY@/${OPENSANDBOX_API_KEY}/" ci/sandboxes/opensandbox.toml > "$RUNNER_TEMP/sandbox.toml"
-          nohup opensandbox-server --config "$RUNNER_TEMP/sandbox.toml" > "$RUNNER_TEMP/opensandbox.log" 2>&1 &
+          # Host networking: it serves on the runner's loopback and reaches
+          # the sandboxes it creates on Docker's bridge.
+          docker run -d --name opensandbox-server --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/sandbox.toml:/etc/opensandbox/config.toml:ro" \
+            "$OPENSANDBOX_SERVER_IMAGE"
           for _ in $(seq 90); do
             curl -fsS http://127.0.0.1:8080/health && exit 0
             sleep 2
           done
-          cat "$RUNNER_TEMP/opensandbox.log"
+          docker logs opensandbox-server
           exit 1
       - name: Build cuma (the stdio bridge)
         run: cargo build -p cuma-cli
@@ -200,7 +201,7 @@ jobs:
         run: cargo test -p cuma-sandbox --test live_opensandbox -- --nocapture
       - name: Server log on failure
         if: failure()
-        run: tail -300 "$RUNNER_TEMP/opensandbox.log" || true
+        run: docker logs --tail 300 opensandbox-server || true
 
   firecracker:
     name: firecracker (plugin)

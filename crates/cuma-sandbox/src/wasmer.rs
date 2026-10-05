@@ -57,7 +57,11 @@ impl WasmerProvider {
             prefix.extend(["-u".to_owned(), name]);
         }
         let workspace = crate::canonical(&request.workspace);
-        prefix.extend([self.settings.program.clone(), "run".to_owned()]);
+        // Resolved here: once `env` has removed PATH it has nothing to search.
+        let program = which::which(&self.settings.program)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| self.settings.program.clone());
+        prefix.extend([program, "run".to_owned()]);
         // A guest has no home of its own: state is seen where it lives.
         let home = dirs::home_dir()
             .map(|h| h.display().to_string())
@@ -168,7 +172,10 @@ mod tests {
         let prefix = provider().prefix(&request);
 
         assert_eq!(prefix[0], "env");
-        let run = prefix.iter().position(|w| w == "wasmer").unwrap();
+        let run = prefix
+            .iter()
+            .position(|w| w == "wasmer" || w.ends_with("/wasmer"))
+            .unwrap();
         assert_eq!(prefix[run + 1], "run");
         assert!(
             prefix
@@ -204,6 +211,26 @@ mod tests {
 
         let open = provider().prefix(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute));
         assert!(open.contains(&"--net".to_owned()));
+    }
+
+    #[test]
+    fn the_program_is_found_before_env_takes_path_away() {
+        let ws = tempfile::tempdir().unwrap();
+        let p = WasmerProvider::new(
+            "w",
+            WasmerSandbox {
+                // Any program on PATH stands in for wasmer.
+                program: "sh".into(),
+                ..WasmerSandbox::default()
+            },
+        );
+        let prefix = p.prefix(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute));
+        let run = prefix.iter().position(|w| w == "run").unwrap();
+        assert_eq!(
+            prefix[run - 1],
+            which::which("sh").unwrap().display().to_string()
+        );
+        assert!(prefix.windows(2).any(|w| w == ["-u", "PATH"]));
     }
 
     #[tokio::test]

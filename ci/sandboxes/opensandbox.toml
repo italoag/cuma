@@ -22,7 +22,7 @@ allowed_host_paths = []
 
 [store]
 type = "sqlite"
-path = "/tmp/opensandbox/opensandbox.db"
+path = "/tmp/opensandbox.db"
 
 [docker]
 network_mode = "bridge"

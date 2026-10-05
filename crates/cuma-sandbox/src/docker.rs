@@ -69,9 +69,22 @@ impl DockerProvider {
             ]
             .map(str::to_owned),
         );
+        // On Linux the container shares the host's permission checks, and
+        // without capabilities the image's root cannot write a workspace
+        // someone else owns: run as the workspace's owner, with a home of its
+        // own. Elsewhere the engine's VM maps ownership itself.
+        let owner = if s.user.is_none() {
+            workspace_owner(&request.workspace)
+        } else {
+            None
+        };
+        let user = s
+            .user
+            .clone()
+            .or_else(|| owner.map(|(uid, gid)| format!("{uid}:{gid}")));
         for (flag, value) in [
             ("--runtime", &s.runtime),
-            ("--user", &s.user),
+            ("--user", &user),
             ("--memory", &s.memory),
             ("--cpus", &s.cpus),
             ("--entrypoint", &s.entrypoint),
@@ -79,6 +92,14 @@ impl DockerProvider {
             if let Some(value) = value {
                 args.extend([flag.to_owned(), value.clone()]);
             }
+        }
+        if let Some((uid, gid)) = owner {
+            args.extend([
+                "--tmpfs".to_owned(),
+                format!("{}:rw,exec,uid={uid},gid={gid},mode=0700", s.home),
+                "-e".to_owned(),
+                format!("HOME={}", s.home),
+            ]);
         }
         for (host, guest) in writable_mounts(request, &s.home) {
             args.extend(["-v".to_owned(), format!("{host}:{guest}")]);
@@ -94,6 +115,20 @@ impl DockerProvider {
         args.push(s.image.clone());
         args
     }
+}
+
+/// Who owns the workspace, on Linux.
+#[cfg(target_os = "linux")]
+fn workspace_owner(workspace: &std::path::Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(workspace)
+        .ok()
+        .map(|meta| (meta.uid(), meta.gid()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn workspace_owner(_workspace: &std::path::Path) -> Option<(u32, u32)> {
+    None
 }
 
 #[async_trait]
@@ -243,6 +278,36 @@ mod tests {
             assert!(args.windows(2).any(|w| w == hardening), "{hardening:?}");
         }
         assert!(args.windows(2).any(|w| w == ["--name", "cuma-1"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_agent_runs_as_the_workspace_owner_with_a_home_of_its_own() {
+        use std::os::unix::fs::MetadataExt as _;
+        let ws = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(ws.path()).unwrap();
+        let request = LaunchRequest::bare(ws.path(), LaunchPurpose::Execute);
+
+        let args = provider(settings()).run_args("cuma-1", &request);
+
+        let owner = format!("{}:{}", meta.uid(), meta.gid());
+        assert!(args.windows(2).any(|w| w == ["--user", &owner]), "{args:?}");
+        let home = format!(
+            "/root:rw,exec,uid={},gid={},mode=0700",
+            meta.uid(),
+            meta.gid()
+        );
+        assert!(args.windows(2).any(|w| w == ["--tmpfs", &home]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-e", "HOME=/root"]));
+
+        // A configured user is the operator's choice, left alone.
+        let chosen = provider(DockerSandbox {
+            user: Some("1000:1000".into()),
+            ..settings()
+        })
+        .run_args("cuma-2", &request);
+        assert!(chosen.windows(2).any(|w| w == ["--user", "1000:1000"]));
+        assert!(!chosen.iter().any(|a| a == "--tmpfs"));
     }
 
     #[test]
