@@ -7,6 +7,9 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+/// "Text file busy", the same number on Linux and macOS.
+const ETXTBSY: i32 = 26;
+
 /// What a program reads on stdin.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Input<'a> {
@@ -78,9 +81,21 @@ pub(crate) async fn run(
         ),
     });
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| failure(sandbox, format!("cannot run {program}: {e}")))?;
+    // A program written just now can be "busy" for a moment: on Linux a fork
+    // elsewhere in this process briefly holds its write handle. Bounded.
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            spawned => {
+                break spawned
+                    .map_err(|e| failure(sandbox, format!("cannot run {program}: {e}")))?;
+            }
+        }
+    };
     if let (Input::Bytes(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
         stdin
             .write_all(bytes)
