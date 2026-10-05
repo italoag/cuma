@@ -30,7 +30,12 @@ out.flush()
 time.sleep(0.5)
 if select.select([0], [], [], 0)[0]:
     open(record + ".early", "w").write("input arrived before the guest was ready")
-out.write(b"CUMA-INIT-READY\n")
+# The sign and its line's end in separate reads, as a console delivers them
+# when it pleases: the end must not reach the agent as an empty line.
+out.write(b"CUMA-INIT-READY")
+out.flush()
+time.sleep(0.3)
+out.write(b"\r\n")
 out.flush()
 os.chdir(workspace)
 os.execvp(argv[0], argv)

@@ -424,7 +424,8 @@ impl OpenSandboxProvider {
             "entrypoint": ["tail", "-f", "/dev/null"],
             "resourceLimits": { "cpu": s.cpu, "memory": s.memory },
             "timeout": s.timeout_secs,
-            "metadata": { "name": format!("cuma {}", self.name) },
+            // Metadata values are labels: letters, digits, `-`, `_`, `.`.
+            "metadata": { "managed-by": "cuma", "cuma-sandbox": self.name },
         });
         if s.mount_workspace {
             let workspace = crate::canonical(&request.workspace);
@@ -883,6 +884,19 @@ mod tests {
         let body = provider.create_body(&request);
         assert_eq!(body["image"]["uri"], "node:22");
         assert_eq!(body["entrypoint"], json!(["tail", "-f", "/dev/null"]));
+        // The server holds metadata values to label syntax.
+        for value in body["metadata"].as_object().unwrap().values() {
+            let value = value.as_str().unwrap();
+            assert!(
+                value.len() <= 63
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                    && value.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && value.ends_with(|c: char| c.is_ascii_alphanumeric()),
+                "{value:?} is not a valid label value"
+            );
+        }
         assert_eq!(
             body["resourceLimits"],
             json!({ "cpu": "1", "memory": "2Gi" })

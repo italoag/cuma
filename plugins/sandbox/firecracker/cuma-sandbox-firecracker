@@ -171,12 +171,14 @@ def start_vm(session, options, image, workspace, argv):
 
 
 def wait_ready(vm, session):
-    """Discard the console until cuma-init says it is ready; return what
-    followed the sign. The boot is kept only to explain a failure."""
+    """Discard the console until cuma-init's ready line has ended; return
+    what followed it. The line's end may arrive in a later read than the
+    sign itself, and must not reach the agent's reader as an empty line.
+    The boot is kept only to explain a failure."""
     fd = vm.stdout.fileno()
     seen = b""
     deadline = time.monotonic() + BOOT_TIMEOUT
-    while READY not in seen:
+    while READY not in seen or b"\n" not in seen.split(READY, 1)[1]:
         remaining = deadline - time.monotonic()
         readable = select.select([fd], [], [], max(remaining, 0))[0] if remaining > 0 else []
         chunk = os.read(fd, 65536) if readable else b""
@@ -191,7 +193,7 @@ def wait_ready(vm, session):
             tail = seen[-2000:].decode(errors="replace")
             fail(f"the VM did not start the agent: {'timed out' if readable == [] else 'it stopped'}\n{tail}\n{log}")
         seen = (seen + chunk)[-1_000_000:]
-    return seen.split(READY, 1)[1].lstrip(b"\r\n")
+    return seen.split(READY, 1)[1].split(b"\n", 1)[1]
 
 
 def probe():
