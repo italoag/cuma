@@ -92,6 +92,12 @@ impl Config {
             self.mcp.insert(name, server);
         }
 
+        // --- sandboxes ----------------------------------------------------
+        // Keyed like agents: redefining one replaces that one.
+        for (name, sandbox) in other.sandboxes {
+            self.sandboxes.insert(name, sandbox);
+        }
+
         // --- memory -------------------------------------------------------
         merge_field!(self.memory.enabled, other.memory.enabled, d.memory.enabled);
         merge_field!(self.memory.backend, other.memory.backend, d.memory.backend);
@@ -164,6 +170,11 @@ impl Config {
             self.security.require_agent_sandbox,
             other.security.require_agent_sandbox,
             d.security.require_agent_sandbox
+        );
+        merge_field!(
+            self.security.agent_sandbox,
+            other.security.agent_sandbox,
+            d.security.agent_sandbox
         );
         merge_collection!(
             self.security.trusted_workspaces,

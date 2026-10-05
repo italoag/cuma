@@ -220,16 +220,9 @@ pub fn descriptors_from_config(config: &cuma_config::Config) -> Result<Vec<Agent
             }
         };
 
-        let capabilities: cuma_core::CapabilitySet = agent_config
-            .capabilities
-            .iter()
-            .map(|c| cuma_core::Capability::parse(c))
-            .collect();
-
-        let mut descriptor = AgentDescriptor::new(id.as_str(), id.as_str(), protocol)
-            .with_capabilities(capabilities);
+        let mut descriptor = AgentDescriptor::new(id.as_str(), id.as_str(), protocol);
         descriptor.enabled = agent_config.enabled;
-        descriptor.metadata = agent_config.metadata.clone();
+        agent_config.apply_to(&mut descriptor);
 
         if let Some(command) = &agent_config.command {
             descriptor
@@ -250,14 +243,6 @@ pub fn descriptors_from_config(config: &cuma_config::Config) -> Result<Vec<Agent
             // an already-logged-in CLI without ever seeing a credential.
             None => cuma_core::AgentAuth::AgentManaged,
         };
-
-        for model_name in &agent_config.models {
-            descriptor.models.push(cuma_core::ModelDescriptor::minimal(
-                descriptor.id.clone(),
-                model_name.as_str(),
-                model_name.as_str(),
-            ));
-        }
 
         agents.push(descriptor);
     }

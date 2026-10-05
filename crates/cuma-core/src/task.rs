@@ -491,7 +491,7 @@ impl TaskGraph {
             .collect();
 
         // Stable sort: priority decides, insertion order breaks ties.
-        ready.sort_by(|a, b| b.spec.priority.cmp(&a.spec.priority));
+        ready.sort_by_key(|t| std::cmp::Reverse(t.spec.priority));
         ready
     }
 

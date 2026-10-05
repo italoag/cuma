@@ -153,11 +153,12 @@ Every command takes `--json`, for CI and for other agents.
 | [Memory](docs/MEMORY.md) | Shared long-term memory |
 | [Skills](docs/SKILLS.md) | Discovery, validation, installation |
 | [Security](docs/SECURITY.md) | Threat model and posture |
+| [Sandboxes](docs/SANDBOXES.md) | Choosing where agents run: native, container, microVM, Wasm, Kubernetes, remote — and the plan |
 | [Observability](docs/OBSERVABILITY.md) | Events, logs, usage |
 | [Configuration](docs/CONFIGURATION.md) | Every setting |
 | [Development](docs/DEVELOPMENT.md) | Working on CUMA |
 | [Roadmap](docs/ROADMAP.md) | What is built and what is not |
-| [ADRs](docs/adr/) | Seventeen decisions, with their costs |
+| [ADRs](docs/adr/) | Eighteen decisions, with their costs |
 
 On the transformation from the previous product:
 [current architecture](CURRENT_ARCHITECTURE.md) ·
@@ -180,7 +181,7 @@ apparatus.
 
 ## Status
 
-746 tests, clippy clean with warnings denied, checked on the MSRV. Verified
+840 tests, clippy clean with warnings denied, checked on the MSRV. Verified
 against a live ACP agent; against the real ACP client SDK driving CUMA as an
 agent (including concurrent sessions, cancellation and reload); against
 scripted A2A peers in both dialects over real HTTP and SSE; and against a real
@@ -189,7 +190,8 @@ MCP client.
 Known gaps are listed in the [roadmap](docs/ROADMAP.md), which distinguishes
 what is done from what is not. The main ones: an editor's own MCP servers are
 not forwarded to the agents behind CUMA-as-ACP, A2A authentication is bearer
-tokens only, and only ai-jail can hold agents to a network allowlist.
+tokens only, and of the sandbox providers docker, microsandbox, wasmer and
+agentOS have been exercised against the real thing so far.
 
 ## History
 

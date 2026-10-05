@@ -15,6 +15,7 @@ use crate::task::{ExecutionOutcome, Task, TaskGraph};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Everything an adapter needs to execute one task.
 ///
@@ -373,6 +374,104 @@ pub trait SecretStore: Send + Sync {
     async fn set(&self, handle: &str, value: &str) -> Result<()>;
 }
 
+/// Why an agent is being launched.
+///
+/// A launch that only negotiates capabilities reads no files and writes none,
+/// so a sandbox holding a copy of the workspace skips both copies for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPurpose {
+    /// Capability negotiation only.
+    Negotiate,
+    /// A task.
+    Execute,
+}
+
+/// A sandbox prepared for one launch of an agent.
+///
+/// The agent's command runs after [`prefix`](Self::prefix). A sandbox with a
+/// lifecycle of its own carries a [`SandboxSession`]: [`finish`](Self::finish)
+/// the launch once the agent has exited. Dropping an unfinished launch aborts
+/// it — the sandbox is torn down and nothing is brought back — which is what a
+/// timeout or a cancellation needs.
+pub struct SandboxLaunch {
+    prefix: Vec<String>,
+    session: Option<Arc<dyn SandboxSession>>,
+}
+
+impl SandboxLaunch {
+    /// A launch that is a prefix and nothing more.
+    pub fn new(prefix: Vec<String>) -> Self {
+        Self {
+            prefix,
+            session: None,
+        }
+    }
+
+    /// A launch whose sandbox must be finished or aborted.
+    pub fn with_session(prefix: Vec<String>, session: Arc<dyn SandboxSession>) -> Self {
+        Self {
+            prefix,
+            session: Some(session),
+        }
+    }
+
+    /// The words the agent's command runs after.
+    pub fn prefix(&self) -> &[String] {
+        &self.prefix
+    }
+
+    /// Whether finishing this launch does anything.
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// The agent has exited: bring its work back and tear the sandbox down.
+    pub async fn finish(mut self) -> Result<()> {
+        match self.session.take() {
+            Some(session) => session.finish().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SandboxLaunch {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { session.abort().await });
+            }
+            Err(_) => tracing::warn!(
+                "a sandbox launch was abandoned outside an async runtime; its sandbox may be left running"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for SandboxLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxLaunch")
+            .field("prefix", &self.prefix)
+            .field("session", &self.session.is_some())
+            .finish()
+    }
+}
+
+/// The lifecycle of one sandbox launch.
+#[async_trait]
+pub trait SandboxSession: Send + Sync {
+    /// The agent has exited. Bring its work back where the sandbox holds a
+    /// copy of the workspace, then tear the sandbox down — even when bringing
+    /// the work back failed.
+    async fn finish(&self) -> Result<()>;
+
+    /// The launch was abandoned. Tear the sandbox down, bringing nothing back.
+    async fn abort(&self);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -392,6 +491,66 @@ mod tests {
         assert_object_safe::<dyn SkillRegistry>();
         assert_object_safe::<dyn LlmProvider>();
         assert_object_safe::<dyn SecretStore>();
+        assert_object_safe::<dyn SandboxSession>();
+    }
+
+    struct Counting {
+        finished: std::sync::atomic::AtomicUsize,
+        aborted: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SandboxSession for Counting {
+        async fn finish(&self) -> Result<()> {
+            self.finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn abort(&self) {
+            self.aborted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counting() -> Arc<Counting> {
+        Arc::new(Counting {
+            finished: 0.into(),
+            aborted: 0.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_finished_launch_is_not_also_aborted() {
+        let session = counting();
+        let launch = SandboxLaunch::with_session(vec!["sb".into()], session.clone());
+        launch.finish().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            session.finished.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(session.aborted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_launch_tears_its_sandbox_down() {
+        let session = counting();
+        drop(SandboxLaunch::with_session(
+            vec!["sb".into()],
+            session.clone(),
+        ));
+        for _ in 0..50 {
+            if session.aborted.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(session.aborted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            session.finished.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]

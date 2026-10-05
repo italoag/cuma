@@ -4,13 +4,13 @@ What is built, how it is verified, and what comes next.
 
 ## Current state
 
-746 tests passing across 20 crates. Clippy clean with warnings denied;
+840 tests passing across 21 crates. Clippy clean with warnings denied;
 checked on the MSRV (1.88) with and without the `otel` feature. Verified
 against a live ACP agent.
 
 ```
 $ cargo test --workspace
-PASSING: 746 | FAILING: 0
+PASSING: 840 | FAILING: 0
 ```
 
 ## Verification, by concern

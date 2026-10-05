@@ -144,6 +144,15 @@ impl A2aAdapter {
         self
     }
 
+    /// Seed the adapter with a configured descriptor.
+    #[must_use]
+    pub fn with_descriptor(self, descriptor: AgentDescriptor) -> Self {
+        if let Ok(mut guard) = self.descriptor.try_lock() {
+            *guard = descriptor;
+        }
+        self
+    }
+
     /// The endpoint this adapter was configured with.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -414,7 +423,10 @@ impl A2aAdapter {
 
         let mut descriptor = self.descriptor.lock().await;
         descriptor.name = card.name.clone();
-        descriptor.capabilities = capabilities_from_card(&card);
+        // Added to what the operator configured, never in place of it.
+        descriptor
+            .capabilities
+            .extend(capabilities_from_card(&card).iter().cloned());
         descriptor
             .metadata
             .insert("endpoint".to_owned(), self.endpoint.clone());
@@ -1078,6 +1090,10 @@ impl A2aDiscovery {
 
             match A2aAdapter::new(id.as_str(), endpoint.clone()) {
                 Ok(mut adapter) => {
+                    let mut descriptor =
+                        AgentDescriptor::new(id.as_str(), id.as_str(), AgentProtocol::A2A);
+                    agent_config.apply_to(&mut descriptor);
+                    adapter = adapter.with_descriptor(descriptor);
                     if let Some(handle) = &agent_config.auth_secret_ref {
                         adapter = adapter.with_auth_handle(handle.clone());
                     }
@@ -1317,5 +1333,28 @@ mod tests {
         assert_eq!(descriptors.len(), 1);
         assert!(!descriptors[0].is_routable());
         assert!(descriptors[0].health.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_agent_keeps_what_the_operator_configured() {
+        let config = cuma_config::Config::from_toml(
+            r#"
+            [agents.architect]
+            protocol = "a2a"
+            endpoint = "https://127.0.0.1:1/a2a"
+            capabilities = ["architecture"]
+            models = ["opus"]
+            "#,
+        )
+        .unwrap();
+
+        let descriptors = A2aDiscovery::new(config).discover().await.unwrap();
+        assert!(
+            descriptors[0]
+                .capabilities
+                .contains(&cuma_core::Capability::Architecture)
+        );
+        assert_eq!(descriptors[0].models.len(), 1);
+        assert_eq!(descriptors[0].protocol, AgentProtocol::A2A);
     }
 }

@@ -15,9 +15,12 @@ thiserror.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 futures.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

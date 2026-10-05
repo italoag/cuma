@@ -16,12 +16,14 @@
 mod env;
 mod merge;
 mod model;
+pub mod sandbox;
 
 pub use model::{
     AgentConfig, Config, LimitsConfig, McpServerSettings, MemoryConfig, RouterConfig,
     RouterWeights, RoutingStrategy, RtkConfig, RtkMode, SecurityConfig, SkillAutoInstall,
     SkillsConfig, TaskIsolation, TelemetryConfig,
 };
+pub use sandbox::SandboxSettings;
 
 use cuma_core::error::{MetaAgentError, Result};
 use std::path::{Path, PathBuf};
@@ -94,9 +96,26 @@ impl Config {
     }
 }
 
-/// `~/.config/cuma/config.toml`, when a home directory exists.
+/// `~/.config/cuma/config.toml`, or under `$XDG_CONFIG_HOME` when it is set.
+///
+/// The same on macOS as on Linux, as documented: `dirs::config_dir` would put
+/// it in `~/Library/Application Support` there, where nobody reading the
+/// documentation would look. Windows keeps its own convention.
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("cuma").join("config.toml"))
+    #[cfg(windows)]
+    let base = dirs::config_dir();
+    #[cfg(not(windows))]
+    let base = config_home(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir());
+    base.map(|dir| dir.join("cuma").join("config.toml"))
+}
+
+/// `$XDG_CONFIG_HOME` when it is absolute — the XDG specification ignores a
+/// relative one — and `~/.config` otherwise.
+#[cfg(not(windows))]
+fn config_home(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home.map(|home| home.join(".config")))
 }
 
 /// Expand a leading `~` to the home directory.
@@ -125,6 +144,30 @@ mod tests {
         assert_eq!(expand_home("~/code"), home.join("code"));
         assert_eq!(expand_home("~other/code"), PathBuf::from("~other/code"));
         assert_eq!(expand_home("/abs/~/x"), PathBuf::from("/abs/~/x"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_global_config_is_under_dot_config_on_macos_as_on_linux() {
+        let home = PathBuf::from("/Users/someone");
+        assert_eq!(
+            config_home(None, Some(home.clone())),
+            Some(home.join(".config"))
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_absolute_xdg_config_home_wins_and_a_relative_one_is_ignored() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(
+            config_home(Some("/srv/config".into()), Some(home.clone())),
+            Some(PathBuf::from("/srv/config"))
+        );
+        assert_eq!(
+            config_home(Some("relative".into()), Some(home.clone())),
+            Some(home.join(".config"))
+        );
     }
 
     #[test]

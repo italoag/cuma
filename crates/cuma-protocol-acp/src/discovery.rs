@@ -26,6 +26,8 @@ pub struct AcpConfigDiscovery {
     mcp_servers: Vec<crate::SharedMcpServer>,
     /// A sandbox launcher every discovered agent is started under.
     launcher: Option<Arc<dyn crate::AgentLauncher>>,
+    /// Launchers for particular agents, in place of `launcher`.
+    agent_launchers: std::collections::BTreeMap<String, Arc<dyn crate::AgentLauncher>>,
     kept_env: Vec<String>,
 }
 
@@ -37,6 +39,7 @@ impl AcpConfigDiscovery {
             require_launchable: true,
             mcp_servers: Vec::new(),
             launcher: None,
+            agent_launchers: std::collections::BTreeMap::new(),
             kept_env: Vec::new(),
         }
     }
@@ -45,6 +48,13 @@ impl AcpConfigDiscovery {
     #[must_use]
     pub fn with_launcher(mut self, launcher: Arc<dyn crate::AgentLauncher>) -> Self {
         self.launcher = Some(launcher);
+        self
+    }
+
+    /// Start agent `id` through `launcher`, whatever the others use.
+    #[must_use]
+    pub fn with_launcher_for(mut self, id: &str, launcher: Arc<dyn crate::AgentLauncher>) -> Self {
+        self.agent_launchers.insert(id.to_owned(), launcher);
         self
     }
 
@@ -90,10 +100,16 @@ impl AcpConfigDiscovery {
                 continue;
             };
 
+            // What the operator stated about the agent, kept through
+            // negotiation and in its place when negotiation fails.
+            let mut descriptor = AgentDescriptor::new(id.as_str(), id.as_str(), AgentProtocol::Acp);
+            agent_config.apply_to(&mut descriptor);
+
             let adapter = AcpAdapter::new(id.as_str(), command)
+                .with_descriptor(descriptor)
                 .with_mcp_servers(self.mcp_servers.clone())
                 .with_kept_env(self.kept_env.clone());
-            let adapter = match &self.launcher {
+            let adapter = match self.agent_launchers.get(id).or(self.launcher.as_ref()) {
                 Some(launcher) => adapter.with_launcher(Arc::clone(launcher)),
                 None => adapter,
             };
@@ -153,6 +169,7 @@ impl AgentDiscovery for AcpConfigDiscovery {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use cuma_core::Capability;
 
     fn config(toml: &str) -> Config {
         Config::from_toml(toml).expect("test config should parse")
@@ -222,5 +239,64 @@ mod tests {
         let discovery = AcpConfigDiscovery::new(Config::default());
         assert_eq!(discovery.source_name(), "acp-config");
         assert!(discovery.discover().await.unwrap().is_empty());
+    }
+
+    /// The minimal ACP agent fixture, configured with `documentation` and a
+    /// model, or `None` without python3.
+    fn minimal_agent() -> Option<Config> {
+        which::which("python3").ok()?;
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/minimal_agent.py"
+        );
+        let mut config = Config::default();
+        config.agents.insert(
+            "minimal".into(),
+            cuma_config::AgentConfig {
+                command: Some(shell_words::join(["python3", script])),
+                capabilities: vec!["documentation".into()],
+                models: vec!["house-model".into()],
+                ..cuma_config::AgentConfig::default()
+            },
+        );
+        Some(config)
+    }
+
+    #[tokio::test]
+    async fn negotiation_adds_the_acp_baseline_to_what_the_operator_configured() {
+        let Some(config) = minimal_agent() else {
+            return;
+        };
+        let adapter = AcpConfigDiscovery::new(config).adapters().remove(0);
+
+        let descriptor = adapter.refresh_capabilities().await.unwrap();
+
+        assert_eq!(descriptor.name, "minimal", "named by the agent itself");
+        assert!(
+            descriptor.capabilities.contains(&Capability::CodeEditing),
+            "negotiated"
+        );
+        assert!(
+            descriptor.capabilities.contains(&Capability::Documentation),
+            "configured, and beyond what ACP can say"
+        );
+        assert_eq!(descriptor.models.len(), 1, "ACP enumerates no models");
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_fails_to_start_keeps_what_the_operator_configured() {
+        let discovery = AcpConfigDiscovery::new(config(
+            "[agents.broken]\nprotocol = \"acp\"\ncommand = \"false\"\ncapabilities = [\"documentation\"]\n",
+        ));
+
+        let descriptors = discovery.discover().await.unwrap();
+
+        assert_eq!(descriptors.len(), 1);
+        assert!(!descriptors[0].is_routable());
+        assert!(
+            descriptors[0]
+                .capabilities
+                .contains(&Capability::Documentation)
+        );
     }
 }

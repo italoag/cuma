@@ -102,8 +102,12 @@ generated skill is `Untrusted`, installed disabled, and cannot be enabled.
 ### Agents themselves
 
 A coding agent runs shell commands of its own, so with `security.sandbox` on
-(the default) every ACP agent is launched inside a sandbox. The profile is
-ai-jail's, whichever runtime renders it:
+(the default) every ACP agent is launched inside a sandbox: its own `sandbox`,
+else `security.agent_sandbox`. By default (`auto`) that is the native profile
+below; containers, microVMs, WebAssembly, Kubernetes and remote sandboxes are
+providers the operator chooses — see [Other sandboxes](#other-sandboxes) and
+[SANDBOXES.md](SANDBOXES.md). The native profile is ai-jail's, whichever
+runtime renders it:
 
 | | |
 |---|---|
@@ -123,7 +127,7 @@ it succeeds here:
 
 | Runtime | Platform | Notes |
 |---|---|---|
-| ai-jail | Linux, macOS | The only one that filters the network by host (`--allow-host` from `security.network_allowlist`). |
+| ai-jail | Linux, macOS | The only one that filters the network by host (`--allow-host` from `security.network_allowlist`). Run with `--clean --no-save-config`: a repository's `.ai-jail` cannot reshape the profile, and none is written into the workspace. Probed by running `true` inside a jail, not by asking its version. |
 | bubblewrap | Linux | `--tmpfs $HOME`, dotdirs bound back; `--die-with-parent`, `--new-session`, pid/uts/ipc namespaces. |
 | `sandbox-exec` | macOS | A Seatbelt profile: writes denied except where listed, hidden paths denied outright. |
 | firejail | Linux | `--read-only=/` with writable exceptions, credentials blacklisted, capabilities dropped. `/tmp` stays shared. |
@@ -132,13 +136,48 @@ Under any runtime other than ai-jail, a non-empty `security.network_allowlist`
 cannot be enforced; `cuma doctor` says so instead of ignoring it. With no
 runtime at all, agents run **unconfined** and `cuma doctor` reports it as a
 problem. `security.require_agent_sandbox = true` refuses to run local agents in
-either case. `security.agent_writable_paths` adds places an agent may write.
+either case. `security.agent_writable_paths` adds places any agent may write;
+an agent's own `state` adds the directories that agent keeps its login in, and
+its `env` the variables it needs — so an agent no preset knows can be confined
+without losing its login. Naming a runtime (`agent_sandbox = "sandbox-exec"`)
+uses that one or none, never another.
 
 Checked on Linux with a probe agent run through CUMA: unconfined, it could read
 `~/.ssh`, see a secret from CUMA's environment and write `/etc`; under
 bubblewrap and firejail it could do none of those, while its workspace, its own
 state, a forwarded variable and `git` — in a worktree too — worked. The macOS
 profile is covered by unit tests only.
+
+### Other sandboxes
+
+The providers in [SANDBOXES.md](SANDBOXES.md) keep the same commitments:
+
+- **No secret on a command line.** Variables are forwarded by name (`docker -e
+  NAME`), declared as secrets substituted outside the guest (`msb --secret
+  NAME@host`), sent in an API request, or written to a mode-0600 file inside
+  the sandbox and destroyed with it. A remote API key is a handle
+  (`api_key_ref`). A remote sandbox's access token lives in a mode-0600
+  session file, never in the bridge's arguments.
+- **Only what was granted.** A guest sees the workspace (mounted at its own
+  path, or a copy), a worktree's git directory, the paths its command names
+  and, when mounted, the agent's `state` — never the host's system
+  directories, so a guest cannot be handed a host binary in place of its own.
+- **Nothing overwritten silently.** A copied workspace comes back through a
+  file-level three-way merge: a file the agent changed that was also changed
+  here is a conflict, nothing is applied, the task fails, and the sandbox's
+  copy is kept under `.cuma/sandbox-results/`. Paths that would leave the
+  workspace — through `..` or a symbolic link — are refused before anything is
+  written. `.git` is never merged back.
+- **Never outlived.** A launch's sandbox is torn down after the turn, and
+  when the turn is abandoned (timeout, cancellation) the dropped launch tears
+  it down too. Kubernetes, ArcBox, e2b and OpenSandbox sandboxes also carry a
+  lifetime, so a sandbox CUMA could not reach is reaped anyway.
+- **Enforced or reported.** A network allowlist is enforced by ai-jail,
+  microsandbox, Wasmer and OpenSandbox; under any other provider `cuma doctor`
+  reports it as not enforced, and `require_agent_sandbox` refuses the agent.
+- **Configuration is code.** A sandbox section names programs to run, so it
+  is subject to the same trust rule as agents: a project's `.cuma/config.toml`
+  applies only in a trusted workspace.
 
 ### Writers colliding
 
@@ -179,8 +218,9 @@ Stated rather than implied:
 | Gap | Status |
 |---|---|
 | Agents with no sandbox runtime installed | Unconfined; reported by `cuma doctor`, refused under `security.require_agent_sandbox`. |
-| Network allowlist without ai-jail | Not enforced; reported by `cuma doctor`. |
+| Network allowlist under a sandbox that cannot filter by host | Not enforced (bubblewrap, `sandbox-exec`, firejail, docker, arcbox, kubernetes, e2b, command); reported by `cuma doctor`, refused under `security.require_agent_sandbox`. |
 | macOS confinement | The `sandbox-exec` profile is unit-tested, not exercised on macOS here. |
+| Sandbox providers exercised live | docker, microsandbox, wasmer and the agentOS plugin were; arcbox, kubernetes, e2b, opensandbox and the Firecracker plugin are tested against their documented interfaces and local stand-ins. See [SANDBOXES.md](SANDBOXES.md#phase-3--live-verification-in-progress). |
 | Command allowlist | `CommandGuard` screens commands CUMA prepares itself. Agents run their own shell commands, which only a sandbox or the agent's own permission prompts can constrain. |
 | A2A authentication | Bearer tokens only; no OAuth or mTLS. |
 | Skill key revocation | Remove the key from configuration. |

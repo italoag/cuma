@@ -17,6 +17,8 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentConfig>,
     /// MCP servers, keyed by name.
     pub mcp: BTreeMap<String, McpServerSettings>,
+    /// Agent sandbox providers, keyed by name.
+    pub sandboxes: BTreeMap<String, crate::sandbox::SandboxSettings>,
     /// Long-term memory backend.
     pub memory: MemoryConfig,
     /// Output-reduction proxy.
@@ -88,6 +90,47 @@ impl Config {
             )));
         }
 
+        self.validate_sandboxes()
+    }
+
+    /// Sandbox entries, and every reference to one.
+    fn validate_sandboxes(&self) -> Result<()> {
+        use crate::sandbox::{check_sandbox_name, is_env_name, is_known_sandbox};
+
+        for (name, sandbox) in &self.sandboxes {
+            check_sandbox_name(name)?;
+            sandbox.validate(name)?;
+        }
+
+        let unknown = |key: String, name: &str| {
+            Err(MetaAgentError::Configuration(format!(
+                "{key} = {name:?} is neither auto, a native runtime \
+                 (ai-jail, bubblewrap, sandbox-exec, firejail) nor a [sandboxes.{name}] section"
+            )))
+        };
+        if !is_known_sandbox(&self.security.agent_sandbox, &self.sandboxes) {
+            return unknown(
+                "security.agent_sandbox".to_owned(),
+                &self.security.agent_sandbox,
+            );
+        }
+        for (id, agent) in &self.agents {
+            if let Some(name) = &agent.sandbox
+                && !is_known_sandbox(name, &self.sandboxes)
+            {
+                return unknown(format!("agents.{id}.sandbox"), name);
+            }
+            if agent.state.iter().any(|path| path.trim().is_empty()) {
+                return Err(MetaAgentError::Configuration(format!(
+                    "agents.{id}.state has an empty path"
+                )));
+            }
+            if let Some(name) = agent.env.iter().find(|name| !is_env_name(name)) {
+                return Err(MetaAgentError::Configuration(format!(
+                    "agents.{id}.env: {name:?} is not a variable name; list names, never values"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -275,7 +318,7 @@ pub struct AgentConfig {
     pub command: Option<String>,
     /// Endpoint URL, for A2A agents.
     pub endpoint: Option<String>,
-    /// Capabilities to assume when the agent does not advertise any.
+    /// Capabilities the agent has beyond what it advertises.
     pub capabilities: Vec<String>,
     /// Models to assume when the agent does not enumerate them.
     pub models: Vec<String>,
@@ -283,6 +326,15 @@ pub struct AgentConfig {
     pub auth_secret_ref: Option<String>,
     /// Adapter-specific extras.
     pub metadata: BTreeMap<String, String>,
+    /// The sandbox this agent runs under, overriding
+    /// `security.agent_sandbox`: `auto`, a native runtime, or the name of a
+    /// `[sandboxes.<name>]` section.
+    pub sandbox: Option<String>,
+    /// Directories the agent keeps between runs — its login, its sessions —
+    /// which stay writable inside its sandbox. `~` is expanded.
+    pub state: Vec<String>,
+    /// Variables the agent needs, by name, forwarded into its sandbox.
+    pub env: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -296,6 +348,38 @@ impl Default for AgentConfig {
             models: Vec::new(),
             auth_secret_ref: None,
             metadata: BTreeMap::new(),
+            sandbox: None,
+            state: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Add what the operator stated about this agent to `descriptor`.
+    ///
+    /// Stated capabilities are added to the advertised ones, not used only in
+    /// their absence: ACP negotiates protocol features rather than the kind of
+    /// work an agent is good at, so anything beyond an ACP agent's baseline —
+    /// research, documentation, architecture — can only come from here.
+    pub fn apply_to(&self, descriptor: &mut cuma_core::AgentDescriptor) {
+        descriptor.capabilities.extend(
+            self.capabilities
+                .iter()
+                .map(|c| cuma_core::Capability::parse(c)),
+        );
+        for model in &self.models {
+            if descriptor.model(&model.as_str().into()).is_none() {
+                let agent = descriptor.id.clone();
+                descriptor.models.push(cuma_core::ModelDescriptor::minimal(
+                    agent,
+                    model.as_str(),
+                    model.as_str(),
+                ));
+            }
+        }
+        for (key, value) in &self.metadata {
+            descriptor.metadata.insert(key.clone(), value.clone());
         }
     }
 }
@@ -487,6 +571,10 @@ pub struct SecurityConfig {
     /// Off by default so a machine with no sandbox still works; `cuma doctor`
     /// reports unconfined agents either way.
     pub require_agent_sandbox: bool,
+    /// The sandbox agents run under unless they name their own: `auto` (the
+    /// native runtimes, in order), one native runtime, or the name of a
+    /// `[sandboxes.<name>]` section. See `docs/SANDBOXES.md`.
+    pub agent_sandbox: String,
     /// Directories whose own `.cuma/config.toml` is applied when an editor
     /// opens a session there over ACP. `~` is expanded; subdirectories count.
     ///
@@ -516,6 +604,7 @@ impl Default for SecurityConfig {
             agent_env: Vec::new(),
             agent_writable_paths: Vec::new(),
             require_agent_sandbox: false,
+            agent_sandbox: crate::sandbox::AUTO.to_owned(),
             trusted_workspaces: Vec::new(),
             a2a_server_token_refs: Vec::new(),
         }
@@ -745,5 +834,39 @@ mod tests {
         assert!(!config.skills.allow_creation);
         assert!(config.security.sandbox);
         assert_eq!(config.skills.auto_install, SkillAutoInstall::TrustedOnly);
+    }
+
+    #[test]
+    fn what_an_operator_states_about_an_agent_adds_to_what_it_advertises() {
+        use cuma_core::{AgentDescriptor, AgentProtocol, Capability, CapabilitySet};
+
+        let config = Config::from_toml(
+            r#"
+            [agents.codex]
+            capabilities = ["documentation", "research"]
+            models = ["gpt-x"]
+            metadata = { team = "platform" }
+            "#,
+        )
+        .unwrap();
+        let mut descriptor = AgentDescriptor::new("codex", "codex", AgentProtocol::Acp)
+            .with_capabilities(CapabilitySet::new().with(Capability::CodeEditing));
+
+        config.agents["codex"].apply_to(&mut descriptor);
+        config.agents["codex"].apply_to(&mut descriptor);
+
+        for capability in [
+            Capability::CodeEditing,
+            Capability::Documentation,
+            Capability::Research,
+        ] {
+            assert!(
+                descriptor.capabilities.contains(&capability),
+                "{capability}"
+            );
+        }
+        assert_eq!(descriptor.models.len(), 1, "applied twice, listed once");
+        assert_eq!(descriptor.models[0].id.as_str(), "gpt-x");
+        assert_eq!(descriptor.metadata["team"], "platform");
     }
 }

@@ -50,6 +50,7 @@ cuma run "implement OAuth and fix the tests"
 | `cuma-protocol-mcp` | MCP tools | core, config, rmcp |
 | `cuma-server-acp` | CUMA *as* an ACP agent | core, orchestrator, ACP SDK |
 | `cuma-workspace` | Ownership, checkpoints, worktrees, sandbox, RTK | core, config |
+| `cuma-sandbox` | Agent sandbox providers: native, container, microVM, Wasm, Kubernetes, remote, plugins | core, config, workspace |
 | `cuma-providers` | `LlmProvider` implementations, secret stores | core, config |
 | `cuma-testkit` | Mock agents | core |
 | `cuma-tui` | View model and rendering | core, orchestrator |

@@ -7,6 +7,7 @@ use cuma_orchestrator::Orchestrator;
 use cuma_planner::HeuristicPlanner;
 use cuma_protocol_a2a::A2aDiscovery;
 use cuma_protocol_acp::AcpConfigDiscovery;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -141,15 +142,21 @@ pub fn apply_cli_overrides(
     config.validate()
 }
 
+/// The subscriber every output layer sits on: the registry, behind the level
+/// filter.
+type Filtered =
+    tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// One output layer: log lines, or exported spans.
+type OutputLayer = Box<dyn tracing_subscriber::Layer<Filtered> + Send + Sync>;
+
 /// Set up logging.
 ///
 /// `--json` switches to structured output, which is what CI and other agents
 /// want; a human at a terminal gets the readable formatter.
 pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    use tracing_subscriber::{EnvFilter, Registry};
 
     let level = match verbosity {
         0 => config.telemetry.log_level.clone(),
@@ -162,21 +169,11 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
 
     // Logs go to stderr so that `--json` output on stdout stays parseable when
     // both are enabled.
-    let fmt_layer = if json || config.telemetry.json_logs {
-        tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(std::io::stderr)
-            .boxed()
-    } else {
-        tracing_subscriber::fmt::layer()
-            .with_target(false)
-            .with_writer(std::io::stderr)
-            .boxed()
-    };
-
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
-    let mut layers: Vec<Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>> =
-        vec![filter.boxed(), fmt_layer];
+    let mut layers = vec![log_layer(
+        json || config.telemetry.json_logs,
+        std::io::stderr,
+    )];
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
     let mut telemetry = Telemetry::default();
     let mut deferred_warning = None;
@@ -199,11 +196,7 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
         }
     }
 
-    if tracing_subscriber::registry()
-        .with(layers)
-        .try_init()
-        .is_err()
-    {
+    if subscriber(filter, layers).try_init().is_err() {
         // A second init in the same process is not an error worth failing on.
         tracing::debug!("a tracing subscriber was already installed");
     }
@@ -211,6 +204,39 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
         tracing::warn!("{warning}");
     }
     telemetry
+}
+
+/// The registry with `filter` beneath every layer in `layers`.
+///
+/// The filter must not be one of `layers`: a `Vec` of layers takes the
+/// highest interest any member expresses, so an unfiltered formatter beside
+/// the filter would switch every callsite on — debug and trace from every
+/// dependency, raw JSON-RPC traffic among them.
+fn subscriber(
+    filter: tracing_subscriber::EnvFilter,
+    layers: Vec<OutputLayer>,
+) -> impl tracing::Subscriber + Send + Sync {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    tracing_subscriber::registry().with(filter).with(layers)
+}
+
+/// Log lines written to `writer`, as JSON or for a human.
+fn log_layer<W>(json: bool, writer: W) -> OutputLayer
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer as _;
+    if json {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(writer)
+            .boxed()
+    }
 }
 
 /// Keeps trace export alive for the process, and flushes it on the way out.
@@ -236,14 +262,14 @@ impl Drop for Telemetry {
 mod otel {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig as _;
-    use tracing_subscriber::{Layer as _, Registry};
+    use tracing_subscriber::Layer as _;
 
     /// A tracing layer exporting spans to an OTLP/HTTP collector.
     pub(super) fn layer(
         endpoint: &str,
     ) -> Result<
         (
-            Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>,
+            super::OutputLayer,
             opentelemetry_sdk::trace::SdkTracerProvider,
         ),
         String,
@@ -367,32 +393,52 @@ pub fn check_a2a_exposure(
 /// "Configure an agent" is wrong advice when agents are configured and were
 /// refused because `security.require_agent_sandbox` cannot be met.
 pub fn no_agents_reason(config: &Config) -> String {
-    no_agents_reason_under(
-        config,
-        &cuma_workspace::AgentSandbox::detect(&config.security),
-    )
+    let sandboxes = sandbox_registry(config);
+    no_agents_reason_under(config, &refusals(config, |id| sandboxes.for_agent(id)))
 }
 
-fn no_agents_reason_under(config: &Config, sandbox: &cuma_workspace::AgentSandbox) -> String {
-    let local_configured = config
+/// The enabled ACP agents of `config`.
+fn local_agents(config: &Config) -> impl Iterator<Item = (&String, &cuma_config::AgentConfig)> {
+    config
         .agents
-        .values()
-        .any(|agent| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"));
+        .iter()
+        .filter(|(_, agent)| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"))
+}
 
-    if local_configured && sandbox.refuses_agents() {
-        match sandbox.level() {
-            cuma_workspace::AgentConfinementLevel::NetworkUnfiltered { runtime } => format!(
-                "no agents can run: security.require_agent_sandbox is set, and \
-                 security.network_allowlist can only be enforced by ai-jail, not {runtime}. \
-                 Install ai-jail, empty the allowlist, or unset require_agent_sandbox."
-            ),
-            _ => "no agents can run: security.require_agent_sandbox is set, and no sandbox \
-                  works here. Install ai-jail or bubblewrap (firejail also works; \
-                  sandbox-exec on macOS), or unset require_agent_sandbox to run agents \
-                  unconfined."
-                .to_owned(),
-        }
-    } else if local_configured {
+/// The local agents `security.require_agent_sandbox` refuses, each with what
+/// its sandbox falls short of.
+fn refusals(
+    config: &Config,
+    sandbox_for: impl Fn(&str) -> Option<Arc<dyn cuma_sandbox::SandboxProvider>>,
+) -> BTreeMap<String, String> {
+    if !config.security.require_agent_sandbox {
+        return BTreeMap::new();
+    }
+    // With sandboxing off there is no sandbox to fall short: the operator
+    // chose to run agents unconfined.
+    local_agents(config)
+        .filter_map(|(id, _)| {
+            let shortfall = sandbox_for(id)?.shortfall(&config.security.network_allowlist)?;
+            Some((id.clone(), shortfall))
+        })
+        .collect()
+}
+
+fn no_agents_reason_under(config: &Config, refused: &BTreeMap<String, String>) -> String {
+    let local: Vec<&String> = local_agents(config).map(|(id, _)| id).collect();
+
+    if !local.is_empty() && local.iter().all(|id| refused.contains_key(*id)) {
+        let mut reasons: Vec<&str> = refused.values().map(String::as_str).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        format!(
+            "no agents can run: security.require_agent_sandbox is set, and their sandboxes fall \
+             short — {}. Choose a sandbox that can confine them (`cuma sandbox list`; on this \
+             machine, ai-jail or bubblewrap, firejail, or sandbox-exec on macOS), empty \
+             security.network_allowlist, or unset require_agent_sandbox.",
+            reasons.join("; ")
+        )
+    } else if !local.is_empty() {
         "no agents are available: those configured under [agents.*] could not be \
          registered (see the warnings above). Run `cuma doctor` for details."
             .to_owned()
@@ -403,15 +449,92 @@ fn no_agents_reason_under(config: &Config, sandbox: &cuma_workspace::AgentSandbo
     }
 }
 
-/// Launches ACP agents inside the agent sandbox, confined to the directory
-/// each one works in.
-struct SandboxLauncher(cuma_workspace::AgentSandbox);
+/// The sandboxes `config` declares, with CUMA's own executable for those
+/// reached through `cuma sandbox exec`.
+pub fn sandbox_registry(config: &Config) -> cuma_sandbox::Registry {
+    cuma_sandbox::Registry::from_config(config, std::env::current_exe().ok())
+}
 
-impl cuma_protocol_acp::AgentLauncher for SandboxLauncher {
+/// Launches one ACP agent under its sandbox, confined to the directory each
+/// launch works in.
+struct ProviderLauncher {
+    provider: Arc<dyn cuma_sandbox::SandboxProvider>,
+    /// The agent's own state directories, expanded.
+    state: Vec<PathBuf>,
+    /// Variables it needs beyond what its command asks for: the agent's own
+    /// `env` and `security.agent_env`.
+    env: Vec<String>,
+    allowed_hosts: Vec<String>,
+}
+
+impl ProviderLauncher {
+    fn new(
+        provider: Arc<dyn cuma_sandbox::SandboxProvider>,
+        agent: &cuma_config::AgentConfig,
+        security: &cuma_config::SecurityConfig,
+    ) -> Self {
+        let mut env = agent.env.clone();
+        env.extend(security.agent_env.iter().cloned());
+        Self {
+            provider,
+            state: agent
+                .state
+                .iter()
+                .map(|p| cuma_config::expand_home(p))
+                .collect(),
+            env,
+            allowed_hosts: security.network_allowlist.clone(),
+        }
+    }
+
+    fn request(
+        &self,
+        workspace: &Path,
+        purpose: cuma_core::ports::LaunchPurpose,
+        keep_env: &[String],
+        readable: &[PathBuf],
+    ) -> cuma_sandbox::LaunchRequest {
+        let mut keep = keep_env.to_vec();
+        keep.extend(self.env.iter().cloned());
+        cuma_sandbox::LaunchRequest {
+            workspace: workspace.to_path_buf(),
+            purpose,
+            keep_env: keep,
+            readable: readable.to_vec(),
+            state: self.state.clone(),
+            allowed_hosts: self.allowed_hosts.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl cuma_protocol_acp::AgentLauncher for ProviderLauncher {
     fn prefix(&self, workspace: &Path, keep_env: &[String], readable: &[PathBuf]) -> Vec<String> {
-        self.0
-            .launch_prefix(workspace, keep_env, readable)
-            .unwrap_or_default()
+        self.provider.prefix_hint(&self.request(
+            workspace,
+            cuma_core::ports::LaunchPurpose::Execute,
+            keep_env,
+            readable,
+        ))
+    }
+
+    fn runs_elsewhere(&self) -> bool {
+        !matches!(
+            self.provider.capabilities().isolation,
+            cuma_sandbox::Isolation::Process
+        )
+    }
+
+    async fn open(
+        &self,
+        workspace: &Path,
+        purpose: cuma_core::ports::LaunchPurpose,
+        keep_env: &[String],
+        readable: &[PathBuf],
+    ) -> Result<cuma_core::ports::SandboxLaunch> {
+        self.provider
+            .open(&self.request(workspace, purpose, keep_env, readable))
+            .await
     }
 }
 
@@ -511,54 +634,62 @@ pub async fn build_orchestrator(
     if !shared.is_empty() {
         tracing::info!(count = shared.len(), "offering MCP servers to ACP agents");
     }
-    let sandbox = cuma_workspace::AgentSandbox::detect(&config.security);
-    if sandbox.level().is_shortfall() {
-        warnings.push(sandbox.describe());
-    }
+    // Each agent runs under its own sandbox, else the default one.
+    let sandboxes = sandbox_registry(&config);
     let mut acp = AcpConfigDiscovery::new(config.clone())
         .with_mcp_servers(shared)
         .with_kept_env(shared_mcp_secret_names(&config));
-    if sandbox.runtime().is_some() {
-        acp = acp.with_launcher(Arc::new(SandboxLauncher(sandbox.clone())));
-    }
-    let acp_adapters = if sandbox.refuses_agents() {
-        // Required confinement is not available: no local agent runs rather
-        // than one running unconfined.
-        warnings.push(
-            "security.require_agent_sandbox is set and agents cannot be fully confined here; \
-             local ACP agents are not registered"
-                .to_owned(),
+    let mut reported = BTreeSet::new();
+    for (id, agent) in local_agents(&config) {
+        let Some(provider) = sandboxes.for_agent(id) else {
+            continue;
+        };
+        if let Some(shortfall) = provider.shortfall(&config.security.network_allowlist)
+            && reported.insert(provider.name().to_owned())
+        {
+            warnings.push(shortfall);
+        }
+        acp = acp.with_launcher_for(
+            id,
+            Arc::new(ProviderLauncher::new(provider, agent, &config.security)),
         );
-        Vec::new()
-    } else {
-        acp.adapters()
-    };
+    }
+    // Required confinement that falls short: that agent does not run, rather
+    // than running less confined than asked.
+    let refused = refusals(&config, |id| sandboxes.for_agent(id));
+    if !refused.is_empty() {
+        let names: Vec<&str> = refused.keys().map(String::as_str).collect();
+        warnings.push(format!(
+            "security.require_agent_sandbox is set and {} cannot be fully confined here; \
+             not registered",
+            names.join(", ")
+        ));
+    }
+    let acp_adapters: Vec<_> = acp
+        .adapters()
+        .into_iter()
+        .filter(|adapter| !refused.contains_key(adapter.agent_id().as_str()))
+        .collect();
     for adapter in acp_adapters {
-        let id = adapter.agent_id().clone();
-
         // Negotiate capabilities where possible; register with configured
         // capabilities where not.
-        if let Err(err) = adapter.refresh_capabilities().await {
-            warnings.push(format!("{id}: ACP negotiation failed ({err})"));
-        }
-
-        if let Err(err) = orchestrator.add_agent(Arc::new(adapter)).await {
-            warnings.push(format!("{id}: could not register ({err})"));
-        }
+        let failure = adapter
+            .refresh_capabilities()
+            .await
+            .err()
+            .map(|err| format!("ACP negotiation failed ({err})"));
+        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
     }
 
     // --- A2A agents -------------------------------------------------------
     let a2a = A2aDiscovery::new(config.clone());
     for adapter in a2a.adapters() {
-        let id = adapter.agent_id().clone();
-
-        if let Err(err) = adapter.refresh_from_card().await {
-            warnings.push(format!("{id}: could not fetch the Agent Card ({err})"));
-        }
-
-        if let Err(err) = orchestrator.add_agent(Arc::new(adapter)).await {
-            warnings.push(format!("{id}: could not register ({err})"));
-        }
+        let failure = adapter
+            .refresh_from_card()
+            .await
+            .err()
+            .map(|err| format!("could not fetch the Agent Card ({err})"));
+        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
     }
 
     // --- memory -----------------------------------------------------------
@@ -605,10 +736,115 @@ pub async fn build_orchestrator(
     Ok((orchestrator, warnings))
 }
 
+/// Register `adapter`, as unavailable when discovering it failed.
+///
+/// An agent that could not be interrogated stays visible — `cuma agents list`
+/// and `cuma doctor` show it, and why — but is not routed to: what failed was
+/// the same launch or request every task sent to it would make.
+async fn register(
+    orchestrator: &mut Orchestrator,
+    adapter: Arc<dyn AgentAdapter>,
+    failure: Option<String>,
+    warnings: &mut Vec<String>,
+) {
+    let id = adapter.agent_id().clone();
+    if let Err(err) = orchestrator.add_agent(adapter).await {
+        warnings.push(format!("{id}: could not register ({err})"));
+        return;
+    }
+    if let Some(reason) = failure {
+        orchestrator
+            .agents()
+            .set_health(
+                &id,
+                cuma_core::HealthState::Unavailable,
+                Some(reason.clone()),
+            )
+            .await;
+        warnings.push(format!("{id}: {reason}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    /// Log output captured in memory.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_log_level_holds_for_every_crate_not_only_cumas_own() {
+        let captured = Captured::default();
+        let sink = captured.clone();
+        let subscriber = subscriber(
+            tracing_subscriber::EnvFilter::new("cuma=info,warn"),
+            vec![log_layer(false, move || sink.clone())],
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "cuma_router", "kept: cuma at info");
+            tracing::warn!(target: "hyper", "kept: a dependency's warning");
+            tracing::debug!(target: "cuma_router", "dropped: cuma at debug");
+            tracing::trace!(target: "agent_client_protocol::jsonrpc", "dropped: raw JSON-RPC");
+        });
+
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("kept: cuma at info"), "{logged}");
+        assert!(logged.contains("kept: a dependency's warning"), "{logged}");
+        assert!(!logged.contains("dropped"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_cannot_negotiate_is_unavailable_and_keeps_what_was_configured() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config::from_toml(
+            r#"
+            [agents.broken]
+            protocol = "acp"
+            command = "false"
+            capabilities = ["documentation"]
+            models = ["house-model"]
+            "#,
+        )
+        .unwrap();
+        config.security.sandbox = false;
+
+        let (orchestrator, warnings) = build_orchestrator(config, workspace.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let agent = orchestrator
+            .agents()
+            .get(&cuma_core::AgentId::new("broken"))
+            .await
+            .unwrap();
+        assert!(!agent.is_routable(), "{:?}", agent.health.state);
+        let error = agent.health.last_error.unwrap_or_default();
+        assert!(error.contains("negotiation failed"), "{error}");
+        assert!(
+            agent
+                .capabilities
+                .contains(&cuma_core::Capability::Documentation)
+        );
+        assert_eq!(agent.models.len(), 1);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("broken:")),
+            "{warnings:?}"
+        );
+    }
 
     #[test]
     fn a2a_is_served_openly_only_on_loopback_or_when_explicitly_allowed() {
@@ -643,35 +879,85 @@ mod tests {
         assert_eq!(a2a_server_tokens(&config).await.unwrap().len(), 1);
     }
 
+    /// A native provider with `runtime` fixed, whatever this machine has.
+    fn native(
+        config: &Config,
+        runtime: Option<cuma_workspace::AgentRuntime>,
+    ) -> Arc<dyn cuma_sandbox::SandboxProvider> {
+        Arc::new(cuma_sandbox::native::NativeProvider::with_sandbox(
+            "auto",
+            cuma_workspace::AgentSandbox::with_runtime(&config.security, runtime),
+        ))
+    }
+
     #[test]
     fn refused_agents_are_explained_as_refused_not_as_missing() {
         let mut config =
             Config::from_toml("[agents.probe]\nprotocol = \"acp\"\ncommand = \"probe\"\n").unwrap();
         config.security.require_agent_sandbox = true;
         // No sandbox runtime on this imagined machine.
-        let nothing = cuma_workspace::AgentSandbox::with_runtime(&config.security, None);
-        let reason = no_agents_reason_under(&config, &nothing);
+        let nothing = native(&config, None);
+        let refused = refusals(&config, |_| Some(Arc::clone(&nothing)));
+        let reason = no_agents_reason_under(&config, &refused);
         assert!(reason.contains("require_agent_sandbox"), "{reason}");
-        assert!(reason.contains("no sandbox works here"), "{reason}");
+        assert!(reason.contains("works here"), "{reason}");
 
         // An allowlist only ai-jail can enforce is its own reason.
         let mut filtered = config.clone();
         filtered.security.network_allowlist = vec!["api.anthropic.com".into()];
-        let bwrap = cuma_workspace::AgentSandbox::with_runtime(
-            &filtered.security,
-            Some(cuma_workspace::AgentRuntime::Bubblewrap),
-        );
-        let reason = no_agents_reason_under(&filtered, &bwrap);
+        let bwrap = native(&filtered, Some(cuma_workspace::AgentRuntime::Bubblewrap));
+        let refused = refusals(&filtered, |_| Some(Arc::clone(&bwrap)));
+        let reason = no_agents_reason_under(&filtered, &refused);
         assert!(reason.contains("network_allowlist"), "{reason}");
         assert!(!reason.contains("Configure one"), "{reason}");
 
         let empty = Config::default();
-        let none = cuma_workspace::AgentSandbox::with_runtime(&empty.security, None);
-        assert!(no_agents_reason_under(&empty, &none).contains("Configure one"));
+        assert!(no_agents_reason_under(&empty, &BTreeMap::new()).contains("Configure one"));
 
         config.security.require_agent_sandbox = false;
-        let unrequired = cuma_workspace::AgentSandbox::with_runtime(&config.security, None);
+        let unrequired = refusals(&config, |_| Some(Arc::clone(&nothing)));
+        assert!(unrequired.is_empty());
         assert!(no_agents_reason_under(&config, &unrequired).contains("could not be registered"));
+
+        // With sandboxing off there is nothing to fall short.
+        config.security.require_agent_sandbox = true;
+        assert!(refusals(&config, |_| None).is_empty());
+    }
+
+    #[test]
+    fn only_the_agent_whose_sandbox_falls_short_is_refused() {
+        let config = Config::from_toml(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "microsandbox"
+            image = "node:22"
+            [sandboxes.box]
+            kind = "docker"
+            image = "node:22"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            [agents.open]
+            command = "b"
+            sandbox = "box"
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let sandboxes = sandbox_registry(&config);
+
+        let refused = refusals(&config, |id| sandboxes.for_agent(id));
+
+        // microsandbox enforces the allowlist; a container engine cannot.
+        assert_eq!(refused.keys().collect::<Vec<_>>(), ["open"]);
+        assert!(
+            refused["open"].contains("NOT enforced"),
+            "{}",
+            refused["open"]
+        );
     }
 
     #[test]
