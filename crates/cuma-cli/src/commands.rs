@@ -115,6 +115,173 @@ pub enum SkillAction {
     Keygen,
 }
 
+/// Sandbox subcommands.
+#[derive(Subcommand)]
+pub enum SandboxAction {
+    /// List the sandboxes agents can run in: what each isolates with, how it
+    /// sees the workspace, what it can enforce, and which agents use it.
+    List,
+    /// Run something inside a sandbox, now.
+    Probe {
+        /// A `[sandboxes.<name>]` section, or a built-in name: `auto`,
+        /// `ai-jail`, `bubblewrap`, `sandbox-exec`, `firejail`.
+        name: String,
+    },
+    /// Relay stdio to a process started in a sandbox reached over HTTP.
+    ///
+    /// What agents in e2b and OpenSandbox sandboxes are launched through.
+    #[command(hide = true)]
+    Exec {
+        /// The launch's session file.
+        #[arg(long)]
+        session: PathBuf,
+        /// The agent's command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+}
+
+/// Sandbox subcommands.
+pub async fn sandbox(config: Config, action: SandboxAction, json: bool) -> Result<()> {
+    let registry = harness::sandbox_registry(&config);
+    match action {
+        SandboxAction::List => {
+            let entries = registry.entries();
+            if json {
+                let text = serde_json::to_string_pretty(&entries)
+                    .map_err(|e| MetaAgentError::Other(e.to_string()))?;
+                println!("{text}");
+                return Ok(());
+            }
+            if !registry.enabled() {
+                println!("sandboxing is off (security.sandbox = false): agents run unconfined");
+            }
+            let mut table = Table::new(&[
+                "Sandbox",
+                "Kind",
+                "Isolation",
+                "Workspace",
+                "Allowlist",
+                "Agents",
+            ]);
+            for entry in &entries {
+                let isolation = serde_json::to_value(entry.capabilities.isolation)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let workspace = serde_json::to_value(entry.capabilities.workspace)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let name = if entry.default {
+                    format!("{} (default)", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+                table.row(vec![
+                    name,
+                    entry.kind.to_owned(),
+                    isolation,
+                    workspace,
+                    if entry.capabilities.network_allowlist {
+                        "enforced"
+                    } else {
+                        "no"
+                    }
+                    .to_owned(),
+                    entry.agents.join(", "),
+                ]);
+            }
+            print!("{}", table.render());
+            Ok(())
+        }
+        SandboxAction::Probe { name } => {
+            let provider = registry
+                .get(&name)
+                .or_else(|| builtin(&config, &name))
+                .ok_or_else(|| {
+                    MetaAgentError::Configuration(format!(
+                        "no sandbox named {name:?}; `cuma sandbox list` shows the configured ones"
+                    ))
+                })?;
+            provider.probe().await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "sandbox": name, "works": true, "describe": provider.describe() })
+                );
+            } else {
+                println!("{name} works: {}", provider.describe());
+            }
+            Ok(())
+        }
+        SandboxAction::Exec { .. } => Err(MetaAgentError::Other(
+            "`cuma sandbox exec` is run by agents' launch prefixes, before any configuration"
+                .to_owned(),
+        )),
+    }
+}
+
+/// A built-in sandbox name that no agent uses yet, for probing.
+fn builtin(config: &Config, name: &str) -> Option<Arc<dyn cuma_sandbox::SandboxProvider>> {
+    use cuma_config::sandbox::{AUTO, NATIVE_RUNTIMES, NativeSandbox};
+    (name == AUTO || NATIVE_RUNTIMES.contains(&name)).then(|| {
+        let native = NativeSandbox {
+            runtime: name.to_owned(),
+        };
+        Arc::new(cuma_sandbox::native::NativeProvider::new(
+            name,
+            &native,
+            &config.security,
+        )) as Arc<dyn cuma_sandbox::SandboxProvider>
+    })
+}
+
+/// One note per sandbox agents run in, naming them, for `cuma doctor`.
+/// Sandboxes that fall short are left out: their warning is a problem.
+fn agent_sandbox_notes(config: &Config) -> Vec<String> {
+    let registry = harness::sandbox_registry(config);
+    if !registry.enabled() {
+        return vec!["agents: unconfined (sandbox disabled)".to_owned()];
+    }
+    let mut groups: std::collections::BTreeMap<
+        String,
+        (Arc<dyn cuma_sandbox::SandboxProvider>, Vec<&str>),
+    > = std::collections::BTreeMap::new();
+    for (id, agent) in &config.agents {
+        if !agent.enabled || !agent.protocol.eq_ignore_ascii_case("acp") {
+            continue;
+        }
+        if let Some(provider) = registry.for_agent(id) {
+            groups
+                .entry(provider.name().to_owned())
+                .or_insert_with(|| (provider, Vec::new()))
+                .1
+                .push(id);
+        }
+    }
+    if groups.is_empty()
+        && let Some(provider) = registry.default_provider()
+    {
+        groups.insert(provider.name().to_owned(), (provider, Vec::new()));
+    }
+    groups
+        .into_values()
+        .filter(|(provider, _)| {
+            provider
+                .shortfall(&config.security.network_allowlist)
+                .is_none()
+        })
+        .map(|(provider, agents)| {
+            if agents.is_empty() {
+                provider.describe()
+            } else {
+                format!("{} [{}]", provider.describe(), agents.join(", "))
+            }
+        })
+        .collect()
+}
+
 /// MCP subcommands.
 #[derive(Subcommand)]
 pub enum McpAction {
@@ -297,6 +464,13 @@ async fn explain_plan(
 ) -> Result<()> {
     let graph = orchestrator.plan_only(goal).await?;
 
+    // Show how the first task would route, so the explanation covers routing
+    // and not only planning.
+    let routing = match graph.iter().next() {
+        Some(first) => Some((first.id.clone(), orchestrator.explain_routing(first).await)),
+        None => None,
+    };
+
     if json {
         let tasks: Vec<serde_json::Value> = graph
             .iter()
@@ -310,11 +484,17 @@ async fn explain_plan(
                 })
             })
             .collect();
+        let routing = routing.map(|(task, decision)| match decision {
+            Ok(decision) => serde_json::json!({ "task": task.as_str(), "decision": decision }),
+            Err(err) => serde_json::json!({ "task": task.as_str(), "error": err.to_string() }),
+        });
 
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "tasks": tasks }))
-                .unwrap_or_default()
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "tasks": tasks, "routing": routing })
+            )
+            .unwrap_or_default()
         );
         return Ok(());
     }
@@ -348,16 +528,13 @@ async fn explain_plan(
 
     println!("{}", table.render());
 
-    // Show how the first task would route, so the explanation covers routing
-    // and not only planning.
-    if let Some(first) = graph.iter().next() {
-        match orchestrator.explain_routing(first).await {
-            Ok(decision) => {
-                println!("Routing for task 1:\n");
-                println!("{}", decision.explain());
-            }
-            Err(err) => println!("Task 1 could not be routed: {err}"),
+    match routing {
+        Some((_, Ok(decision))) => {
+            println!("Routing for task 1:\n");
+            println!("{}", decision.explain());
         }
+        Some((_, Err(err))) => println!("Task 1 could not be routed: {err}"),
+        None => {}
     }
 
     Ok(())
@@ -1330,11 +1507,9 @@ pub async fn doctor(
         problems.push(sandbox.describe());
     }
 
-    // A shortfall already reached `problems` through the build warnings.
-    let agent_sandbox = cuma_workspace::AgentSandbox::detect(&config.security);
-    if !agent_sandbox.level().is_shortfall() {
-        notes.push(agent_sandbox.describe());
-    }
+    // Each sandbox agents run in, with the agents in it. A shortfall already
+    // reached `problems` through the build warnings.
+    notes.extend(agent_sandbox_notes(&config));
 
     let rtk = orchestrator.rtk_status();
     if rtk.is_fatal() || matches!(rtk, cuma_workspace::RtkStatus::Unverified { .. }) {

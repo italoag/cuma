@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-async-patterns": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/systems-programming/skills/rust-async-patterns/SKILL.md",
+      "computedHash": "20d32ef58158c94eb4dfc4aaf19bec7ae2a025ae5d42da7b49ccfbaeda389273"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "a3db351ec552ed9d36b59e547d6c1d94077867eb5bcb98b3f802dfebb0a8a248"
+    },
+    "rust-skill-creator": {
+      "source": "actionbook/rust-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-skill-creator/SKILL.md",
+      "computedHash": "0314bb7b61f6e7be24a498b7fb45969f78924e81c2f74723badb056724697119"
+    },
+    "rust-testing": {
+      "source": "affaan-m/ecc",
+      "sourceType": "github",
+      "skillPath": "skills/rust-testing/SKILL.md",
+      "computedHash": "bd66d6441ff6d3a6acb89c902cd6a01bf58410aec3ecbc43d45409b3a3788ac8"
+    },
+    "unlazy": {
+      "source": "leonxlnx/unlazy",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "7fcb511111a6d234d56dc1d9d38e0ae754c1762945ad7cd26679e799ee5e64ed"
+    }
+  }
+}

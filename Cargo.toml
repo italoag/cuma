@@ -19,6 +19,7 @@ members = [
     "crates/cuma-tui",
     "crates/cuma-server-acp",
     "crates/cuma-workspace",
+    "crates/cuma-sandbox",
     "crates/cuma-providers",
     "crates/cuma-cli",
 ]
@@ -51,6 +52,7 @@ cuma-testkit = { path = "crates/cuma-testkit", version = "0.1.0" }
 cuma-tui = { path = "crates/cuma-tui", version = "0.1.0" }
 cuma-server-acp = { path = "crates/cuma-server-acp", version = "0.1.0" }
 cuma-workspace = { path = "crates/cuma-workspace", version = "0.1.0" }
+cuma-sandbox = { path = "crates/cuma-sandbox", version = "0.1.0" }
 cuma-providers = { path = "crates/cuma-providers", version = "0.1.0" }
 
 # --- runtime / async ---

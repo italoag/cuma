@@ -1,0 +1,77 @@
+#!/bin/sh
+# CUMA's guest init for Firecracker microVMs: install as /sbin/cuma-init in
+# the root filesystem the cuma-sandbox-firecracker plugin boots.
+#
+# It runs as PID 1. It mounts the workspace image (/dev/vdb) at the
+# workspace's own path, loads the agent's variables and deletes them, puts
+# the serial console in raw mode, runs the agent on it, and powers off when
+# the agent exits. The agent's stdio is the serial console, which is
+# Firecracker's own stdio on the host — so its JSON-RPC reaches CUMA as is.
+#
+# Kernel command line, set by the plugin:
+#   cuma.ws=<base64 workspace path>
+#   cuma.cmd=<base64 word>,<base64 word>,…
+#
+# Needs: sh, mount, umount, base64, stty, sync, and a reboot that halts the
+# VM (busybox has all of them).
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# The root filesystem is read-only: everything written goes to memory.
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+param() {
+    for word in $(cat /proc/cmdline); do
+        case "$word" in "$1"=*) printf '%s' "${word#*=}"; return ;; esac
+    done
+}
+
+poweroff_vm() {
+    sync
+    umount -l "$workspace" 2>/dev/null
+    umount /mnt/cuma 2>/dev/null
+    # With reboot=k, Firecracker exits when the guest reboots.
+    reboot -f 2>/dev/null || echo b > /proc/sysrq-trigger
+}
+
+workspace=$(param cuma.ws | base64 -d)
+mount -t tmpfs tmpfs /mnt 2>/dev/null || true
+mkdir -p /mnt/cuma
+# `sync`: what the agent writes reaches the image even if the VM is killed.
+mount -o sync /dev/vdb /mnt/cuma || poweroff_vm
+
+# The workspace's path need not exist in the read-only root: give its first
+# component a writable overlay, then mount the workspace there.
+top=$(printf '%s' "$workspace" | cut -d/ -f2)
+mount -t tmpfs tmpfs "/$top" 2>/dev/null || true
+mkdir -p "$workspace"
+mount --bind /mnt/cuma/ws "$workspace" || poweroff_vm
+
+if [ -f /mnt/cuma/env ]; then
+    set -a
+    . /mnt/cuma/env
+    set +a
+    rm -f /mnt/cuma/env
+fi
+HOME=/tmp/home
+export HOME
+mkdir -p "$HOME"
+
+set --
+for word in $(param cuma.cmd | tr ',' ' '); do
+    set -- "$@" "$(printf '%s' "$word" | base64 -d)"
+done
+
+# Raw: no echo of what CUMA writes, no CR added to what the agent writes.
+stty -F /dev/ttyS0 raw -echo 2>/dev/null
+cd "$workspace" || poweroff_vm
+# The plugin discards the console up to here and sends nothing before it.
+printf 'CUMA-INIT-READY\n' >/dev/ttyS0
+"$@" </dev/ttyS0 >/dev/ttyS0 2>/tmp/agent.stderr
+
+poweroff_vm

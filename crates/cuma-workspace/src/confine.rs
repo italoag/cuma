@@ -165,6 +165,17 @@ impl AgentRuntime {
         Self::Firejail,
     ];
 
+    /// The runtime configuration names `name` (`security.agent_sandbox`).
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        match name {
+            "ai-jail" => Some(Self::AiJail),
+            "bubblewrap" => Some(Self::Bubblewrap),
+            "sandbox-exec" => Some(Self::SandboxExec),
+            "firejail" => Some(Self::Firejail),
+            _ => None,
+        }
+    }
+
     /// The binary.
     pub fn program(self) -> &'static str {
         match self {
@@ -209,9 +220,9 @@ impl AgentRuntime {
             .find(|p| Path::new(p).exists())
             .unwrap_or("true");
         let args: Vec<&str> = match self {
-            // ai-jail builds its own profile; asking for its version is enough
-            // to know the binary is ai-jail and runs.
-            Self::AiJail => vec!["--version"],
+            // Run something inside it, as for the others: a binary that
+            // answers `--version` but cannot start a jail protects nothing.
+            Self::AiJail => vec!["--exec", "--clean", "--no-save-config", "--", truth],
             Self::Bubblewrap => vec![
                 "--ro-bind",
                 "/",
@@ -286,6 +297,21 @@ impl AgentSandbox {
         Self::with_runtime(config, runtime)
     }
 
+    /// Confinement by `runtime` only, if it works here — an operator who
+    /// named one gets that one or none, never another.
+    pub fn detect_only(config: &SecurityConfig, runtime: AgentRuntime) -> Self {
+        let runtime = (config.sandbox && runtime.works()).then_some(runtime);
+        Self::with_runtime(config, runtime)
+    }
+
+    /// Also let the agent write `paths` — the directories it keeps its login
+    /// and sessions in. Those that do not exist are ignored.
+    #[must_use]
+    pub fn with_state(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.writable.extend(paths);
+        self
+    }
+
     /// Confinement by a given runtime, whether or not it is installed — for
     /// tests, and for callers that have already chosen.
     pub fn with_runtime(config: &SecurityConfig, runtime: Option<AgentRuntime>) -> Self {
@@ -306,6 +332,12 @@ impl AgentSandbox {
     /// The runtime in use, if any.
     pub fn runtime(&self) -> Option<AgentRuntime> {
         self.runtime
+    }
+
+    /// Whether a configured network allowlist is enforced: only ai-jail
+    /// filters by host.
+    pub fn filters_network(&self) -> bool {
+        self.runtime == Some(AgentRuntime::AiJail)
     }
 
     /// What confinement agents get.
@@ -496,9 +528,14 @@ impl Profile {
     }
 
     fn ai_jail(&self, allowed_hosts: &[String]) -> Vec<String> {
+        // Left to itself, ai-jail reads a `.ai-jail` file from the directory
+        // it starts in and writes one back: repository content shaping the
+        // confinement CUMA chose, and a file of CUMA's left in the user's tree.
         let mut prefix = vec![
             "ai-jail".to_owned(),
             "--exec".to_owned(),
+            "--clean".to_owned(),
+            "--no-save-config".to_owned(),
             "--agent-state".to_owned(),
         ];
         if allowed_hosts.is_empty() {
@@ -782,12 +819,26 @@ fn is_network_setup(name: &str) -> bool {
         || ["NODE_OPTIONS", "JAVA_TOOL_OPTIONS", "LD_LIBRARY_PATH"].contains(&name)
 }
 
+/// Variables a coding agent needs wherever it runs — its credentials and its
+/// proxy settings — unlike those describing this machine (`PATH`, `HOME`,
+/// certificate paths), which mean nothing inside another operating system.
+///
+/// What a container or a microVM is given by default.
+pub fn is_portable_agent_env(name: &str) -> bool {
+    KEPT_ENV_PREFIXES
+        .iter()
+        .filter(|prefix| !matches!(**prefix, "LC_" | "XDG_"))
+        .any(|prefix| name.starts_with(prefix))
+        || ["GOOGLE_API_KEY", "OPENROUTER_API_KEY"].contains(&name)
+        || name.to_ascii_uppercase().ends_with("PROXY")
+}
+
 /// The repository git directory of a worktree, which lives outside it.
 ///
 /// A worktree's `.git` is a file, `gitdir: <repo>/.git/worktrees/<name>`;
 /// git inside the worktree writes to that repository directory, so it must
 /// be writable too.
-fn git_common_dir(workspace: &Path) -> Option<PathBuf> {
+pub fn git_common_dir(workspace: &Path) -> Option<PathBuf> {
     let marker = workspace.join(".git");
     if !marker.is_file() {
         return None;
@@ -924,6 +975,16 @@ mod tests {
             let joined = args.join(" ");
             assert!(joined.contains("GITHUB_TOKEN"));
             assert!(!joined.contains("FORWARDED"));
+        }
+    }
+
+    #[test]
+    fn ai_jail_neither_reads_nor_writes_a_sandbox_file_in_the_project() {
+        let args = prefix(AgentRuntime::AiJail, Path::new("/cuma-test-elsewhere"));
+        let separator = args.iter().position(|a| a == "--").unwrap();
+        for flag in ["--clean", "--no-save-config"] {
+            let at = args.iter().position(|a| a == flag);
+            assert!(at.is_some_and(|at| at < separator), "{flag}: {args:?}");
         }
     }
 

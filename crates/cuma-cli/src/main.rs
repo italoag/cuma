@@ -113,6 +113,12 @@ enum Command {
         action: commands::MemoryAction,
     },
 
+    /// List and check the sandboxes agents run in.
+    Sandbox {
+        #[command(subcommand)]
+        action: commands::SandboxAction,
+    },
+
     /// Show token, cost and outcome statistics.
     Usage {
         /// Break the report down by model rather than by agent.
@@ -132,7 +138,24 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match run().await {
+    let cli = Cli::parse();
+
+    // The stdio bridge is an agent's own process: it reads no configuration,
+    // writes nothing of its own to stdout, and exits as the agent did.
+    if let Some(Command::Sandbox {
+        action: commands::SandboxAction::Exec { session, command },
+    }) = &cli.command
+    {
+        return match cuma_sandbox::bridge::exec(session, command.clone()).await {
+            Ok(code) => std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+
+    match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
@@ -150,9 +173,7 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn run(cli: Cli) -> Result<()> {
     let workspace = match cli.workspace.clone() {
         Some(path) => path,
         None => std::env::current_dir().map_err(|err| {
@@ -188,6 +209,7 @@ async fn run() -> Result<()> {
         Some(Command::Skills { .. }) => "skills",
         Some(Command::Mcp { .. }) => "mcp",
         Some(Command::Memory { .. }) => "memory",
+        Some(Command::Sandbox { .. }) => "sandbox",
         Some(Command::Usage { .. }) => "usage",
         Some(Command::Doctor) => "doctor",
     };
@@ -232,6 +254,7 @@ async fn run() -> Result<()> {
                 commands::memory(config, workspace, action, cli.json).await
             }
             Some(Command::Mcp { action }) => commands::mcp(config, action, cli.json).await,
+            Some(Command::Sandbox { action }) => commands::sandbox(config, action, cli.json).await,
             Some(Command::Usage { by_model }) => {
                 commands::usage(config, workspace, by_model, cli.json).await
             }

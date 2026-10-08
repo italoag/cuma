@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""CUMA sandbox plugin for Firecracker (https://github.com/firecracker-microvm/firecracker).
+
+Firecracker is a bare VMM: a kernel, block devices, a TAP interface, a serial
+console - and no shared filesystem. So each launch:
+
+  open   copies the workspace into an ext4 image (no journal, mounted `sync`
+         in the guest, so what the agent wrote is on disk even if the VM is
+         killed), with the agent's variables in a private file beside it;
+  exec   boots `firecracker --no-api --config-file` with the agent's command in
+         the kernel command line. The guest init, `cuma-init`, mounts the
+         workspace at its own path, puts the serial console in raw mode, says
+         it is ready and runs the agent on it. This plugin relays between
+         CUMA and the console: the boot is discarded, nothing CUMA writes is
+         sent before the guest is ready, and when CUMA closes stdin - which a
+         serial line cannot carry - the VM is stopped;
+  close  copies the workspace back out of the image with `debugfs` for CUMA's
+         three-way merge;
+  release / abort  removes the launch's files (and, on abort, the VM).
+
+`probe` boots a VM and runs `true` in it.
+
+Requirements: Linux with KVM, `firecracker`, e2fsprogs (`mke2fs`, `debugfs`),
+a kernel image, and a root filesystem holding busybox (or sh, mount, base64,
+stty) and `/sbin/cuma-init` from this directory. A network needs a TAP device
+the operator created (Firecracker cannot create one without root).
+
+    [sandboxes.fc]
+    kind = "plugin"
+    program = "/path/to/cuma-sandbox-firecracker"
+    [sandboxes.fc.options]
+    kernel = "/var/lib/cuma/vmlinux"
+    rootfs = "/var/lib/cuma/agent-rootfs.ext4"
+    vcpus = 2
+    memory_mib = 2048
+    tap = "tap0"                       # optional
+    ip = "172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"   # optional, kernel ip=
+    firecracker = "firecracker"        # optional
+
+`ci/sandboxes/firecracker-assets.sh` downloads Firecracker and a kernel and
+builds such a root filesystem. Standard library only. Protocol: see
+docs/SANDBOXES.md.
+"""
+
+import base64
+import json
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PLUGIN = os.path.abspath(__file__)
+# What cuma-init prints on the console once it is raw and the agent starts.
+READY = b"CUMA-INIT-READY"
+BOOT_TIMEOUT = 120
+
+
+def read_request():
+    text = sys.stdin.read()
+    return json.loads(text) if text.strip() else {}
+
+
+def reply(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message):
+    sys.stderr.write(f"cuma-sandbox-firecracker: {message}\n")
+    sys.exit(1)
+
+
+def run(*argv, **kwargs):
+    done = subprocess.run(argv, capture_output=True, text=True, **kwargs)
+    if done.returncode != 0:
+        fail(f"{' '.join(argv)} failed: {done.stderr.strip() or done.stdout.strip()}")
+    return done.stdout
+
+
+def require(options):
+    for program in (options.get("firecracker", "firecracker"), "mke2fs", "debugfs"):
+        if shutil.which(program) is None:
+            fail(f"{program} is not installed")
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        fail("/dev/kvm is missing or not accessible")
+    for key in ("kernel", "rootfs"):
+        path = options.get(key)
+        if not path or not os.path.isfile(path):
+            fail(f"options.{key} must name an existing file")
+
+
+def directory_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def sh_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+
+def build_image(session, workspace, keep_env, options):
+    """The launch's ext4 image: `ws/` (the workspace without CUMA's state,
+    when given) and `env` (the agent's variables, deleted by cuma-init before
+    the agent starts, and outside what is copied back)."""
+    stage = os.path.join(session, "stage")
+    os.makedirs(os.path.join(stage, "ws"))
+    if workspace:
+        pack = subprocess.Popen(["tar", "-C", workspace, "--exclude=./.cuma", "-cf", "-", "."], stdout=subprocess.PIPE)
+        unpack = subprocess.run(["tar", "-C", os.path.join(stage, "ws"), "-xf", "-"], stdin=pack.stdout)
+        if pack.wait() != 0 or unpack.returncode != 0:
+            fail("copying the workspace failed")
+    lines = [f"{name}={sh_quote(os.environ[name])}\n" for name in keep_env if name in os.environ]
+    with open(os.open(os.path.join(stage, "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as env:
+        env.writelines(lines)
+    size_mib = int(options.get("workspace_size_mib") or (directory_size(stage) * 2 // (1024 * 1024) + 512))
+    image = os.path.join(session, "workspace.ext4")
+    run("mke2fs", "-q", "-t", "ext4", "-O", "^has_journal", "-L", "cuma-ws", "-d", stage, image, f"{size_mib}M")
+    shutil.rmtree(stage)
+    return image
+
+
+def start_vm(session, options, image, workspace, argv):
+    """Boot a VM running `argv` in `workspace`; its console is the pipes."""
+    boot = [
+        "console=ttyS0", "reboot=k", "panic=1", "quiet", "loglevel=0", "init=/sbin/cuma-init",
+        f"cuma.ws={b64(workspace)}",
+        "cuma.cmd=" + ",".join(b64(word) for word in argv),
+    ]
+    if options.get("ip"):
+        boot.append(f"ip={options['ip']}")
+    config = {
+        "boot-source": {"kernel_image_path": options["kernel"], "boot_args": " ".join(boot)},
+        "drives": [
+            {"drive_id": "rootfs", "path_on_host": options["rootfs"], "is_root_device": True, "is_read_only": True},
+            {"drive_id": "workspace", "path_on_host": image, "is_root_device": False, "is_read_only": False},
+        ],
+        "machine-config": {"vcpu_count": int(options.get("vcpus", 2)), "mem_size_mib": int(options.get("memory_mib", 2048))},
+    }
+    if options.get("tap"):
+        config["network-interfaces"] = [{"iface_id": "eth0", "host_dev_name": options["tap"]}]
+    config_path = os.path.join(session, "vm.json")
+    with open(config_path, "w") as written:
+        json.dump(config, written)
+    # Firecracker's own log goes to a file: its stdout is the guest console.
+    log_path = os.path.join(session, "firecracker.log")
+    open(log_path, "a").close()
+    firecracker = options.get("firecracker", "firecracker")
+    vm = subprocess.Popen(
+        [firecracker, "--no-api", "--config-file", config_path, "--log-path", log_path, "--level", "Error"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    with open(os.path.join(session, "pid"), "w") as pid_file:
+        pid_file.write(str(vm.pid))
+    return vm
+
+
+def wait_ready(vm, session):
+    """Discard the console until cuma-init's ready line has ended; return
+    what followed it. The line's end may arrive in a later read than the
+    sign itself, and must not reach the agent's reader as an empty line.
+    The boot is kept only to explain a failure."""
+    fd = vm.stdout.fileno()
+    seen = b""
+    deadline = time.monotonic() + BOOT_TIMEOUT
+    while READY not in seen or b"\n" not in seen.split(READY, 1)[1]:
+        remaining = deadline - time.monotonic()
+        readable = select.select([fd], [], [], max(remaining, 0))[0] if remaining > 0 else []
+        chunk = os.read(fd, 65536) if readable else b""
+        if not chunk:
+            vm.kill()
+            log = ""
+            try:
+                with open(os.path.join(session, "firecracker.log"), errors="replace") as fc_log:
+                    log = fc_log.read()[-2000:]
+            except OSError:
+                pass
+            tail = seen[-2000:].decode(errors="replace")
+            fail(f"the VM did not start the agent: {'timed out' if readable == [] else 'it stopped'}\n{tail}\n{log}")
+        seen = (seen + chunk)[-1_000_000:]
+    return seen.split(READY, 1)[1].split(b"\n", 1)[1]
+
+
+def probe():
+    options = read_request().get("options", {})
+    require(options)
+    session = tempfile.mkdtemp(prefix="cuma-firecracker-probe-")
+    try:
+        image = build_image(session, None, [], options)
+        vm = start_vm(session, options, image, "/tmp/cuma-probe", ["true"])
+        vm.stdin.close()
+        wait_ready(vm, session)
+        try:
+            code = vm.wait(timeout=BOOT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+            fail("the VM did not stop after running true")
+        if code != 0:
+            fail(f"firecracker exited with {code}")
+    finally:
+        shutil.rmtree(session, ignore_errors=True)
+    reply({"isolation": "microvm", "workspace": "copied", "network_allowlist": False, "secrets_outside": False})
+
+
+def open_():
+    request = read_request()
+    options = request.get("options", {})
+    require(options)
+    workspace = os.path.realpath(request["workspace"])
+    session = tempfile.mkdtemp(prefix="cuma-firecracker-")
+    os.chmod(session, 0o700)
+    copy = workspace if request.get("purpose") == "execute" else None
+    image = build_image(session, copy, request.get("keep_env", []), options)
+    with open(os.path.join(session, "session.json"), "w") as saved:
+        json.dump({"workspace": workspace, "options": options, "image": image}, saved)
+    reply({"prefix": [sys.executable, PLUGIN, "exec", session, "--"], "session": session})
+
+
+def exec_(args):
+    if "--" not in args or len(args) < 3:
+        fail("usage: cuma-sandbox-firecracker exec <session> -- <command> [args...]")
+    session = args[0]
+    argv = args[args.index("--") + 1:]
+    with open(os.path.join(session, "session.json")) as saved:
+        state = json.load(saved)
+    vm = start_vm(session, state["options"], state["image"], state["workspace"], argv)
+    out = sys.stdout.buffer
+    out.write(wait_ready(vm, session))
+    out.flush()
+
+    stopped = threading.Event()
+
+    def feed():
+        try:
+            while True:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                vm.stdin.write(data)
+                vm.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return
+        # A serial line cannot carry end-of-file, and CUMA closes stdin only
+        # once the turn is over: give the agent a moment, then stop the VM.
+        time.sleep(1)
+        stopped.set()
+        vm.terminate()
+        try:
+            vm.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+
+    threading.Thread(target=feed, daemon=True).start()
+    fd = vm.stdout.fileno()
+    while True:
+        data = os.read(fd, 65536)
+        if not data:
+            break
+        out.write(data)
+        out.flush()
+    code = vm.wait()
+    sys.exit(0 if stopped.is_set() else code)
+
+
+def close():
+    request = read_request()
+    session = request["session"]
+    if not request.get("collect"):
+        shutil.rmtree(session, ignore_errors=True)
+        reply({})
+        return
+    out = os.path.join(session, "out")
+    os.makedirs(out, exist_ok=True)
+    run("debugfs", "-R", f"rdump /ws {out}", os.path.join(session, "workspace.ext4"))
+    reply({"result_dir": os.path.join(out, "ws")})
+
+
+def release():
+    shutil.rmtree(read_request()["session"], ignore_errors=True)
+    reply({})
+
+
+def abort():
+    session = read_request()["session"]
+    try:
+        with open(os.path.join(session, "pid")) as pid_file:
+            os.kill(int(pid_file.read().strip()), signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+    shutil.rmtree(session, ignore_errors=True)
+    reply({})
+
+
+def main():
+    if len(sys.argv) < 2:
+        fail("expected an operation: probe, open, exec, close, release or abort")
+    operation, rest = sys.argv[1], sys.argv[2:]
+    if operation == "exec":
+        exec_(rest)
+        return
+    handlers = {"probe": probe, "open": open_, "close": close, "release": release, "abort": abort}
+    if operation not in handlers:
+        fail(f"unknown operation {operation}")
+    handlers[operation]()
+
+
+if __name__ == "__main__":
+    main()

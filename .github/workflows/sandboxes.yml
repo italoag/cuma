@@ -1,0 +1,271 @@
+name: Sandboxes
+
+# Brings up each sandbox CUMA can run agents in and runs its live test: an
+# ACP agent completing a turn inside it, its work landing in the workspace,
+# and the sandbox gone afterwards. Hosted runners cover everything they can
+# run; ArcBox (macOS virtualization) and CubeSandbox (a full deployment) run
+# on self-hosted runners, enabled by repository variables.
+on:
+  pull_request:
+    paths:
+      - "crates/cuma-sandbox/**"
+      - "crates/cuma-config/src/sandbox.rs"
+      - "crates/cuma-protocol-acp/src/adapter.rs"
+      - "plugins/**"
+      - "ci/sandboxes/**"
+      - ".github/workflows/sandboxes.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandboxes-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # What is tested; bump deliberately.
+  AGENT_SANDBOX_VERSION: v1.0.5
+  MICROSANDBOX_VERSION: 0.7.6
+  WASMER_VERSION: v7.5.0
+  AGENTOS_VERSION: 0.2.22
+  # The PyPI wheel of 1.1.0 lacks a generated module; the image is whole.
+  OPENSANDBOX_SERVER_IMAGE: opensandbox/server:release-1.1.0
+  FIRECRACKER_VERSION: v1.17.0
+  TEST_IMAGE: cuma-sandbox-test:ci
+
+jobs:
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Build the test image
+        run: docker build -t "$TEST_IMAGE" ci/sandboxes/images/sandbox-test
+      - name: Live test
+        env:
+          CUMA_LIVE_DOCKER_IMAGE: ${{ env.TEST_IMAGE }}
+        run: cargo test -p cuma-sandbox --test live_docker -- --nocapture
+
+  microsandbox:
+    name: microsandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install microsandbox
+        run: |
+          npm install -g "microsandbox@${MICROSANDBOX_VERSION}"
+          msb --version
+      - name: Load the test image
+        run: |
+          docker build -t "$TEST_IMAGE" ci/sandboxes/images/sandbox-test
+          docker save "$TEST_IMAGE" -o "$RUNNER_TEMP/test-image.tar"
+          msb load -i "$RUNNER_TEMP/test-image.tar" -t "$TEST_IMAGE"
+      - name: Live test
+        env:
+          CUMA_LIVE_MICROSANDBOX_IMAGE: ${{ env.TEST_IMAGE }}
+        run: cargo test -p cuma-sandbox --test live_microsandbox -- --nocapture
+
+  wasmer:
+    name: wasmer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Install Wasmer
+        run: |
+          curl -fsSL https://get.wasmer.io | sh -s "$WASMER_VERSION"
+          echo "$HOME/.wasmer/bin" >> "$GITHUB_PATH"
+      - name: Live test
+        env:
+          CUMA_LIVE_WASMER_PACKAGE: wasmer/bash
+        run: cargo test -p cuma-sandbox --test live_wasmer -- --nocapture
+
+  agentos:
+    name: agentos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install agentOS
+        run: npm install --prefix "$RUNNER_TEMP/agentos" "@rivet-dev/agentos-core@${AGENTOS_VERSION}"
+      - name: Live test
+        env:
+          CUMA_LIVE_AGENTOS_MODULES: ${{ runner.temp }}/agentos/node_modules
+        run: cargo test -p cuma-sandbox --test live_agentos -- --nocapture
+
+  kubernetes:
+    name: kubernetes (agent-sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: cuma
+      - name: Install agent-sandbox
+        run: |
+          kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/sandbox-with-extensions.yaml"
+          kubectl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
+          kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
+      - name: Load the test image
+        run: |
+          docker build -t "$TEST_IMAGE" ci/sandboxes/images/sandbox-test
+          kind load docker-image "$TEST_IMAGE" --name cuma
+      - name: Live test
+        env:
+          CUMA_LIVE_KUBERNETES_IMAGE: ${{ env.TEST_IMAGE }}
+        run: cargo test -p cuma-sandbox --test live_kubernetes -- --nocapture
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get sandboxes,pods -A -o wide || true
+          kubectl -n agent-sandbox-system logs deployment/agent-sandbox-controller --tail=200 || true
+
+  opensandbox:
+    name: opensandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      OPENSANDBOX_API_KEY: ci-only-${{ github.run_id }}
+      OPENSANDBOX_IMAGE: localhost:5000/cuma-sandbox-test:ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Serve the test image from a local registry
+        run: |
+          docker run -d --name registry -p 5000:5000 registry:2
+          docker build -t "$OPENSANDBOX_IMAGE" ci/sandboxes/images/sandbox-test
+          docker push "$OPENSANDBOX_IMAGE"
+      - name: Start opensandbox-server
+        run: |
+          sed "s/@API_KEY@/${OPENSANDBOX_API_KEY}/" ci/sandboxes/opensandbox.toml > "$RUNNER_TEMP/sandbox.toml"
+          # Host networking: it serves on the runner's loopback and reaches
+          # the sandboxes it creates on Docker's bridge.
+          docker run -d --name opensandbox-server --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/sandbox.toml:/etc/opensandbox/config.toml:ro" \
+            "$OPENSANDBOX_SERVER_IMAGE"
+          for _ in $(seq 90); do
+            curl -fsS http://127.0.0.1:8080/health && exit 0
+            sleep 2
+          done
+          docker logs opensandbox-server
+          exit 1
+      - name: Build cuma (the stdio bridge)
+        run: cargo build -p cuma-cli
+      - name: Live test
+        env:
+          CUMA_LIVE_OPENSANDBOX_URL: http://127.0.0.1:8080
+          CUMA_LIVE_OPENSANDBOX_IMAGE: ${{ env.OPENSANDBOX_IMAGE }}
+          CUMA_LIVE_OPENSANDBOX_KEY_REF: OPENSANDBOX_API_KEY
+          CUMA_LIVE_CUMA_BIN: ${{ github.workspace }}/target/debug/cuma
+        run: cargo test -p cuma-sandbox --test live_opensandbox -- --nocapture
+      - name: Server log on failure
+        if: failure()
+        run: docker logs --tail 300 opensandbox-server || true
+
+  firecracker:
+    name: firecracker (plugin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Firecracker, a kernel and a root filesystem
+        run: ci/sandboxes/firecracker-assets.sh "$RUNNER_TEMP/firecracker"
+      - name: Live test
+        run: cargo test -p cuma-sandbox --test live_firecracker -- --nocapture
+
+  arcbox:
+    name: arcbox (self-hosted macOS)
+    # Hosted macOS runners have no nested virtualization. Set the repository
+    # variable CUMA_ARCBOX_RUNNER=true once a runner labelled `arcbox` (Apple
+    # Silicon, ArcBox installed) is registered. Never a fork's code on it.
+    if: vars.CUMA_ARCBOX_RUNNER == 'true' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, arcbox]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Live test
+        env:
+          CUMA_LIVE_ARCBOX_IMAGE: ${{ vars.CUMA_ARCBOX_IMAGE || 'ghcr.io/italoag/cuma-sandbox-test:latest' }}
+        run: cargo test -p cuma-sandbox --test live_arcbox -- --nocapture
+
+  cubesandbox:
+    name: cubesandbox (self-hosted)
+    # CubeSandbox needs its control plane deployed on an x86-64 KVM host. Set
+    # CUMA_CUBESANDBOX_RUNNER=true, CUMA_CUBE_API_URL, CUMA_CUBE_DOMAIN and
+    # CUMA_CUBE_TEMPLATE (variables) and CUMA_CUBE_API_KEY (secret) once a
+    # runner labelled `cubesandbox` can reach it. Never a fork's code on it.
+    if: vars.CUMA_CUBESANDBOX_RUNNER == 'true' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, linux, X64, cubesandbox]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sandboxes
+      - name: Build cuma (the stdio bridge)
+        run: cargo build -p cuma-cli
+      - name: Live test
+        env:
+          CUMA_LIVE_E2B_API_URL: ${{ vars.CUMA_CUBE_API_URL }}
+          CUMA_LIVE_E2B_DOMAIN: ${{ vars.CUMA_CUBE_DOMAIN }}
+          CUMA_LIVE_E2B_TEMPLATE: ${{ vars.CUMA_CUBE_TEMPLATE }}
+          CUMA_LIVE_E2B_ENVD_SCHEME: ${{ vars.CUMA_CUBE_ENVD_SCHEME || 'http' }}
+          CUMA_LIVE_E2B_KEY_REF: CUBE_API_KEY
+          CUBE_API_KEY: ${{ secrets.CUMA_CUBE_API_KEY }}
+          CUMA_LIVE_CUMA_BIN: ${{ github.workspace }}/target/debug/cuma
+        run: cargo test -p cuma-sandbox --test live_e2b -- --nocapture

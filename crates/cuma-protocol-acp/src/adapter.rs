@@ -11,7 +11,9 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use async_trait::async_trait;
 use cuma_core::error::{MetaAgentError, Result};
-use cuma_core::ports::{AgentAdapter, ExecutionRequest, ExecutionUpdate};
+use cuma_core::ports::{
+    AgentAdapter, ExecutionRequest, ExecutionUpdate, LaunchPurpose, SandboxLaunch,
+};
 use cuma_core::{
     AgentDescriptor, AgentId, AgentProtocol, AttemptId, ErrorClass, ExecutionOutcome, Risk,
     TokenUsage,
@@ -70,11 +72,42 @@ pub struct AcpAdapter {
 ///
 /// Asked afresh for every launch: an agent working in a task's worktree must
 /// be able to write that worktree, not the directory CUMA started in.
+#[async_trait]
 pub trait AgentLauncher: Send + Sync {
     /// The command-line prefix for an agent working in `workspace`, keeping
     /// the environment variables named in `keep_env` and able to read the
     /// paths its own command names in `readable`.
+    ///
+    /// For a sandbox with a lifecycle this is only indicative — its first
+    /// word is the program a launch needs — and [`open`](Self::open) is what
+    /// prepares a real one.
     fn prefix(&self, workspace: &Path, keep_env: &[String], readable: &[PathBuf]) -> Vec<String>;
+
+    /// Whether agents run on another system — a container, a virtual
+    /// machine, a remote service — whose programs this machine's `PATH` says
+    /// nothing about. Their own `initialize` is then the only test of their
+    /// command.
+    fn runs_elsewhere(&self) -> bool {
+        false
+    }
+
+    /// Prepare one launch of an agent working in `workspace`.
+    ///
+    /// A launcher that is a prefix needs nothing more. A sandbox with a
+    /// lifecycle of its own — a microVM, a pod, a remote service — is created
+    /// here, and torn down when the returned launch is finished or dropped.
+    async fn open(
+        &self,
+        workspace: &Path,
+        purpose: LaunchPurpose,
+        keep_env: &[String],
+        readable: &[PathBuf],
+    ) -> Result<SandboxLaunch> {
+        let _ = purpose;
+        Ok(SandboxLaunch::new(
+            self.prefix(workspace, keep_env, readable),
+        ))
+    }
 }
 
 /// A fixed prefix, whatever the workspace.
@@ -161,15 +194,42 @@ impl AcpAdapter {
     /// agent's environment. They are moved ahead of the sandbox — which would
     /// otherwise try to run `NAME=value` as a program — and their names kept.
     pub fn launch_command(&self, workspace: &Path) -> String {
-        let Some(launcher) = &self.launcher else {
+        let (Some(launcher), Some(parts)) = (&self.launcher, self.command_parts()) else {
             return self.command.clone();
         };
-        let Ok(parts) = shell_words::split(&self.command) else {
-            return self.command.clone();
-        };
+        let prefix = launcher.prefix(workspace, &parts.keep, &parts.readable);
+        parts.under(&prefix).unwrap_or_else(|| self.command.clone())
+    }
 
-        let assignments: Vec<&String> = parts.iter().take_while(|p| is_assignment(p)).collect();
-        let program = &parts[assignments.len()..];
+    /// Prepare a launch in `workspace`: the sandbox, if any, and the command
+    /// to run in it. The launch must be finished once the agent has exited;
+    /// dropping it instead tears the sandbox down.
+    async fn open_launch(
+        &self,
+        workspace: &Path,
+        purpose: LaunchPurpose,
+    ) -> Result<(String, Option<SandboxLaunch>)> {
+        let (Some(launcher), Some(parts)) = (&self.launcher, self.command_parts()) else {
+            return Ok((self.command.clone(), None));
+        };
+        let launch = launcher
+            .open(workspace, purpose, &parts.keep, &parts.readable)
+            .await?;
+        let command = parts
+            .under(launch.prefix())
+            .unwrap_or_else(|| self.command.clone());
+        Ok((command, Some(launch)))
+    }
+
+    /// The configured command, taken apart for a launcher.
+    fn command_parts(&self) -> Option<CommandParts> {
+        let words = shell_words::split(&self.command).ok()?;
+        let assignments: Vec<String> = words
+            .iter()
+            .take_while(|w| is_assignment(w))
+            .cloned()
+            .collect();
+        let program = words[assignments.len()..].to_vec();
         let mut keep = self.kept_env.clone();
         keep.extend(
             assignments
@@ -179,7 +239,13 @@ impl AcpAdapter {
 
         // The agent's program and any path its command names — a script in
         // a project folder, a binary under $HOME — were chosen by whoever
-        // configured it, and must stay visible inside the sandbox.
+        // configured it, and must stay visible inside the sandbox. Where the
+        // agent runs on another system, its program is that system's, not
+        // whatever this machine's PATH finds under the same name.
+        let elsewhere = self
+            .launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.runs_elsewhere());
         let readable: Vec<PathBuf> = program
             .iter()
             .enumerate()
@@ -187,7 +253,7 @@ impl AcpAdapter {
                 let path = Path::new(word);
                 if path.is_absolute() {
                     Some(path.to_path_buf())
-                } else if index == 0 {
+                } else if index == 0 && !elsewhere {
                     which::which(word).ok()
                 } else {
                     None
@@ -196,14 +262,12 @@ impl AcpAdapter {
             .filter(|path| path.exists())
             .collect();
 
-        let prefix = launcher.prefix(workspace, &keep, &readable);
-        if prefix.is_empty() {
-            return self.command.clone();
-        }
-        let mut words: Vec<&str> = assignments.iter().map(|a| a.as_str()).collect();
-        words.extend(prefix.iter().map(String::as_str));
-        words.extend(program.iter().map(String::as_str));
-        shell_words::join(words)
+        Some(CommandParts {
+            assignments,
+            program,
+            keep,
+            readable,
+        })
     }
 
     /// MCP servers to offer the agent in every session.
@@ -237,14 +301,22 @@ impl AcpAdapter {
     /// Whether the agent's command is actually on `PATH`.
     ///
     /// Used by `cuma doctor` and by discovery so a misconfigured agent is
-    /// reported as missing rather than silently failing at routing time.
+    /// reported as missing rather than silently failing at routing time. An
+    /// agent that runs elsewhere — in a container, a virtual machine — is
+    /// checked only for its sandbox's program: its own command lives there.
     pub fn is_launchable(&self) -> bool {
         let Ok(parts) = shell_words::split(&self.command) else {
             return false;
         };
-        let agent = parts
-            .first()
-            .is_some_and(|binary| which::which(binary).is_ok());
+        let elsewhere = self
+            .launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.runs_elsewhere());
+        let agent = elsewhere
+            || parts
+                .iter()
+                .find(|word| !is_assignment(word))
+                .is_some_and(|binary| which::which(binary).is_ok());
         let here = std::env::current_dir().unwrap_or_default();
         let launcher = self.launcher.as_ref().is_none_or(|launcher| {
             launcher
@@ -255,14 +327,43 @@ impl AcpAdapter {
         agent && launcher
     }
 
-    /// Build the SDK's agent handle for an agent working in `workspace`.
-    fn spawn_handle(&self, workspace: &Path) -> Result<AcpAgent> {
-        AcpAgent::from_str(&self.launch_command(workspace)).map_err(|err| {
+    /// Build the SDK's agent handle for `command`.
+    fn spawn_handle(&self, command: &str) -> Result<AcpAgent> {
+        AcpAgent::from_str(command).map_err(|err| {
             MetaAgentError::Configuration(format!(
                 "agent {}: cannot parse command {:?}: {err}",
                 self.id, self.command
             ))
         })
+    }
+}
+
+/// A configured command, taken apart: what a launcher needs to know about it,
+/// and how to put it back together under a sandbox's prefix.
+struct CommandParts {
+    /// Leading `NAME=value` words.
+    assignments: Vec<String>,
+    /// The program and its arguments.
+    program: Vec<String>,
+    /// Variables the agent keeps.
+    keep: Vec<String>,
+    /// Paths the command names.
+    readable: Vec<PathBuf>,
+}
+
+impl CommandParts {
+    /// The command under `prefix`, or `None` when there is no prefix.
+    fn under(&self, prefix: &[String]) -> Option<String> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let words = self
+            .assignments
+            .iter()
+            .chain(prefix)
+            .chain(&self.program)
+            .map(String::as_str);
+        Some(shell_words::join(words))
     }
 }
 
@@ -405,7 +506,11 @@ impl AgentAdapter for AcpAdapter {
         updates: mpsc::Sender<ExecutionUpdate>,
     ) -> Result<ExecutionOutcome> {
         let started = std::time::Instant::now();
-        let agent = self.spawn_handle(&request.workspace)?;
+        // Dropped on any early return below, which tears its sandbox down.
+        let (command, launch) = self
+            .open_launch(&request.workspace, LaunchPurpose::Execute)
+            .await?;
+        let agent = self.spawn_handle(&command)?;
 
         let risk = request.task.spec.risk;
         let policy = self.permission_policy;
@@ -426,7 +531,7 @@ impl AgentAdapter for AcpAdapter {
         let usage_for_handler = Arc::clone(&usage);
         let updates_for_handler = updates.clone();
 
-        let (stop_reason, turn_usage) = agent_client_protocol::Client
+        let turn = agent_client_protocol::Client
             .builder()
             .name("cuma")
             .on_receive_notification(
@@ -500,7 +605,24 @@ impl AgentAdapter for AcpAdapter {
                 // orchestrator re-classifies from the message when this comes
                 // back as a generic protocol error.
                 MetaAgentError::protocol_msg("acp", format!("agent {agent_id} failed: {err}"))
-            })?;
+            });
+
+        // The sandbox must not outlive the turn, and the agent's work comes
+        // back whatever the turn's outcome — as it would have stayed in a
+        // mounted workspace.
+        let collected = match launch {
+            Some(launch) => launch.finish().await,
+            None => Ok(()),
+        };
+        let (stop_reason, turn_usage) = match turn {
+            Ok(turn) => turn,
+            Err(err) => {
+                if let Err(collect) = collected {
+                    tracing::warn!(agent = %self.id, error = %collect, "closing the sandbox failed too");
+                }
+                return Err(err);
+            }
+        };
 
         let output = transcript.lock().await.clone();
         let context_report = usage.lock().await.clone();
@@ -514,10 +636,20 @@ impl AgentAdapter for AcpAdapter {
         #[allow(clippy::cast_possible_truncation)]
         let latency_ms = started.elapsed().as_millis() as u64;
 
-        let (success, failure_class, failure_reason) = match interpret_stop_reason(stop_reason) {
-            Ok(()) => (true, None, None),
-            Err((class, reason)) => (false, Some(class), Some(reason)),
-        };
+        let (success, failure_class, failure_reason) =
+            match (interpret_stop_reason(stop_reason), collected) {
+                (Ok(()), Ok(())) => (true, None, None),
+                (Err((class, reason)), _) => (false, Some(class), Some(reason)),
+                // The agent finished, but its work did not reach the
+                // workspace: the task did not happen.
+                (Ok(()), Err(err)) => (
+                    false,
+                    Some(ErrorClass::TaskFailure),
+                    Some(format!(
+                        "the agent's work could not be brought back from its sandbox: {err}"
+                    )),
+                ),
+            };
 
         Ok(ExecutionOutcome {
             attempt_id: AttemptId::generate(),
@@ -555,7 +687,9 @@ impl AcpAdapter {
     pub async fn refresh_capabilities(&self) -> Result<AgentDescriptor> {
         // No task yet, so no workspace of its own: negotiation only
         // exchanges capabilities, from where CUMA runs.
-        let agent = self.spawn_handle(&std::env::current_dir().unwrap_or_default())?;
+        let here = std::env::current_dir().unwrap_or_default();
+        let (command, launch) = self.open_launch(&here, LaunchPurpose::Negotiate).await?;
+        let agent = self.spawn_handle(&command)?;
         let agent_id = self.id.clone();
 
         let response = agent_client_protocol::Client
@@ -567,16 +701,25 @@ impl AcpAdapter {
                     .block_task()
                     .await
             })
-            .await
-            .map_err(|err| {
-                MetaAgentError::protocol_msg(
-                    "acp",
-                    format!("agent {agent_id}: initialize failed: {err}"),
-                )
-            })?;
+            .await;
+        if let Some(launch) = launch
+            && let Err(err) = launch.finish().await
+        {
+            tracing::warn!(agent = %self.id, error = %err, "closing the negotiation sandbox failed");
+        }
+        let response = response.map_err(|err| {
+            MetaAgentError::protocol_msg(
+                "acp",
+                format!("agent {agent_id}: initialize failed: {err}"),
+            )
+        })?;
 
         let mut descriptor = self.descriptor.lock().await;
-        descriptor.capabilities = capabilities_from_initialize(&response);
+        // Added to what was configured, never in place of it: negotiation
+        // yields a coding baseline, and the operator may know more.
+        descriptor
+            .capabilities
+            .extend(capabilities_from_initialize(&response).iter().cloned());
 
         if let Some(info) = &response.agent_info {
             descriptor.name = info.name.clone();
@@ -812,7 +955,9 @@ mod tests {
     #[test]
     fn an_unparseable_command_is_a_configuration_error() {
         let adapter = AcpAdapter::new("broken", "unterminated 'quote");
-        let err = adapter.spawn_handle(Path::new("/w")).unwrap_err();
+        let err = adapter
+            .spawn_handle(&adapter.launch_command(Path::new("/w")))
+            .unwrap_err();
         assert_eq!(err.class(), ErrorClass::Configuration);
     }
 
@@ -850,5 +995,188 @@ mod tests {
     fn the_adapter_is_usable_behind_the_port_trait() {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(AcpAdapter::new("codex", "echo"));
         assert_eq!(adapter.agent_id(), &AgentId::new("codex"));
+    }
+
+    // --- sandbox launches -------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// How the launches a [`Recording`] launcher opened ended.
+    #[derive(Default)]
+    struct Lifecycle {
+        opened: std::sync::Mutex<Vec<LaunchPurpose>>,
+        finished: AtomicUsize,
+        aborted: AtomicUsize,
+    }
+
+    struct Ended(Arc<Lifecycle>);
+
+    #[async_trait]
+    impl cuma_core::ports::SandboxSession for Ended {
+        async fn finish(&self) -> Result<()> {
+            self.0.finished.fetch_add(1, SeqCst);
+            Ok(())
+        }
+
+        async fn abort(&self) {
+            self.0.aborted.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// A launcher whose every launch has a session, run under `env`.
+    struct Recording(Arc<Lifecycle>);
+
+    #[async_trait]
+    impl AgentLauncher for Recording {
+        fn prefix(&self, _: &Path, _: &[String], _: &[PathBuf]) -> Vec<String> {
+            vec!["env".into()]
+        }
+
+        async fn open(
+            &self,
+            _: &Path,
+            purpose: LaunchPurpose,
+            _: &[String],
+            _: &[PathBuf],
+        ) -> Result<SandboxLaunch> {
+            self.0.opened.lock().unwrap().push(purpose);
+            Ok(SandboxLaunch::with_session(
+                vec!["env".into()],
+                Arc::new(Ended(Arc::clone(&self.0))),
+            ))
+        }
+    }
+
+    /// The minimal ACP agent fixture, or `None` without python3.
+    fn minimal_agent() -> Option<String> {
+        which::which("python3").ok()?;
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/minimal_agent.py"
+        );
+        Some(shell_words::join(["python3", script]))
+    }
+
+    fn request() -> ExecutionRequest {
+        ExecutionRequest {
+            task: cuma_core::Task::new(cuma_core::TaskSpec::new(
+                "say hello",
+                cuma_core::TaskType::Research,
+            )),
+            model: None,
+            prompt: "say hello".to_owned(),
+            workspace: std::env::temp_dir(),
+            handoff: None,
+            timeout_ms: 20_000,
+        }
+    }
+
+    async fn settle(count: &AtomicUsize, expected: usize) {
+        for _ in 0..200 {
+            if count.load(SeqCst) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_launch_is_finished_after_the_turn() {
+        let Some(command) = minimal_agent() else {
+            return;
+        };
+        let lifecycle = Arc::new(Lifecycle::default());
+        let adapter = AcpAdapter::new("minimal", command)
+            .with_launcher(Arc::new(Recording(Arc::clone(&lifecycle))));
+
+        let (tx, _rx) = mpsc::channel(16);
+        let outcome = adapter.execute(request(), tx).await.unwrap();
+
+        assert!(outcome.success, "{:?}", outcome.failure_reason);
+        assert_eq!(outcome.output, "done");
+        assert_eq!(
+            *lifecycle.opened.lock().unwrap(),
+            vec![LaunchPurpose::Execute]
+        );
+        assert_eq!(lifecycle.finished.load(SeqCst), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.aborted.load(SeqCst), 0, "finished, not aborted");
+    }
+
+    #[tokio::test]
+    async fn negotiation_opens_a_launch_that_needs_no_workspace() {
+        let Some(command) = minimal_agent() else {
+            return;
+        };
+        let lifecycle = Arc::new(Lifecycle::default());
+        let adapter = AcpAdapter::new("minimal", command)
+            .with_launcher(Arc::new(Recording(Arc::clone(&lifecycle))));
+
+        adapter.refresh_capabilities().await.unwrap();
+
+        assert_eq!(
+            *lifecycle.opened.lock().unwrap(),
+            vec![LaunchPurpose::Negotiate]
+        );
+        assert_eq!(lifecycle.finished.load(SeqCst), 1);
+    }
+
+    /// A launcher for agents on another system, recording what it was told
+    /// the agent's command names.
+    struct Elsewhere(std::sync::Mutex<Vec<PathBuf>>);
+
+    impl AgentLauncher for Elsewhere {
+        fn prefix(&self, _: &Path, _: &[String], readable: &[PathBuf]) -> Vec<String> {
+            *self.0.lock().unwrap() = readable.to_vec();
+            vec!["env".into()]
+        }
+
+        fn runs_elsewhere(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn an_agent_on_another_system_is_not_resolved_on_this_machines_path() {
+        let launcher = Arc::new(Elsewhere(std::sync::Mutex::new(Vec::new())));
+        let script = tempfile::NamedTempFile::new().unwrap();
+        let command = shell_words::join(["sh", &script.path().display().to_string()]);
+        let adapter = AcpAdapter::new("guest", command).with_launcher(launcher.clone());
+
+        adapter.launch_command(Path::new("/w"));
+
+        // The script it names travels; this machine's `sh` does not.
+        assert_eq!(*launcher.0.lock().unwrap(), [script.path().to_path_buf()]);
+        assert!(
+            adapter.is_launchable(),
+            "its program is checked where it runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_is_aborted_when_the_turn_is_abandoned() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        // An agent that never answers `initialize`.
+        let adapter = AcpAdapter::new("silent", "sleep 30")
+            .with_launcher(Arc::new(Recording(Arc::clone(&lifecycle))));
+
+        let (tx, _rx) = mpsc::channel(16);
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            adapter.execute(request(), tx),
+        )
+        .await;
+
+        assert!(
+            abandoned.is_err(),
+            "the turn should still have been running"
+        );
+        settle(&lifecycle.aborted, 1).await;
+        assert_eq!(lifecycle.aborted.load(SeqCst), 1);
+        assert_eq!(
+            lifecycle.finished.load(SeqCst),
+            0,
+            "nothing is brought back"
+        );
     }
 }

@@ -1,0 +1,5 @@
+# Labels of the self-hosted runners .github/workflows/sandboxes.yml targets.
+self-hosted-runner:
+  labels:
+    - arcbox
+    - cubesandbox

@@ -14,7 +14,7 @@ use cuma_core::{
 use cuma_orchestrator::Orchestrator;
 use cuma_planner::HeuristicPlanner;
 use cuma_protocol_a2a::wire::Dialect;
-use cuma_protocol_a2a::{A2aAdapter, A2aServer};
+use cuma_protocol_a2a::{A2aAdapter, A2aDiscovery, A2aServer};
 use cuma_testkit::{Behaviour, MockAgent};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -128,6 +128,35 @@ fn v1_message(text: &str) -> Value {
 // ---------------------------------------------------------------------------
 // CUMA to CUMA
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_card_adds_to_what_the_operator_configured_rather_than_replacing_it() {
+    let base = serve_cuma(Behaviour::ok("ok")).await;
+    let mut config = cuma_config::Config::default();
+    config.agents.insert(
+        "remote".into(),
+        cuma_config::AgentConfig {
+            protocol: "a2a".into(),
+            endpoint: Some(base),
+            capabilities: vec!["vision".into()],
+            models: vec!["remote-model".into()],
+            ..cuma_config::AgentConfig::default()
+        },
+    );
+
+    let adapter = A2aDiscovery::new(config).adapters().remove(0);
+    let descriptor = adapter.refresh_from_card().await.unwrap();
+
+    assert!(
+        descriptor.capabilities.contains(&Capability::CodeReview),
+        "from the card"
+    );
+    assert!(
+        descriptor.capabilities.contains(&Capability::Vision),
+        "from the configuration"
+    );
+    assert_eq!(descriptor.models.len(), 1);
+}
 
 #[tokio::test]
 async fn cuma_delegates_to_cuma_over_a2a_1_0_with_streaming() {

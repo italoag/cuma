@@ -1,0 +1,76 @@
+name: Sandbox images
+
+# Builds the images CUMA's sandboxes use and publishes them as
+# ghcr.io/italoag/cuma-<name>, for amd64 and arm64; mirrors the third-party
+# images in ci/sandboxes/mirror.txt next to them, for networks that reach
+# ghcr.io and nothing else. Pull requests build without publishing.
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "ci/sandboxes/images/**"
+      - "ci/sandboxes/mirror.txt"
+      - ".github/workflows/sandbox-images.yml"
+  pull_request:
+    paths:
+      - "ci/sandboxes/images/**"
+      - "ci/sandboxes/mirror.txt"
+      - ".github/workflows/sandbox-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PREFIX: ghcr.io/italoag/cuma
+
+jobs:
+  build:
+    name: build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sandbox-test, agent-node]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ci/sandboxes/images/${{ matrix.image }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.PREFIX }}-${{ matrix.image }}:latest
+            ${{ env.PREFIX }}-${{ matrix.image }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  mirror:
+    name: mirror third-party images
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Mirror
+        run: |
+          grep -vE '^[[:space:]]*(#|$)' ci/sandboxes/mirror.txt | while read -r source target; do
+            echo "::group::$source -> ghcr.io/italoag/$target"
+            docker buildx imagetools create --tag "ghcr.io/italoag/$target" "$source"
+            echo "::endgroup::"
+          done

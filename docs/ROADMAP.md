@@ -2,7 +2,7 @@
 
 ## Where things stand
 
-746 tests passing, clippy clean with warnings denied, checked on the MSRV
+840 tests passing, clippy clean with warnings denied, checked on the MSRV
 (Rust 1.88) with and without the `otel` feature.
 
 | Milestone | State |
@@ -40,7 +40,7 @@
 | Structured logging and tracing | **Done** | spans per command, session, task, attempt |
 | OpenTelemetry export | **Done** | `otel` feature |
 | Safe parallel execution | **Done** | ownership ledger, worktree isolation |
-| Sandboxing | **Done** | agents confined by ai-jail, bubblewrap, `sandbox-exec` or firejail |
+| Sandboxing | **Done** | agents confined by ai-jail, bubblewrap, `sandbox-exec` or firejail by default, or by a provider the operator chooses per agent — docker, microsandbox, arcbox, kubernetes, e2b, opensandbox, wasmer, command, plugin ([SANDBOXES.md](SANDBOXES.md)) |
 | RTK integration | **Done** | verified with `rtk gain`; measured savings reported |
 | CUMA as an ACP / A2A / MCP agent | **Done** | `cuma serve --protocol acp \| a2a \| mcp` |
 | Provider adapters | **Done** | `cuma-providers` |
@@ -75,7 +75,9 @@ if a plan or a repository ever grew large enough to matter.
 | **A2A beyond the task lifecycle** | Push notifications and the extended Agent Card are refused with their own error codes and advertised `false`. CUMA never pauses for input, so multi-turn tasks are refused. A task interrupted by a restart is reported failed, not resumed. |
 | **A2A authentication beyond bearer tokens** | Both directions use bearer tokens from secret handles; there are no OAuth, OpenID Connect or mTLS flows. |
 | **Binary agents from the ACP registry** | `cuma agents add` configures npx and uvx agents; binary distributions are described (URL, SHA-256) for a person to install. |
-| **Network filtering without ai-jail** | bubblewrap, `sandbox-exec` and firejail confine the filesystem and environment but cannot filter by host; a `network_allowlist` is reported as not enforced. With no runtime installed at all, agents run unconfined unless `require_agent_sandbox` is set. |
+| **Network filtering under some sandboxes** | ai-jail, microsandbox, Wasmer and OpenSandbox enforce `network_allowlist`; bubblewrap, `sandbox-exec`, firejail, docker, arcbox, kubernetes and e2b confine the filesystem and environment but cannot filter by host, and the allowlist is reported as not enforced. With no runtime installed at all, agents run unconfined unless `require_agent_sandbox` is set. |
+| **Sandbox providers, exercised live** | docker (Rancher Desktop), microsandbox, wasmer and the agentOS plugin were, end to end through `cuma run`. arcbox, kubernetes, e2b (CubeSandbox), opensandbox and the Firecracker plugin are tested against their documented interfaces and local stand-ins of their APIs; the [Sandboxes pipeline](../.github/workflows/sandboxes.yml) has a live job for each, not yet run on GitHub, and ArcBox and CubeSandbox need self-hosted runners. The plan for each is in [SANDBOXES.md](SANDBOXES.md#plan). |
+| **Copied workspaces** | arcbox, kubernetes, e2b and OpenSandbox without `mount_workspace` move the whole workspace each way per task, and the merge works file by file: two edits to one file conflict rather than combine. Commits made inside such a sandbox are not brought back. |
 | **macOS confinement, exercised** | The `sandbox-exec` profile is unit-tested; the Linux runtimes were checked with a probe agent, macOS was not. |
 | **Write prediction** | Grounded in a file index and dependency outputs, but still read from a task's description. A task naming no path claims the whole workspace, which is safe and serializing. |
 | **Skill revocation and pinning** | A trusted key cannot be revoked short of removing it from configuration, and git registries are not pinned to a commit in `installed.json`. |

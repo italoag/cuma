@@ -43,7 +43,10 @@ see [SECURITY.md](SECURITY.md#agents-themselves).
 at. The mapping is therefore partly read and partly assumed: `prompt.image`
 becomes `Vision`, MCP-over-HTTP becomes `Research`, and a conservative coding
 baseline is assumed because every ACP agent is a coding agent by construction.
-Anything more specific belongs in configuration.
+Anything more specific belongs in configuration: an agent's `capabilities` and
+`models` are added to what negotiation finds. An agent whose negotiation fails
+is registered unavailable, with what was configured, so `cuma agents list` and
+`cuma doctor` say why it is never chosen.
 
 **Permissions.** Answered from the task's `Risk`, not from how the agent phrased
 the request. An unattended run must not block on a prompt nobody will see.

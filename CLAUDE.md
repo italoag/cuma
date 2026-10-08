@@ -15,7 +15,7 @@ ACP, A2A and MCP.
 ## Tech stack
 
 - Rust 2024 edition, MSRV 1.88
-- Cargo workspace, 20 crates
+- Cargo workspace, 21 crates
 - `tokio`, `serde`, `thiserror`, `tracing`, `clap`
 - `agent-client-protocol` 2.0 — the official ACP SDK
 - `rmcp` 3.1 — the official MCP SDK
@@ -28,7 +28,7 @@ ACP, A2A and MCP.
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 746 tests
+cargo test --workspace              # 840 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 
@@ -36,7 +36,25 @@ cargo test -p cuma-router           # one crate
 cargo test -p cuma-orchestrator --test end_to_end
 cargo bench -p cuma-orchestrator --bench harness
 cargo +1.88.0 check --workspace     # the MSRV
+make check                          # what CI runs: fmt, clippy -D warnings, tests
+
+# Opt-in: an ACP agent in a real sandbox (skipped when the variable is unset).
+# The image needs only `sh` and `sed`, and must be pullable from here — behind
+# a registry restriction, use a mirror on an allowed registry (ghcr.io).
+CUMA_LIVE_DOCKER_IMAGE=<image> cargo test -p cuma-sandbox --test live_docker
+CUMA_LIVE_MICROSANDBOX_IMAGE=<image> cargo test -p cuma-sandbox --test live_microsandbox
+CUMA_LIVE_WASMER_PACKAGE=wasmer/bash [CUMA_LIVE_WASMER_PROGRAM=~/.wasmer/bin/wasmer] \
+  cargo test -p cuma-sandbox --test live_wasmer
+CUMA_LIVE_AGENTOS_MODULES=<node_modules holding @rivet-dev/agentos-core> \
+  cargo test -p cuma-sandbox --test live_agentos
+# Every live test and its variables: docs/DEVELOPMENT.md#live-sandbox-tests.
+# .github/workflows/sandboxes.yml runs them all on PRs touching sandbox code.
+actionlint                          # workflows; runner labels in .github/actionlint.yaml
 ```
+
+CI lints with the *latest* stable Clippy and `-D warnings`, so a new Rust
+release can fail CI with no code change (1.98's `unnecessary_sort_by` did).
+Run `rustup update` before `make check`.
 
 ## Crate layout
 
@@ -58,6 +76,7 @@ crates/
 ├── cuma-protocol-mcp   MCP tools
 ├── cuma-server-acp     CUMA *as* an ACP agent
 ├── cuma-workspace      isolation, checkpoints, sandbox, RTK
+├── cuma-sandbox        agent sandbox providers and plugins
 ├── cuma-providers      LlmProvider implementations, secret stores
 ├── cuma-testkit        mock agents
 ├── cuma-tui            view model and rendering
@@ -95,10 +114,16 @@ ready set; prediction is pessimistic on purpose.
 ACP, a session directory's `.cuma/config.toml` applies only if it is trusted
 (the start directory, or under `security.trusted_workspaces`).
 
-**Agents run sandboxed.** ai-jail, else bubblewrap, `sandbox-exec` or firejail,
-all rendering one profile (`cuma-workspace::confine`). A runtime is used only
-after running something inside it succeeds. Environment variables are removed
-by name — never put a value on a command line.
+**Agents run sandboxed.** By default ai-jail, else bubblewrap, `sandbox-exec`
+or firejail, all rendering one profile (`cuma-workspace::confine`); the
+operator may choose another provider per agent (`cuma-sandbox`: docker,
+microsandbox, arcbox, kubernetes, e2b, opensandbox, wasmer, command, plugin —
+see `docs/SANDBOXES.md`). A runtime is used only after running something inside
+it succeeds. Environment variables are removed or forwarded by name — never put
+a value on a command line. A launch's sandbox is finished after the turn and
+torn down when the turn is abandoned; a copied workspace comes back only
+through the three-way merge in `cuma-sandbox::sync`, which refuses conflicts
+rather than overwriting.
 
 **Advertise only what is implemented.** When CUMA serves ACP or A2A, an
 unimplemented capability is reported `false` rather than claimed.
@@ -171,6 +196,7 @@ cuma agents list           # health and capabilities
 cuma agents discover --registry / add <id>   # the ACP registry
 cuma skills install | enable | update | sign # verified skills
 cuma mcp tools | call | proxy                # MCP servers
+cuma sandbox list | probe <name>             # where agents run, and whether it works
 cuma usage                 # tokens, cost, outcomes
 cuma doctor                # check the installation
 ```
@@ -206,7 +232,8 @@ and what was done about it.
 ## Documentation
 
 `docs/ARCHITECTURE.md`, `PROTOCOLS.md`, `ROUTING.md`, `ORCHESTRATION.md`,
-`MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `OBSERVABILITY.md`, `CONFIGURATION.md`,
-`DEVELOPMENT.md`, `ROADMAP.md`, and seventeen ADRs in `docs/adr/`.
+`MEMORY.md`, `SKILLS.md`, `SECURITY.md`, `SANDBOXES.md`, `OBSERVABILITY.md`,
+`CONFIGURATION.md`, `DEVELOPMENT.md`, `ROADMAP.md`, and eighteen ADRs in
+`docs/adr/`.
 
 `ROADMAP.md` distinguishes what is built from what is not. Keep it honest.

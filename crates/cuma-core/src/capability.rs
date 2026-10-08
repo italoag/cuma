@@ -183,6 +183,12 @@ impl FromIterator<Capability> for CapabilitySet {
     }
 }
 
+impl Extend<Capability> for CapabilitySet {
+    fn extend<I: IntoIterator<Item = Capability>>(&mut self, iter: I) {
+        self.0.extend(iter);
+    }
+}
+
 /// The result of matching an agent's capabilities against a task's requirements.
 ///
 /// `missing` is carried alongside `score` because the router must be able to
