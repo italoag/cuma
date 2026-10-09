@@ -1,0 +1,138 @@
+docs/ROADMAP.md
+  s_3e8fd5faa7b358::t_24392cd633cd8b 74
+  s_3e8fd5faa7b358::t_487aef4ebeca66 87-119
+  s_3e8fd5faa7b358::t_ababd84ad92442 5
+  s_3e8fd5faa7b358::t_ef513d150f900f 79
+  s_3e8fd5faa7b358::t_2363143f451e1f 11
+crates/cuma-core/src/event.rs
+  s_3e8fd5faa7b358::t_07d020354db185 73-76
+crates/cuma-orchestrator/src/lib.rs
+  s_3e8fd5faa7b358::t_f0a0e8fed8cec4 21
+crates/cuma-core/src/ports.rs
+  s_3e8fd5faa7b358::t_ebc2659d1f4faf 20-54,73-79
+crates/cuma-server-acp/src/tools.rs
+  s_3e8fd5faa7b358::t_56afee36858e23 65-68,106-108,118-120,127-130
+  s_3e8fd5faa7b358::t_e1fe88d2010e5a 1-64,69-105,109-117,121-126,131-248
+crates/cuma-tui/src/state.rs
+  s_3e8fd5faa7b358::t_501f5fa2ef4290 644
+  s_3e8fd5faa7b358::t_ef81bdc063be38 286
+crates/cuma-server-acp/tests/acp_round_trip.rs
+  s_3e8fd5faa7b358::t_a5658e9640e471 63-66,80-87
+  s_3e8fd5faa7b358::t_8db4151c074661 67,174,812-814,830-831
+  s_3e8fd5faa7b358::t_562d03678894b1 173,175
+  s_3e8fd5faa7b358::t_ed2f9bf5c0fa6f 88,747-811,815-829,832-892
+  s_3e8fd5faa7b358::t_b226c2c66e7a6f 126-134
+  s_3e8fd5faa7b358::t_61dffd8dc9c733 89
+crates/cuma-router/src/explain.rs
+  s_3e8fd5faa7b358::t_3119b637499374 66-69
+  s_3e8fd5faa7b358::t_c59dac044627a6 190
+crates/cuma-testkit/src/lib.rs
+  s_3e8fd5faa7b358::t_73e1680a54bbbe 357
+  s_3e8fd5faa7b358::t_d6488f31f321f6 209-211
+  s_3e8fd5faa7b358::t_a54c1eac5981c2 121
+  s_3e8fd5faa7b358::t_9e22be09670a8d 172-178
+  s_3e8fd5faa7b358::t_85ec042d333da8 99
+crates/cuma-server-acp/src/translate.rs
+  s_3e8fd5faa7b358::t_2ab38269eca89a 85-90,92-96
+  s_3e8fd5faa7b358::t_0b1e1ac9f44ae3 32-35
+  s_3e8fd5faa7b358::t_28ffa7a2a96715 227
+crates/cuma-orchestrator/src/executor.rs
+  s_3e8fd5faa7b358::t_2f98c82aef4d9d 268-280
+  s_3e8fd5faa7b358::t_e5b1399166fceb 303
+  s_3e8fd5faa7b358::t_69b1458d6553e4 7-8
+  s_3e8fd5faa7b358::t_53b3eac13d1c5a 487
+  s_3e8fd5faa7b358::t_82a85b124784a3 956
+  s_3e8fd5faa7b358::t_99e938a908837f 1283
+  s_3e8fd5faa7b358::t_8c6ca6229e48db 1248,1261-1262
+  s_3e8fd5faa7b358::t_6a37825c3e8a19 800
+  s_3e8fd5faa7b358::t_dbc4defb298db0 43-57
+  s_3e8fd5faa7b358::t_6275df90acc0e9 554
+  s_3e8fd5faa7b358::t_2a1e0f40284242 450
+  s_3e8fd5faa7b358::t_1d05fa51cd4798 685
+  s_3e8fd5faa7b358::t_79dfea2f228fc2 1310-1317,1325
+  s_3e8fd5faa7b358::t_15d56ee8616f00 717,735,744-745
+docs/PROTOCOLS.md
+  s_3e8fd5faa7b358::t_3f2da51cbefac4 151
+IMPLEMENTATION_PLAN.md
+  s_3e8fd5faa7b358::t_043636a1189721 7
+  s_3e8fd5faa7b358::t_8ea1d83ee88873 13
+docs/SECURITY.md
+  s_3e8fd5faa7b358::t_cefdc09df6b7c9 68-70
+docs/adr/ADR-016-mcp-sharing.md
+  s_3e8fd5faa7b358::t_d715e9d313a494 38-46
+crates/cuma-core/src/agent.rs
+  s_3e8fd5faa7b358::t_f41982e66a1b17 315-325
+crates/cuma-protocol-acp/src/adapter.rs
+  s_3e8fd5faa7b358::t_56afee36858e23 366
+  s_3e8fd5faa7b358::t_1e010e2a6c3b43 782-784
+  s_3e8fd5faa7b358::t_0880a2884a26b2 1239
+  s_3e8fd5faa7b358::t_82964cfe7fe53e 256-259,264,269-274,276
+  s_3e8fd5faa7b358::t_213fd9bea0bc5f 941-993,995-999,1001-1002,1004-1006,1008-1015
+  s_3e8fd5faa7b358::t_3d4d130f631556 149-197
+  s_3e8fd5faa7b358::t_aa1fcd979f6008 340-365,367-369
+  s_3e8fd5faa7b358::t_0facc0610b0e18 994,1000,1003,1007
+  s_3e8fd5faa7b358::t_345c7f780a7fec 6-7,15
+  s_3e8fd5faa7b358::t_fbdedaeb631d48 599-603,606,615
+crates/cuma-server-acp/src/session.rs
+  s_3e8fd5faa7b358::t_c1e38c81bd1a0d 231-233
+  s_3e8fd5faa7b358::t_743e7f56730163 488
+  s_3e8fd5faa7b358::t_f26ab9dc579ea9 21
+  s_3e8fd5faa7b358::t_1f3d8f2a08556d 494-543,548-549
+  s_3e8fd5faa7b358::t_8dcb89f50ab191 349-351
+  s_3e8fd5faa7b358::t_be0767109f53f2 58-65,70,76
+  s_3e8fd5faa7b358::t_5a8bc0a93ac539 380
+  s_3e8fd5faa7b358::t_af64dd4324a9fc 474
+  s_3e8fd5faa7b358::t_56afee36858e23 544-547
+  s_3e8fd5faa7b358::t_6215d45db09638 553
+  s_3e8fd5faa7b358::t_bb61213e8c1f4e 203-213
+  s_3e8fd5faa7b358::t_ef58d55b15445b 406
+  s_3e8fd5faa7b358::t_e58b579ce40f92 136-140,142,153-162,164-169,182-183,185
+  s_3e8fd5faa7b358::t_5484ad4712939a 363-364
+  s_3e8fd5faa7b358::t_390b26b2c82433 426
+  s_3e8fd5faa7b358::t_476d0d383be9ff 437,441-444
+crates/cuma-server-acp/src/lib.rs
+  s_3e8fd5faa7b358::t_05df78b19f6876 217,227-230
+  s_3e8fd5faa7b358::t_56afee36858e23 380-384
+  s_3e8fd5faa7b358::t_594c6f319534f5 374,378-379,385-386
+  s_3e8fd5faa7b358::t_90f6613c1714a0 93-100
+  s_3e8fd5faa7b358::t_1a9184c50cce96 168,172,183
+  s_3e8fd5faa7b358::t_29eb664732a805 28
+  s_3e8fd5faa7b358::t_28228d9bb92314 181,185-200,204
+  s_3e8fd5faa7b358::t_ce65e1fb8ac8e5 257-269
+crates/cuma-protocol-a2a/tests/a2a_lifecycle.rs
+  s_3e8fd5faa7b358::t_516b084616fc1a 121
+crates/cuma-router/src/router.rs
+  s_3e8fd5faa7b358::t_00bcdb016322e4 34-39
+  s_3e8fd5faa7b358::t_2553c563346c62 146-154
+  s_3e8fd5faa7b358::t_05ddac318f948d 370-374,394
+  s_3e8fd5faa7b358::t_f978b5559729ac 542-562,564-587,589-601
+  s_3e8fd5faa7b358::t_9b6d830cf4263b 51
+  s_3e8fd5faa7b358::t_e9f377e4d3108d 69-75
+  s_3e8fd5faa7b358::t_8db4151c074661 563,588
+CLAUDE.md
+  s_36f965c9602341::t_a1b7fb57e0c8e6 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8c38aa06c461a08ba527eb6d0247e5dfefdca761",
+  "prompts": {},
+  "sessions": {
+    "s_36f965c9602341": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_36f965c9602341",
+        "model": "unknown"
+      },
+      "human_author": "Italo A. G. <182202+italoag@users.noreply.github.com>"
+    },
+    "s_3e8fd5faa7b358": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "sunny-suit",
+        "model": "unknown"
+      },
+      "human_author": "Italo A. G. <182202+italoag@users.noreply.github.com>"
+    }
+  }
+}
