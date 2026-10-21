@@ -165,6 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn with_no_runtime_the_native_provider_claims_no_isolation() {
+        let security = SecurityConfig::default();
+        let unconfined =
+            NativeProvider::with_sandbox("none", AgentSandbox::with_runtime(&security, None));
+        assert_eq!(unconfined.capabilities().isolation, Isolation::Unknown);
+        let confined = NativeProvider::with_sandbox(
+            "jail",
+            AgentSandbox::with_runtime(&security, Some(AgentRuntime::Bubblewrap)),
+        );
+        assert_eq!(confined.capabilities().isolation, Isolation::Process);
+    }
+
+    #[test]
     fn only_ai_jail_is_reported_as_filtering_the_network() {
         let security = SecurityConfig::default();
         for (runtime, filters) in [

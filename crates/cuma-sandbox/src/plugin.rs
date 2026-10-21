@@ -442,6 +442,96 @@ esac
     }
 
     #[tokio::test]
+    async fn an_open_reply_with_an_empty_prefix_aborts_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = plugin(
+            dir.path(),
+            r#"cat >/dev/null
+echo "$1" >> "$log"
+case "$1" in
+  probe) echo '{"isolation":"microvm","workspace":"mounted"}' ;;
+  open) echo '{"prefix":[],"session":"s1"}' ;;
+  *) echo '{}' ;;
+esac
+"#,
+        );
+        let ws = tempfile::tempdir().unwrap();
+        let err = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("empty prefix"), "{err}");
+        let ops = std::fs::read_to_string(dir.path().join("ops")).unwrap();
+        assert_eq!(ops.lines().collect::<Vec<_>>(), ["probe", "open", "abort"]);
+    }
+
+    #[tokio::test]
+    async fn a_copying_plugin_that_returns_no_session_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = plugin(
+            dir.path(),
+            r#"cat >/dev/null
+case "$1" in
+  probe) echo '{"isolation":"microvm","workspace":"copied"}' ;;
+  open) echo '{"prefix":["vm","--"]}' ;;
+esac
+"#,
+        );
+        let ws = tempfile::tempdir().unwrap();
+        let err = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no session"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_merge_leaves_the_plugins_copy_unreleased() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "before\n").unwrap();
+        let copy = dir.path().join("copy");
+        let program = plugin(
+            dir.path(),
+            &format!(
+                r#"cat >/dev/null
+echo "$1" >> "$log"
+case "$1" in
+  probe) echo '{{"isolation":"microvm","workspace":"copied"}}' ;;
+  open) mkdir -p {copy}; cp -R {ws}/. {copy}/; echo after > {copy}/a.txt
+        echo '{{"prefix":["vm","--"],"session":"s1"}}' ;;
+  close) echo '{{"result_dir":"{copy}"}}' ;;
+  release) rm -rf {copy} ;;
+esac
+"#,
+                copy = copy.display(),
+                ws = ws.path().display()
+            ),
+        );
+        let launch = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .unwrap();
+        // A conflict, and nowhere to keep the sandbox's side of it.
+        std::fs::write(ws.path().join("a.txt"), "edited here\n").unwrap();
+        std::fs::create_dir_all(ws.path().join(".cuma")).unwrap();
+        std::fs::write(ws.path().join(".cuma/sandbox-results"), "in the way\n").unwrap();
+
+        assert!(launch.finish().await.is_err());
+        let ops = std::fs::read_to_string(dir.path().join("ops")).unwrap();
+        assert_eq!(ops.lines().collect::<Vec<_>>(), ["probe", "open", "close"]);
+        assert_eq!(
+            std::fs::read_to_string(copy.join("a.txt")).unwrap(),
+            "after\n",
+            "the agent's work is still where the plugin put it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_missing_plugin_fails_its_probe_and_a_bad_reply_is_an_error() {
         let p = provider(std::path::Path::new("/nonexistent/cuma-sandbox-x"));
         assert!(p.probe().await.is_err());

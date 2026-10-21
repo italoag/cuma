@@ -749,7 +749,7 @@ where
         errors: _,
     } = io;
     let (client, endpoint) = (lifecycle.client.clone(), tunnel.clone());
-    let feeding = tokio::spawn(async move {
+    let mut feeding = tokio::spawn(async move {
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (c1, e1, s1) = (client.clone(), endpoint.clone(), Arc::clone(&sequence));
         bridge::pump(
@@ -764,8 +764,24 @@ where
     });
 
     let mut text = String::new();
+    let mut fed = false;
     let outcome = loop {
-        let chunk = match stream.chunk().await {
+        // Input that cannot be delivered ends the relay: the agent would
+        // wait for it forever.
+        let next = tokio::select! {
+            next = stream.chunk() => next,
+            joined = &mut feeding, if !fed => {
+                fed = true;
+                match joined {
+                    Ok(Err(err)) => break Err(failure(
+                        &session.sandbox_id,
+                        format!("sending the agent its input: {err}"),
+                    )),
+                    _ => continue,
+                }
+            }
+        };
+        let chunk = match next {
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
                 break Err(failure(
@@ -1093,6 +1109,78 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    /// A tunnel that is healthy and holds its output open, but refuses every
+    /// byte of input.
+    async fn refusing_tunnel() -> u16 {
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/stdout",
+                get(|| async {
+                    let open = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b": open\n\n"))
+                    });
+                    Body::from_stream(futures::StreamExt::chain(open, futures::stream::pending()))
+                }),
+            )
+            .route(
+                "/stdin",
+                post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    #[tokio::test]
+    async fn an_input_that_cannot_be_delivered_ends_the_relay() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            root: root.path().to_path_buf(),
+            tunnel_port: refusing_tunnel().await,
+            deleted: Arc::default(),
+            exits: Arc::default(),
+            background: Arc::default(),
+        };
+        let url = serve(fake.clone()).await;
+        let session = Session {
+            server: format!("{url}/v1"),
+            api_key_ref: None,
+            sandbox_id: "osb1".into(),
+            execd: Endpoint {
+                url: url.clone(),
+                headers: BTreeMap::from([("X-EXECD-ACCESS-TOKEN".to_owned(), "t".to_owned())]),
+            },
+            tunnel_port: fake.tunnel_port,
+            cwd: None,
+            env: vec![],
+        };
+        let input: &'static [u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        // The output stays open with nothing on it: unwatched, the relay
+        // would wait on it forever.
+        let relayed = tokio::time::timeout(
+            Duration::from_secs(20),
+            relay(
+                &session,
+                &["cat".to_owned()],
+                Stdio {
+                    input,
+                    output: &mut output,
+                    errors: &mut errors,
+                },
+            ),
+        )
+        .await;
+        fake.stop_background();
+        let err = relayed
+            .expect("the relay must end when its input cannot be delivered")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sending the agent its input"), "{err}");
     }
 
     #[tokio::test]

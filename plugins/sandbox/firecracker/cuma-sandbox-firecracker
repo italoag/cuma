@@ -107,6 +107,16 @@ def directory_size(path):
     return total
 
 
+def env_lines(keep_env, environ):
+    """The assignments cuma-init sources. A name that is not a variable name
+    would be shell syntax, so it is left out."""
+    return [
+        f"{name}={sh_quote(environ[name])}\n"
+        for name in keep_env
+        if ENV_NAME.fullmatch(name) and name in environ
+    ]
+
+
 def sh_quote(value):
     return "'" + value.replace("'", "'\\''") + "'"
 
@@ -126,15 +136,8 @@ def build_image(session, workspace, keep_env, options):
         unpack = subprocess.run(["tar", "-C", os.path.join(stage, "ws"), "-xf", "-"], stdin=pack.stdout)
         if pack.wait() != 0 or unpack.returncode != 0:
             fail("copying the workspace failed")
-    # cuma-init sources this file: a name that is not a variable name would
-    # be shell syntax, so it is left out.
-    lines = [
-        f"{name}={sh_quote(os.environ[name])}\n"
-        for name in keep_env
-        if ENV_NAME.fullmatch(name) and name in os.environ
-    ]
     with open(os.open(os.path.join(stage, "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as env:
-        env.writelines(lines)
+        env.writelines(env_lines(keep_env, os.environ))
     size_mib = int(options.get("workspace_size_mib") or (directory_size(stage) * 2 // (1024 * 1024) + 512))
     image = os.path.join(session, "workspace.ext4")
     run("mke2fs", "-q", "-t", "ext4", "-O", "^has_journal", "-L", "cuma-ws", "-d", stage, image, f"{size_mib}M")
