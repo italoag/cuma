@@ -392,8 +392,10 @@ pub fn check_a2a_exposure(
 ///
 /// "Configure an agent" is wrong advice when agents are configured and were
 /// refused because `security.require_agent_sandbox` cannot be met.
-pub fn no_agents_reason(config: &Config) -> String {
+pub async fn no_agents_reason(config: &Config) -> String {
     let sandboxes = sandbox_registry(config);
+    // Judged as `build_orchestrator` judged them: plugins are asked first.
+    probe_plugins(config, &sandboxes, &mut Vec::new()).await;
     no_agents_reason_under(config, &refusals(config, |id| sandboxes.for_agent(id)))
 }
 
@@ -1023,6 +1025,46 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let refused = refusals(&config, |id| sandboxes.for_agent(id));
         assert!(refused.is_empty(), "{refused:?}");
+
+        // Explaining why no agent is available judges it the same way.
+        let reason = no_agents_reason(&config).await;
+        assert!(!reason.contains("fall short"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_explanation_probes_a_plugin_before_blaming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("cuma-sandbox-filtering");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = probe ] && \
+             echo '{\"isolation\":\"microvm\",\"workspace\":\"mounted\",\"network_allowlist\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config::from_toml(&format!(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "plugin"
+            program = "{}"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            "#,
+            plugin.display()
+        ))
+        .unwrap();
+
+        let reason = no_agents_reason(&config).await;
+
+        // The agent was not refused for its sandbox: it failed some other way.
+        assert!(!reason.contains("fall short"), "{reason}");
+        assert!(reason.contains("could not be registered"), "{reason}");
     }
 
     #[test]

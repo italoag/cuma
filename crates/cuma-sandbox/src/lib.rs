@@ -276,10 +276,17 @@ pub(crate) fn guest_readable(request: &LaunchRequest) -> Vec<String> {
 
 /// [`guest_readable`] for sandboxes that mount only directories: a named file
 /// brings its directory — never the home directory or one above it, which
-/// would expose far more than the file. What the workspace mount already
-/// covers is left out.
+/// would expose far more than the file. What the workspace and the agent's
+/// state already mount is left out: mounted read-only again on top, it would
+/// turn writable state read-only.
 pub(crate) fn guest_readable_dirs(request: &LaunchRequest) -> Vec<String> {
     let workspace = canonical(&request.workspace);
+    let state: Vec<String> = request
+        .state
+        .iter()
+        .filter(|p| p.exists())
+        .map(|p| canonical(p))
+        .collect();
     let home = dirs::home_dir().map(|h| canonical(&h));
     let within = |path: &str, dir: &str| path == dir || path.starts_with(&format!("{dir}/"));
     let mut found: Vec<String> = guest_readable(request)
@@ -293,7 +300,7 @@ pub(crate) fn guest_readable_dirs(request: &LaunchRequest) -> Vec<String> {
             }
         })
         .filter(|dir| dir != "/" && !home.as_deref().is_some_and(|home| within(home, dir)))
-        .filter(|dir| !within(dir, &workspace))
+        .filter(|dir| !within(dir, &workspace) && !state.iter().any(|s| within(dir, s)))
         .collect();
     found.sort();
     found.dedup();
@@ -383,6 +390,29 @@ mod tests {
         // The tools directory comes; the workspace already does; the home
         // directory never does, whatever file in it was named.
         assert_eq!(guest_readable_dirs(&request), [canonical(tools.path())]);
+    }
+
+    #[test]
+    fn readable_directories_leave_out_what_the_workspace_and_state_mount() {
+        let ws = tempfile::tempdir().unwrap();
+        // An agent installed into its own state directory, outside home.
+        let state = tempfile::tempdir().unwrap();
+        let bin = state.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let agent = bin.join("agent");
+        std::fs::write(&agent, "").unwrap();
+        let mut request = LaunchRequest::bare(ws.path(), LaunchPurpose::Execute);
+        request.readable = vec![agent.clone()];
+        assert_eq!(
+            guest_readable_dirs(&request),
+            [canonical(&bin)],
+            "without state"
+        );
+
+        request.state = vec![state.path().to_path_buf()];
+
+        // Writable already: mounted read-only on top, the state would not be.
+        assert!(guest_readable_dirs(&request).is_empty());
     }
 
     #[test]

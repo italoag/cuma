@@ -184,6 +184,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let loaded = cuma_config::Config::load(&workspace)?;
+    let load_warnings = loaded.warnings;
     let mut config = loaded.config;
 
     // CLI flags are the highest-precedence layer, applied after every file and
@@ -198,6 +199,10 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Held for the whole run: dropping it flushes exported traces.
     let _telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
+    // Loading ran before logging existed; what it noticed is told now.
+    for warning in &load_warnings {
+        tracing::warn!("{warning}");
+    }
 
     let command = match &cli.command {
         None | Some(Command::Chat) => "chat",

@@ -36,7 +36,10 @@ uploaded. A file the agent created, changed or deleted is applied when the
 host copy is still what was uploaded. When the host copy changed too, that
 file is a conflict: nothing is overwritten, the task fails, and the sandbox's
 copy is kept under `.cuma/sandbox-results/<session>/` for a manual merge.
-CUMA's own state (`.cuma/`) is never uploaded.
+A link the agent made that points outside the workspace is refused the same
+way. CUMA's own state (`.cuma/`) is never uploaded. The archive a sandbox
+returns is read by CUMA itself rather than by `tar`, and applied all or
+nothing (see [SECURITY.md](SECURITY.md)).
 
 ### Choosing a sandbox
 

@@ -345,9 +345,9 @@ pub async fn run_goal(
     }
 
     if orchestrator.agents().is_empty().await {
-        return Err(MetaAgentError::Configuration(harness::no_agents_reason(
-            &config,
-        )));
+        return Err(MetaAgentError::Configuration(
+            harness::no_agents_reason(&config).await,
+        ));
     }
 
     if dry_run {
@@ -620,7 +620,7 @@ pub async fn serve(
     if orchestrator.agents().is_empty().await {
         return Err(MetaAgentError::Configuration(format!(
             "refusing to serve with nothing to route to — {}",
-            harness::no_agents_reason(&config)
+            harness::no_agents_reason(&config).await
         )));
     }
 
@@ -737,7 +737,7 @@ fn workspace_builder(
                 return Err(MetaAgentError::Configuration(format!(
                     "{}: {}",
                     workspace.display(),
-                    harness::no_agents_reason(&config)
+                    harness::no_agents_reason(&config).await
                 )));
             }
             Ok(orchestrator)
@@ -1431,7 +1431,7 @@ pub async fn doctor(
 
     let snapshot = orchestrator.agents().snapshot().await;
     if snapshot.is_empty() {
-        problems.push(harness::no_agents_reason(&config));
+        problems.push(harness::no_agents_reason(&config).await);
     } else {
         notes.push(format!(
             "agents: {} registered, {} routable",
