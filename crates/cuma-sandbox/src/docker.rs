@@ -206,11 +206,12 @@ struct Container {
 }
 
 impl Container {
-    async fn remove(&self) {
+    /// Remove the container. Already gone (`--rm`) is the usual case, not
+    /// an error; anything else is, since nothing reaps it later.
+    async fn remove(&self) -> Result<()> {
         let mut args = self.global.clone();
         args.extend(["rm".to_owned(), "-f".to_owned(), self.id.clone()]);
-        // Already gone (`--rm`) is the usual case, not an error.
-        if let Err(err) = run(
+        match run(
             &self.sandbox,
             &self.program,
             &args,
@@ -219,9 +220,9 @@ impl Container {
             Duration::from_secs(60),
         )
         .await
-            && !err.to_string().contains("No such container")
         {
-            tracing::warn!(container = %self.id, error = %err, "removing the container failed");
+            Err(err) if !err.to_string().contains("No such container") => Err(err),
+            _ => Ok(()),
         }
     }
 }
@@ -229,12 +230,13 @@ impl Container {
 #[async_trait]
 impl SandboxSession for Container {
     async fn finish(&self) -> Result<()> {
-        self.remove().await;
-        Ok(())
+        self.remove().await
     }
 
     async fn abort(&self) {
-        self.remove().await;
+        if let Err(err) = self.remove().await {
+            tracing::warn!(container = %self.id, error = %err, "removing the container failed");
+        }
     }
 }
 

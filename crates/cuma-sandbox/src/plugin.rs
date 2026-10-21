@@ -221,12 +221,26 @@ impl SandboxProvider for PluginProvider {
             )
             .await?;
         if reply.prefix.first().is_none_or(|word| word.is_empty()) {
+            // The plugin may have created its sandbox already: undo it.
+            if let Some(session) = &reply.session
+                && let Err(err) = program.call("abort", &json!({ "session": session })).await
+            {
+                tracing::warn!(sandbox = %self.name, error = %err, "the plugin's abort failed");
+            }
             return Err(failure(
                 &self.name,
                 "the plugin's open reply has an empty prefix",
             ));
         }
         let Some(session) = reply.session else {
+            // Without a session there is nothing to close, so nothing to
+            // bring a copied workspace back from.
+            if snapshot.is_some() {
+                return Err(failure(
+                    &self.name,
+                    "the plugin copies the workspace, but its open reply has no session to collect the work from",
+                ));
+            }
             return Ok(SandboxLaunch::new(reply.prefix));
         };
         let keep = request
@@ -292,11 +306,13 @@ impl SandboxSession for PluginSession {
                 "the plugin copies the workspace but its close reply has no result_dir",
             )
         })?;
-        let merged = Arc::clone(snapshot)
+        // Not released when the merge fails: the plugin's copy may then be
+        // all that is left of the agent's work.
+        let report = Arc::clone(snapshot)
             .merge_async(result, self.keep.clone())
-            .await;
-        // The plugin removes its copy; CUMA never deletes a path a plugin
-        // named.
+            .await?;
+        // Merged: the plugin removes its copy; CUMA never deletes a path a
+        // plugin named.
         if let Err(err) = self
             .program
             .call("release", &json!({ "session": self.session }))
@@ -304,7 +320,6 @@ impl SandboxSession for PluginSession {
         {
             tracing::warn!(sandbox = %self.program.sandbox, error = %err, "the plugin's release failed");
         }
-        let report = merged?;
         tracing::info!(sandbox = %self.program.sandbox, %report, "brought the agent's work back");
         Ok(())
     }

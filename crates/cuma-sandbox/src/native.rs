@@ -68,7 +68,13 @@ impl SandboxProvider for NativeProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            isolation: Isolation::Process,
+            // With no runtime working here the agent runs unconfined: claim
+            // no isolation that is not there.
+            isolation: if self.sandbox.runtime().is_some() {
+                Isolation::Process
+            } else {
+                Isolation::Unknown
+            },
             workspace: WorkspaceAccess::Mounted,
             network_allowlist: self.sandbox.filters_network(),
             secrets_outside: false,

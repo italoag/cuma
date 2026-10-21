@@ -519,10 +519,12 @@ impl cuma_protocol_acp::AgentLauncher for ProviderLauncher {
     }
 
     fn runs_elsewhere(&self) -> bool {
-        !matches!(
-            self.provider.capabilities().isolation,
-            cuma_sandbox::Isolation::Process
-        )
+        // Native sandboxes run here, confined or (with no runtime) not.
+        self.provider.kind() != "native"
+            && !matches!(
+                self.provider.capabilities().isolation,
+                cuma_sandbox::Isolation::Process
+            )
     }
 
     async fn open(
