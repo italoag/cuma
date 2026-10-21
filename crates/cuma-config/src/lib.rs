@@ -58,8 +58,7 @@ impl Config {
         let mut config = Config::default();
         let mut sources = vec![ConfigSource::Default];
 
-        if let Some(global) = global_config_path()
-            && global.exists()
+        if let Some(global) = global_config_file(global_config_path(), legacy_global_config_path())
         {
             let layer = Self::from_file(&global)?;
             config.merge(layer);
@@ -109,6 +108,32 @@ pub fn global_config_path() -> Option<PathBuf> {
     base.map(|dir| dir.join("cuma").join("config.toml"))
 }
 
+/// Where the global configuration lived before it moved to
+/// [`global_config_path`]: `~/Library/Application Support/cuma` on macOS.
+fn legacy_global_config_path() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        dirs::config_dir().map(|dir| dir.join("cuma").join("config.toml"))
+    } else {
+        None
+    }
+}
+
+/// The global file to load: the documented one, else one left at the old
+/// location — read, and named in a warning and in `cuma doctor`'s sources,
+/// rather than silently dropped by an upgrade.
+fn global_config_file(documented: Option<PathBuf>, legacy: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = documented.as_ref().filter(|path| path.exists()) {
+        return Some(path.clone());
+    }
+    let legacy = legacy.filter(|path| path.exists())?;
+    tracing::warn!(
+        found = %legacy.display(),
+        documented = %documented.as_deref().unwrap_or(Path::new("~/.config/cuma/config.toml")).display(),
+        "the global configuration is at its old location; move it to the documented one"
+    );
+    Some(legacy)
+}
+
 /// `$XDG_CONFIG_HOME` when it is absolute — the XDG specification ignores a
 /// relative one — and `~/.config` otherwise.
 #[cfg(not(windows))]
@@ -136,6 +161,31 @@ pub fn expand_home(path: &str) -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn a_global_file_left_at_the_old_location_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let documented = dir.path().join("new/cuma/config.toml");
+        let legacy = dir.path().join("old/cuma/config.toml");
+        assert_eq!(
+            global_config_file(Some(documented.clone()), Some(legacy.clone())),
+            None
+        );
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "").unwrap();
+        assert_eq!(
+            global_config_file(Some(documented.clone()), Some(legacy.clone())),
+            Some(legacy.clone()),
+            "an upgrade must not drop it"
+        );
+        std::fs::create_dir_all(documented.parent().unwrap()).unwrap();
+        std::fs::write(&documented, "").unwrap();
+        assert_eq!(
+            global_config_file(Some(documented.clone()), Some(legacy)),
+            Some(documented),
+            "the documented location wins"
+        );
+    }
 
     #[test]
     fn a_leading_tilde_is_the_home_directory_and_nothing_else_is_touched() {
