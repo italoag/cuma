@@ -20,6 +20,7 @@ use crate::{
 use async_trait::async_trait;
 use cuma_config::sandbox::KubernetesSandbox;
 use cuma_core::error::Result;
+use cuma_core::ports::LaunchPurpose;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -280,7 +281,25 @@ impl SandboxProvider for KubernetesProvider {
                 ));
             }
         }
-        Ok(())
+        // Only running something inside proves that the controller, the
+        // runtime class, the image and the pod's start all work.
+        let ws = tempfile::tempdir().map_err(|e| failure(&self.name, e))?;
+        let launch = self
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Negotiate))
+            .await?;
+        let mut words = launch.prefix().to_vec();
+        words.push("true".to_owned());
+        let ran = run(
+            &self.name,
+            &words[0],
+            &words[1..],
+            Input::Nothing,
+            Output::Capture,
+            Duration::from_secs(60),
+        )
+        .await;
+        launch.finish().await?;
+        ran.map(drop)
     }
 
     async fn open(&self, request: &LaunchRequest) -> Result<SandboxLaunch> {
@@ -525,6 +544,8 @@ mod tests {
 root={root}
 echo "$@" >> {log}
 case "$1" in
+  get) exit 0 ;;
+  auth) echo yes ;;
   apply) name=$(sed -n 's/.*"name":"\(cuma-[0-9a-f]*\)".*/\1/p'); mkdir -p "$root/$name/tmp" ;;
   wait) exit 0 ;;
   delete) rm -rf "$root/${{2#*/}}" ;;
@@ -536,7 +557,8 @@ case "$1" in
         else
           cmd=$(printf '%s' "$3" | sed "s#/tmp/#$root/$pod/tmp/#g")
           ws="$root/$pod$5"
-          sh -c "$cmd" sh "$ws"
+          if [ $# -ge 5 ]; then shift 5; else set --; fi
+          sh -c "$cmd" sh "$ws" "$@"
         fi ;;
 esac
 "#,
@@ -547,6 +569,35 @@ esac
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn the_probe_runs_true_inside_a_sandbox_and_deletes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubectl = fake_kubectl(dir.path());
+        let p = KubernetesProvider::new(
+            "cluster",
+            KubernetesSandbox {
+                program: kubectl.display().to_string(),
+                ..settings()
+            },
+        );
+        p.probe().await.unwrap();
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.starts_with("exec ") && line.ends_with(" true")),
+            "{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.starts_with("delete sandbox/")),
+            "{calls}"
+        );
+        let left = std::fs::read_dir(dir.path().join("pods")).unwrap().count();
+        assert_eq!(left, 0, "nothing is left behind");
     }
 
     #[tokio::test]

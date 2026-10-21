@@ -128,6 +128,16 @@ fn check_archive(archive: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A hidden name beside `target` for a merge's staged or set-aside copy:
+/// the same directory, so moving it into place is a rename.
+fn beside(target: &Path, index: usize, tag: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.cuma-{}-{index}.{tag}", std::process::id()))
+}
+
 /// Run blocking file work — hashing, archiving, merging — off the async
 /// runtime's workers.
 async fn off_runtime<T: Send + 'static>(
@@ -377,36 +387,115 @@ impl Snapshot {
         {
             self.inside(path)?;
         }
-        for (path, entry) in &writes {
-            let target = self.inside(path)?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(io("creating a directory"))?;
-                self.check_inside(parent)?;
+        // Every new file is first written beside its target, so a failure
+        // while writing — a full disk, a read-only directory — changes
+        // nothing. Then each is renamed into place, what it replaces and what
+        // is deleted set aside until every step has succeeded, and put back
+        // if one fails.
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if let Err(err) = self.stage(result, &writes, &mut staged) {
+            for (stage, _) in &staged {
+                let _ = std::fs::remove_file(stage);
             }
-            if target.is_symlink() || target.exists() {
-                std::fs::remove_file(&target).map_err(io("replacing a file"))?;
-            }
-            match entry {
-                Entry::File { executable, .. } => {
-                    std::fs::copy(result.join(path), &target).map_err(io("writing a file"))?;
-                    let mode = if *executable { 0o755 } else { 0o644 };
-                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
-                        .map_err(io("setting permissions"))?;
-                }
-                Entry::Link(points_to) => {
-                    std::os::unix::fs::symlink(points_to, &target)
-                        .map_err(io("creating a link"))?;
-                }
-            }
+            return Err(err);
         }
-        for path in &deletes {
-            let target = self.inside(path)?;
-            std::fs::remove_file(&target).map_err(io("deleting a file"))?;
+        let mut placed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let mut set_aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if let Err(err) = self.commit(&staged, &deletes, &mut placed, &mut set_aside) {
+            for (target, old) in set_aside.iter().rev() {
+                let _ = std::fs::rename(old, target);
+            }
+            for (target, replaced) in placed.iter().rev() {
+                let _ = std::fs::remove_file(target);
+                if let Some(old) = replaced {
+                    let _ = std::fs::rename(old, target);
+                }
+            }
+            for (stage, _) in &staged {
+                let _ = std::fs::remove_file(stage);
+            }
+            return Err(err);
+        }
+        for old in placed
+            .iter()
+            .filter_map(|(_, replaced)| replaced.as_ref())
+            .chain(set_aside.iter().map(|(_, old)| old))
+        {
+            if let Err(err) = std::fs::remove_file(old) {
+                tracing::warn!(path = %old.display(), error = %err, "removing a replaced file failed");
+            }
         }
         Ok(MergeReport {
             written: writes.len(),
             deleted: deletes.len(),
         })
+    }
+
+    /// Rename each staged file into place and set each deleted one aside,
+    /// recording every step in `placed` and `set_aside` so a failure can
+    /// undo them.
+    fn commit(
+        &self,
+        staged: &[(PathBuf, PathBuf)],
+        deletes: &[&PathBuf],
+        placed: &mut Vec<(PathBuf, Option<PathBuf>)>,
+        set_aside: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<()> {
+        for (i, (stage, target)) in staged.iter().enumerate() {
+            let replaced = target
+                .symlink_metadata()
+                .is_ok()
+                .then(|| beside(target, i, "old"));
+            if let Some(old) = &replaced {
+                std::fs::rename(target, old).map_err(io("replacing a file"))?;
+            }
+            placed.push((target.clone(), replaced));
+            std::fs::rename(stage, target).map_err(io("writing a file"))?;
+        }
+        for (i, path) in deletes.iter().enumerate() {
+            let target = self.inside(path)?;
+            let old = beside(&target, staged.len() + i, "old");
+            std::fs::rename(&target, &old).map_err(io("deleting a file"))?;
+            set_aside.push((target, old));
+        }
+        Ok(())
+    }
+
+    /// Write each of `writes` beside its target, recording each staged path
+    /// (even a partly written one) in `staged` so a failure can remove it.
+    fn stage(
+        &self,
+        result: &Path,
+        writes: &[(&PathBuf, &Entry)],
+        staged: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<()> {
+        for (i, (path, entry)) in writes.iter().enumerate() {
+            let target = self.inside(path)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(io("creating a directory"))?;
+                self.check_inside(parent)?;
+            }
+            if target.is_dir() && !target.is_symlink() {
+                return Err(MetaAgentError::Other(format!(
+                    "{} is a directory here and a file in the sandbox",
+                    path.display()
+                )));
+            }
+            let stage = beside(&target, i, "new");
+            staged.push((stage.clone(), target));
+            match entry {
+                Entry::File { executable, .. } => {
+                    std::fs::copy(result.join(path), &stage).map_err(io("writing a file"))?;
+                    let mode = if *executable { 0o755 } else { 0o644 };
+                    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(mode))
+                        .map_err(io("setting permissions"))?;
+                }
+                Entry::Link(points_to) => {
+                    std::os::unix::fs::symlink(points_to, &stage).map_err(io("creating a link"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `relative` within the workspace, refusing anything that would leave it.
@@ -816,6 +905,82 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn a_merge_that_cannot_write_everything_writes_nothing() {
+        let (ws, snapshot, work, sandbox) = handed_over(|root| {
+            write(root, "a.txt", "v1\n");
+            write(root, "locked/b.txt", "v1\n");
+            write(root, "gone.txt", "delete me\n");
+        });
+        write(&sandbox, "a.txt", "v2\n");
+        write(&sandbox, "locked/b.txt", "v2\n");
+        std::fs::remove_file(sandbox.join("gone.txt")).unwrap();
+        // The second write cannot happen: its directory is read-only here.
+        let locked = ws.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(locked.join("probe"), "").is_ok() {
+            // Running as root: permissions cannot make a write fail.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let merged = snapshot.merge(&sandbox, &work.path().join("keep"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(merged.is_err());
+        assert_eq!(read(ws.path(), "a.txt").unwrap(), "v1\n", "nothing applied");
+        assert_eq!(read(ws.path(), "gone.txt").unwrap(), "delete me\n");
+        let mut left: Vec<String> = std::fs::read_dir(ws.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["a.txt", "gone.txt", "locked"],
+            "no staged file is left"
+        );
+    }
+
+    #[test]
+    fn a_workspace_below_the_repository_root_is_copied_whole() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        write(repo.path(), "top.txt", "outside the workspace\n");
+        write(repo.path(), "sub/a.txt", "tracked\n");
+        write(repo.path(), "sub/inner/c.txt", "tracked deeper\n");
+        write(repo.path(), "sub/.gitignore", "ignored.log\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        write(repo.path(), "sub/b.txt", "untracked\n");
+        write(repo.path(), "sub/ignored.log", "ignored\n");
+        let work = tempfile::tempdir().unwrap();
+
+        let snapshot = Snapshot::take(&repo.path().join("sub"), work.path()).unwrap();
+
+        let listed = std::process::Command::new("tar")
+            .arg("-tf")
+            .arg(snapshot.archive().unwrap())
+            .output()
+            .unwrap();
+        let names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .map(|name| name.trim_start_matches("./").to_owned())
+            .collect();
+        for present in ["a.txt", "b.txt", "inner/c.txt", ".gitignore"] {
+            assert!(
+                names.iter().any(|n| n == present),
+                "{present} missing: {names:?}"
+            );
+        }
+        for absent in ["ignored.log", "top.txt", "sub/a.txt"] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "{absent} copied: {names:?}"
+            );
+        }
     }
 
     #[test]

@@ -345,9 +345,12 @@ moves files, and exposes ports through `/sandboxes/{id}/endpoints/{port}`.
   (`cuma-tunnel.mjs`, uploaded through `execd`), and the bridge relays stdio
   over the tunnel's endpoint: output as server-sent events, input as ordered
   POSTs. `finish` deletes the sandbox.
-- **Workspace** — mounted through a host-path volume when `mount_workspace =
-  true` (runtimes that allow host mounts, such as the Docker runtime); copied
-  through `execd`'s file API otherwise.
+- **Workspace** — mounted through host-path volumes when `mount_workspace =
+  true` (runtimes that allow host mounts, such as the Docker runtime): the
+  workspace, a worktree's repository and the agent's `state` writable (state
+  under your home lands under `/root`), and the directories of the paths its
+  command names read-only. The server's host-path allowlist must permit them
+  all. Copied through `execd`'s file API otherwise.
 - **Network** — `security.network_allowlist` becomes the sandbox's egress
   policy (deny by default, allow the listed hosts).
 - **Credentials** — names in `env` are sent as the command's environment over
@@ -403,7 +406,10 @@ agents as the use of `msb exec --stream`.
   --net-rule allow@host,…`.
 - **Credentials** — `secrets` become `--secret NAME@host,…`: `msb` reads the
   variable from CUMA's environment and the guest only sees a placeholder that
-  is substituted for the listed hosts.
+  is substituted for the listed hosts. Values written in the sandbox's own
+  `env` table are configuration, not credentials: `msb` takes them only as
+  `-e NAME=value`, so they are visible in the process list while `msb create`
+  runs (CUMA's own errors show the name only). Put a credential in `secrets`.
 - **Requirements** — `msb`; Apple Silicon macOS, Linux with KVM, or Windows
   with WHP.
 - **Status** — built in, and exercised live on macOS (Apple M3 Pro, `msb`
