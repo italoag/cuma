@@ -181,7 +181,7 @@ apparatus.
 
 ## Status
 
-840 tests, clippy clean with warnings denied, checked on the MSRV. Verified
+866 tests, clippy clean with warnings denied, checked on the MSRV. Verified
 against a live ACP agent; against the real ACP client SDK driving CUMA as an
 agent (including concurrent sessions, cancellation and reload); against
 scripted A2A peers in both dialects over real HTTP and SSE; and against a real

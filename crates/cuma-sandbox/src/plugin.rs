@@ -221,12 +221,26 @@ impl SandboxProvider for PluginProvider {
             )
             .await?;
         if reply.prefix.first().is_none_or(|word| word.is_empty()) {
+            // The plugin may have created its sandbox already: undo it.
+            if let Some(session) = &reply.session
+                && let Err(err) = program.call("abort", &json!({ "session": session })).await
+            {
+                tracing::warn!(sandbox = %self.name, error = %err, "the plugin's abort failed");
+            }
             return Err(failure(
                 &self.name,
                 "the plugin's open reply has an empty prefix",
             ));
         }
         let Some(session) = reply.session else {
+            // Without a session there is nothing to close, so nothing to
+            // bring a copied workspace back from.
+            if snapshot.is_some() {
+                return Err(failure(
+                    &self.name,
+                    "the plugin copies the workspace, but its open reply has no session to collect the work from",
+                ));
+            }
             return Ok(SandboxLaunch::new(reply.prefix));
         };
         let keep = request
@@ -292,11 +306,13 @@ impl SandboxSession for PluginSession {
                 "the plugin copies the workspace but its close reply has no result_dir",
             )
         })?;
-        let merged = Arc::clone(snapshot)
+        // Not released when the merge fails: the plugin's copy may then be
+        // all that is left of the agent's work.
+        let report = Arc::clone(snapshot)
             .merge_async(result, self.keep.clone())
-            .await;
-        // The plugin removes its copy; CUMA never deletes a path a plugin
-        // named.
+            .await?;
+        // Merged: the plugin removes its copy; CUMA never deletes a path a
+        // plugin named.
         if let Err(err) = self
             .program
             .call("release", &json!({ "session": self.session }))
@@ -304,7 +320,6 @@ impl SandboxSession for PluginSession {
         {
             tracing::warn!(sandbox = %self.program.sandbox, error = %err, "the plugin's release failed");
         }
-        let report = merged?;
         tracing::info!(sandbox = %self.program.sandbox, %report, "brought the agent's work back");
         Ok(())
     }
@@ -423,6 +438,96 @@ esac
         assert!(
             !copy.exists(),
             "the plugin removed its copy after the merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_reply_with_an_empty_prefix_aborts_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = plugin(
+            dir.path(),
+            r#"cat >/dev/null
+echo "$1" >> "$log"
+case "$1" in
+  probe) echo '{"isolation":"microvm","workspace":"mounted"}' ;;
+  open) echo '{"prefix":[],"session":"s1"}' ;;
+  *) echo '{}' ;;
+esac
+"#,
+        );
+        let ws = tempfile::tempdir().unwrap();
+        let err = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("empty prefix"), "{err}");
+        let ops = std::fs::read_to_string(dir.path().join("ops")).unwrap();
+        assert_eq!(ops.lines().collect::<Vec<_>>(), ["probe", "open", "abort"]);
+    }
+
+    #[tokio::test]
+    async fn a_copying_plugin_that_returns_no_session_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = plugin(
+            dir.path(),
+            r#"cat >/dev/null
+case "$1" in
+  probe) echo '{"isolation":"microvm","workspace":"copied"}' ;;
+  open) echo '{"prefix":["vm","--"]}' ;;
+esac
+"#,
+        );
+        let ws = tempfile::tempdir().unwrap();
+        let err = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no session"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_merge_leaves_the_plugins_copy_unreleased() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "before\n").unwrap();
+        let copy = dir.path().join("copy");
+        let program = plugin(
+            dir.path(),
+            &format!(
+                r#"cat >/dev/null
+echo "$1" >> "$log"
+case "$1" in
+  probe) echo '{{"isolation":"microvm","workspace":"copied"}}' ;;
+  open) mkdir -p {copy}; cp -R {ws}/. {copy}/; echo after > {copy}/a.txt
+        echo '{{"prefix":["vm","--"],"session":"s1"}}' ;;
+  close) echo '{{"result_dir":"{copy}"}}' ;;
+  release) rm -rf {copy} ;;
+esac
+"#,
+                copy = copy.display(),
+                ws = ws.path().display()
+            ),
+        );
+        let launch = provider(&program)
+            .open(&LaunchRequest::bare(ws.path(), LaunchPurpose::Execute))
+            .await
+            .unwrap();
+        // A conflict, and nowhere to keep the sandbox's side of it.
+        std::fs::write(ws.path().join("a.txt"), "edited here\n").unwrap();
+        std::fs::create_dir_all(ws.path().join(".cuma")).unwrap();
+        std::fs::write(ws.path().join(".cuma/sandbox-results"), "in the way\n").unwrap();
+
+        assert!(launch.finish().await.is_err());
+        let ops = std::fs::read_to_string(dir.path().join("ops")).unwrap();
+        assert_eq!(ops.lines().collect::<Vec<_>>(), ["probe", "open", "close"]);
+        assert_eq!(
+            std::fs::read_to_string(copy.join("a.txt")).unwrap(),
+            "after\n",
+            "the agent's work is still where the plugin put it"
         );
     }
 

@@ -68,7 +68,13 @@ impl SandboxProvider for NativeProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            isolation: Isolation::Process,
+            // With no runtime working here the agent runs unconfined: claim
+            // no isolation that is not there.
+            isolation: if self.sandbox.runtime().is_some() {
+                Isolation::Process
+            } else {
+                Isolation::Unknown
+            },
             workspace: WorkspaceAccess::Mounted,
             network_allowlist: self.sandbox.filters_network(),
             secrets_outside: false,
@@ -156,6 +162,19 @@ mod tests {
         assert!(launch.prefix().is_empty());
         let err = provider.probe().await.unwrap_err().to_string();
         assert!(err.contains("UNCONFINED"), "{err}");
+    }
+
+    #[test]
+    fn with_no_runtime_the_native_provider_claims_no_isolation() {
+        let security = SecurityConfig::default();
+        let unconfined =
+            NativeProvider::with_sandbox("none", AgentSandbox::with_runtime(&security, None));
+        assert_eq!(unconfined.capabilities().isolation, Isolation::Unknown);
+        let confined = NativeProvider::with_sandbox(
+            "jail",
+            AgentSandbox::with_runtime(&security, Some(AgentRuntime::Bubblewrap)),
+        );
+        assert_eq!(confined.capabilities().isolation, Isolation::Process);
     }
 
     #[test]

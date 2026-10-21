@@ -2,7 +2,7 @@
 
 ## Where things stand
 
-840 tests passing, clippy clean with warnings denied, checked on the MSRV
+866 tests passing, clippy clean with warnings denied, checked on the MSRV
 (Rust 1.88) with and without the `otel` feature.
 
 | Milestone | State |

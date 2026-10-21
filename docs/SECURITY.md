@@ -167,7 +167,15 @@ The providers in [SANDBOXES.md](SANDBOXES.md) keep the same commitments:
   here is a conflict, nothing is applied, the task fails, and the sandbox's
   copy is kept under `.cuma/sandbox-results/`. Paths that would leave the
   workspace — through `..` or a symbolic link — are refused before anything is
-  written. `.git` is never merged back.
+  written, and so is a link the sandbox made that points outside it. `.git` is
+  never merged back.
+- **The sandbox's archive is read, not trusted.** CUMA reads a returned tar
+  archive itself, into a directory it has just created, so the names it
+  checks are the names it writes: absolute names, `..`, members below a link
+  the archive planted, hard links to anything but an earlier file, and devices
+  are refused. Applying a merge writes each file beside its target under a
+  name created exclusively for it, then renames it into place; a failure part
+  way puts everything back.
 - **Never outlived.** A launch's sandbox is torn down after the turn, and
   when the turn is abandoned (timeout, cancellation) the dropped launch tears
   it down too. Kubernetes, ArcBox, e2b and OpenSandbox sandboxes also carry a
