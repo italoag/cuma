@@ -28,7 +28,7 @@ ACP, A2A and MCP.
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 840 tests
+cargo test --workspace              # 866 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 
