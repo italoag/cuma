@@ -329,6 +329,9 @@ pub(crate) fn env_file(names: &[String]) -> String {
 fn env_file_with(names: &[String], value: impl Fn(&str) -> Option<String>) -> String {
     names
         .iter()
+        // The file is sourced by a shell: a name that is not a variable name
+        // would be shell syntax, so it is left out.
+        .filter(|name| cuma_config::sandbox::is_env_name(name))
         .filter_map(|name| {
             let value = value(name)?;
             Some(format!("{name}='{}'\n", value.replace('\'', "'\\''")))
@@ -390,6 +393,19 @@ mod tests {
             "/root/.config/devin"
         );
         assert_eq!(guest_path(Path::new("/opt/state"), "/root"), "/opt/state");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_variable_name_never_reaches_the_shell() {
+        let file = env_file_with(
+            &[
+                "OK_NAME".to_owned(),
+                "X=1; touch /tmp/pwned #".to_owned(),
+                "$(id)".to_owned(),
+            ],
+            |_| Some("v".to_owned()),
+        );
+        assert_eq!(file, "OK_NAME='v'\n");
     }
 
     #[test]

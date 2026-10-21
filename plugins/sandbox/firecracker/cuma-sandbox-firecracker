@@ -45,6 +45,7 @@ docs/SANDBOXES.md.
 import base64
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -58,6 +59,7 @@ PLUGIN = os.path.abspath(__file__)
 # What cuma-init prints on the console once it is raw and the agent starts.
 READY = b"CUMA-INIT-READY"
 BOOT_TIMEOUT = 120
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def read_request():
@@ -124,7 +126,13 @@ def build_image(session, workspace, keep_env, options):
         unpack = subprocess.run(["tar", "-C", os.path.join(stage, "ws"), "-xf", "-"], stdin=pack.stdout)
         if pack.wait() != 0 or unpack.returncode != 0:
             fail("copying the workspace failed")
-    lines = [f"{name}={sh_quote(os.environ[name])}\n" for name in keep_env if name in os.environ]
+    # cuma-init sources this file: a name that is not a variable name would
+    # be shell syntax, so it is left out.
+    lines = [
+        f"{name}={sh_quote(os.environ[name])}\n"
+        for name in keep_env
+        if ENV_NAME.fullmatch(name) and name in os.environ
+    ]
     with open(os.open(os.path.join(stage, "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as env:
         env.writelines(lines)
     size_mib = int(options.get("workspace_size_mib") or (directory_size(stage) * 2 // (1024 * 1024) + 512))

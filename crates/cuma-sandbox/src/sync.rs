@@ -68,6 +68,66 @@ impl std::fmt::Display for MergeReport {
     }
 }
 
+/// Refuse an archive that would write outside where it is unpacked: an
+/// absolute name, a `..`, or a member below an entry the archive made a file
+/// or a link — extracting through a link it planted itself.
+fn check_archive(archive: &Path) -> Result<()> {
+    let listed = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(archive)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(io("running tar"))?;
+    if !listed.status.success() {
+        return Err(MetaAgentError::Other(format!(
+            "listing the sandbox's copy failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
+    }
+    let refuse = |name: &str, why: &str| {
+        Err(MetaAgentError::Other(format!(
+            "the sandbox's copy was refused: {name:?} {why}"
+        )))
+    };
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let mut leaves = std::collections::BTreeSet::new();
+    let mut names = Vec::new();
+    for raw in text.lines().filter(|line| !line.is_empty()) {
+        let name = raw.trim_start_matches("./").trim_end_matches('/');
+        let escapes = Path::new(name).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if raw.starts_with('/') || escapes {
+            return refuse(raw, "would be written outside the workspace");
+        }
+        if name.is_empty() || name == "." {
+            continue;
+        }
+        if !raw.ends_with('/') {
+            leaves.insert(PathBuf::from(name));
+        }
+        names.push(PathBuf::from(name));
+    }
+    for name in &names {
+        if name
+            .ancestors()
+            .skip(1)
+            .any(|parent| leaves.contains(parent))
+        {
+            return refuse(
+                &name.display().to_string(),
+                "lies below a file or link in the same archive",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run blocking file work — hashing, archiving, merging — off the async
 /// runtime's workers.
 async fn off_runtime<T: Send + 'static>(
@@ -209,8 +269,12 @@ impl Snapshot {
     /// Unpack `archive` — the sandbox's final copy — into `dir`, then
     /// [`merge`](Self::merge) it.
     pub fn merge_archive(&self, archive: &Path, dir: &Path, keep: &Path) -> Result<MergeReport> {
+        // The sandbox wrote this archive: nothing in it may reach outside
+        // `dir` while it is unpacked, before the merge checks anything.
+        check_archive(archive)?;
         std::fs::create_dir_all(dir).map_err(io("creating the unpack directory"))?;
         let unpacked = std::process::Command::new("tar")
+            .arg("--no-same-owner")
             .arg("-x")
             .arg("-f")
             .arg(archive)
@@ -649,6 +713,76 @@ mod tests {
         write(ws.path(), "gone.txt", "edited here\n");
         assert!(snapshot.merge(&sandbox, &work.path().join("keep")).is_err());
         assert_eq!(read(ws.path(), "gone.txt").unwrap(), "edited here\n");
+    }
+
+    /// A ustar archive of `(name, type, link target, content)` entries,
+    /// written by hand: what a hostile sandbox could hand back.
+    fn ustar(entries: &[(&str, u8, &str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, kind, link, data) in entries {
+            let mut header = [0u8; 512];
+            let field = |header: &mut [u8; 512], at: usize, value: &[u8]| {
+                header[at..at + value.len()].copy_from_slice(value);
+            };
+            field(&mut header, 0, name.as_bytes());
+            field(&mut header, 100, b"0000644\0");
+            field(&mut header, 108, b"0000000\0");
+            field(&mut header, 116, b"0000000\0");
+            field(
+                &mut header,
+                124,
+                format!("{:011o}\0", data.len()).as_bytes(),
+            );
+            field(&mut header, 136, b"00000000000\0");
+            field(&mut header, 148, b"        ");
+            header[156] = *kind;
+            field(&mut header, 157, link.as_bytes());
+            field(&mut header, 257, b"ustar\x0000");
+            let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+            field(&mut header, 148, format!("{sum:06o}\0 ").as_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(data);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+        }
+        out.resize(out.len() + 1024, 0);
+        out
+    }
+
+    #[test]
+    fn an_archive_reaching_outside_where_it_is_unpacked_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = |name: &str, entries: &[(&str, u8, &str, &[u8])]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, ustar(entries)).unwrap();
+            check_archive(&path)
+        };
+        // A link the archive plants, then a file written through it.
+        let through = check(
+            "through.tar",
+            &[
+                ("evil", b'2', "/tmp", b""),
+                ("evil/pwned", b'0', "", b"x\n"),
+            ],
+        );
+        assert!(
+            through
+                .unwrap_err()
+                .to_string()
+                .contains("below a file or link")
+        );
+        let up = check("up.tar", &[("../escape", b'0', "", b"x\n")]);
+        assert!(up.unwrap_err().to_string().contains("outside"));
+        let absolute = check("abs.tar", &[("/tmp/cuma-abs", b'0', "", b"x\n")]);
+        assert!(absolute.is_err());
+        // An ordinary copy passes.
+        check(
+            "ok.tar",
+            &[
+                ("./src/", b'5', "", b""),
+                ("./src/main.rs", b'0', "", b"fn main() {}\n"),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
