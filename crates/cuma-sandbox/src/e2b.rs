@@ -473,15 +473,28 @@ where
         mut errors,
     } = io;
     let mut input = Some(input);
-    let mut feeding: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    let mut feeding: Option<tokio::task::JoinHandle<()>> = None;
+    // Input that cannot be delivered ends the relay: the agent would wait
+    // for it forever.
+    let (failed_tx, mut failed_rx) = tokio::sync::mpsc::unbounded_channel::<MetaAgentError>();
     let outcome = loop {
-        match frames.next(&session.sandbox_id).await {
+        let next = tokio::select! {
+            next = frames.next(&session.sandbox_id) => next,
+            Some(err) = failed_rx.recv() => break Err(failure(
+                &session.sandbox_id,
+                format!("sending the agent its input: {err}"),
+            )),
+        };
+        match next {
             Ok(Some(Frame::Message(message))) => match Event::of(&message) {
                 Ok(Event::Start(pid)) => {
                     if let Some(input) = input.take() {
                         let (client, session) = (client.clone(), session.clone());
+                        let failed = failed_tx.clone();
                         feeding = Some(tokio::spawn(async move {
-                            feed(client, session, pid, input).await
+                            if let Err(err) = feed(client, session, pid, input).await {
+                                let _ = failed.send(err);
+                            }
                         }));
                     }
                 }
@@ -778,6 +791,7 @@ mod tests {
         files: Shared<HashMap<String, Vec<u8>>>,
         input: Shared<Option<Feed>>,
         started: Shared<Vec<(Value, HeaderMap)>>,
+        refuse_input: Shared<bool>,
     }
 
     fn frame(message: &Value, flags: u8) -> Bytes {
@@ -853,12 +867,16 @@ mod tests {
                 "/process.Process/SendInput",
                 post(|State(f): State<Fake>, body: axum::Json<Value>| async move {
                     assert_eq!(body["process"]["pid"], 7);
+                    if *f.refuse_input.lock().unwrap() {
+                        let refused = json!({ "code": "internal", "message": "refused" });
+                        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(refused));
+                    }
                     let chunk = unb64(body["input"]["stdin"].as_str().unwrap()).unwrap();
                     if let Some(tx) = f.input.lock().unwrap().as_ref() {
                         // The process may have ended already, as a real one may.
                         let _ = tx.send(Some(chunk));
                     }
-                    axum::Json(json!({}))
+                    (StatusCode::OK, axum::Json(json!({})))
                 }),
             )
             .route(
@@ -933,6 +951,33 @@ mod tests {
         assert_eq!(headers["x-access-token"], "tok");
         assert_eq!(headers["content-type"], "application/connect+json");
         assert_eq!(headers["authorization"], format!("Basic {}", b64(b"user:")));
+    }
+
+    #[tokio::test]
+    async fn an_input_that_cannot_be_delivered_ends_the_relay() {
+        let fake = Fake::default();
+        *fake.refuse_input.lock().unwrap() = true;
+        let url = serve(fake).await;
+        let input: &'static [u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        // The stand-in `cat` waits for input that never arrives: unwatched,
+        // the relay would wait with it forever.
+        let relayed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            relay(
+                &session(&url),
+                &argv(&["cat"]),
+                Stdio {
+                    input,
+                    output: &mut output,
+                    errors: &mut errors,
+                },
+            ),
+        )
+        .await
+        .expect("the relay must end when its input cannot be delivered");
+        let err = relayed.unwrap_err().to_string();
+        assert!(err.contains("sending the agent its input"), "{err}");
     }
 
     #[tokio::test]

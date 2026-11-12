@@ -6,7 +6,7 @@ use cuma_core::ports::AgentAdapter;
 use cuma_orchestrator::Orchestrator;
 use cuma_planner::HeuristicPlanner;
 use cuma_protocol_a2a::A2aDiscovery;
-use cuma_protocol_acp::AcpConfigDiscovery;
+use cuma_protocol_acp::{AcpAdapter, AcpConfigDiscovery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -392,8 +392,10 @@ pub fn check_a2a_exposure(
 ///
 /// "Configure an agent" is wrong advice when agents are configured and were
 /// refused because `security.require_agent_sandbox` cannot be met.
-pub fn no_agents_reason(config: &Config) -> String {
+pub async fn no_agents_reason(config: &Config) -> String {
     let sandboxes = sandbox_registry(config);
+    // Judged as `build_orchestrator` judged them: plugins are asked first.
+    probe_plugins(config, &sandboxes, &mut Vec::new()).await;
     no_agents_reason_under(config, &refusals(config, |id| sandboxes.for_agent(id)))
 }
 
@@ -403,6 +405,33 @@ fn local_agents(config: &Config) -> impl Iterator<Item = (&String, &cuma_config:
         .agents
         .iter()
         .filter(|(_, agent)| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"))
+}
+
+/// The warning recorded when memory is enabled but unreachable.
+///
+/// `cuma doctor`'s memory check reports the same fact itself; the constant
+/// lets it claim the warning's exact text so the report never lists it twice.
+pub(crate) const MEMORY_UNREACHABLE: &str =
+    "long-term memory is enabled but its backend is not reachable; running without recall";
+
+/// Probe each plugin sandbox a local agent uses. A plugin says what it
+/// enforces only when asked, so it is asked before it is judged — else an
+/// allowlist it does enforce would refuse it unheard.
+pub(crate) async fn probe_plugins(
+    config: &Config,
+    sandboxes: &cuma_sandbox::Registry,
+    warnings: &mut Vec<String>,
+) {
+    let mut probed = BTreeSet::new();
+    for (id, _) in local_agents(config) {
+        if let Some(provider) = sandboxes.for_agent(id)
+            && provider.kind() == "plugin"
+            && probed.insert(provider.name().to_owned())
+            && let Err(err) = provider.probe().await
+        {
+            warnings.push(format!("sandbox {}: {err}", provider.name()));
+        }
+    }
 }
 
 /// The local agents `security.require_agent_sandbox` refuses, each with what
@@ -465,6 +494,8 @@ struct ProviderLauncher {
     /// `env` and `security.agent_env`.
     env: Vec<String>,
     allowed_hosts: Vec<String>,
+    /// The binary its command starts, for runtimes with harness presets.
+    harness: Option<String>,
 }
 
 impl ProviderLauncher {
@@ -484,6 +515,13 @@ impl ProviderLauncher {
                 .collect(),
             env,
             allowed_hosts: security.network_allowlist.clone(),
+            harness: agent.command.as_deref().and_then(|command| {
+                command
+                    .split_whitespace()
+                    .next()
+                    .and_then(|program| Path::new(program).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            }),
         }
     }
 
@@ -503,6 +541,7 @@ impl ProviderLauncher {
             readable: readable.to_vec(),
             state: self.state.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
+            harness: self.harness.clone(),
         }
     }
 }
@@ -519,10 +558,12 @@ impl cuma_protocol_acp::AgentLauncher for ProviderLauncher {
     }
 
     fn runs_elsewhere(&self) -> bool {
-        !matches!(
-            self.provider.capabilities().isolation,
-            cuma_sandbox::Isolation::Process
-        )
+        // Native sandboxes run here, confined or (with no runtime) not.
+        self.provider.kind() != "native"
+            && !matches!(
+                self.provider.capabilities().isolation,
+                cuma_sandbox::Isolation::Process
+            )
     }
 
     async fn open(
@@ -636,6 +677,7 @@ pub async fn build_orchestrator(
     }
     // Each agent runs under its own sandbox, else the default one.
     let sandboxes = sandbox_registry(&config);
+    probe_plugins(&config, &sandboxes, &mut warnings).await;
     let mut acp = AcpConfigDiscovery::new(config.clone())
         .with_mcp_servers(shared)
         .with_kept_env(shared_mcp_secret_names(&config));
@@ -665,20 +707,37 @@ pub async fn build_orchestrator(
             names.join(", ")
         ));
     }
-    let acp_adapters: Vec<_> = acp
+    let acp_adapters: Vec<Arc<AcpAdapter>> = acp
         .adapters()
         .into_iter()
         .filter(|adapter| !refused.contains_key(adapter.agent_id().as_str()))
+        .map(Arc::new)
         .collect();
-    for adapter in acp_adapters {
+    // Each negotiation launches and handshakes a real agent process — the
+    // slowest phase of startup. They are independent, so they run together:
+    // wall time is the slowest agent's, not the sum of all of them.
+    let negotiations = futures::future::join_all(acp_adapters.iter().map(|adapter| {
+        let adapter = Arc::clone(adapter);
+        async move {
+            let started = std::time::Instant::now();
+            let result = adapter.refresh_capabilities().await;
+            (adapter, started, result)
+        }
+    }))
+    .await;
+    for (adapter, started, result) in negotiations {
         // Negotiate capabilities where possible; register with configured
         // capabilities where not.
-        let failure = adapter
-            .refresh_capabilities()
-            .await
+        let failure = result
             .err()
             .map(|err| format!("ACP negotiation failed ({err})"));
-        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
+        tracing::info!(
+            agent = %adapter.agent_id(),
+            ms = started.elapsed().as_millis() as u64,
+            ok = failure.is_none(),
+            "agent capability negotiation"
+        );
+        register(&mut orchestrator, adapter, failure, &mut warnings).await;
     }
 
     // --- A2A agents -------------------------------------------------------
@@ -695,11 +754,7 @@ pub async fn build_orchestrator(
     // --- memory -----------------------------------------------------------
     let memory = memory_store(&config, &workspace);
     if config.memory.enabled && !memory.is_available().await {
-        warnings.push(
-            "long-term memory is enabled but its backend is not reachable; \
-             running without recall"
-                .to_owned(),
-        );
+        warnings.push(MEMORY_UNREACHABLE.to_owned());
     }
     let mut orchestrator = orchestrator.with_memory(memory);
 
@@ -958,6 +1013,88 @@ mod tests {
             "{}",
             refused["open"]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plugin_is_probed_before_an_allowlist_refuses_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A plugin that enforces the allowlist, and says so when probed.
+        let plugin = dir.path().join("cuma-sandbox-filtering");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = probe ] && \
+             echo '{\"isolation\":\"microvm\",\"workspace\":\"mounted\",\"network_allowlist\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config::from_toml(&format!(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "plugin"
+            program = "{}"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            "#,
+            plugin.display()
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let sandboxes = sandbox_registry(&config);
+        // Unprobed, it cannot be said to enforce anything.
+        assert!(refusals(&config, |id| sandboxes.for_agent(id)).contains_key("filtered"));
+
+        let mut warnings = Vec::new();
+        probe_plugins(&config, &sandboxes, &mut warnings).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let refused = refusals(&config, |id| sandboxes.for_agent(id));
+        assert!(refused.is_empty(), "{refused:?}");
+
+        // Explaining why no agent is available judges it the same way.
+        let reason = no_agents_reason(&config).await;
+        assert!(!reason.contains("fall short"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_explanation_probes_a_plugin_before_blaming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("cuma-sandbox-filtering");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = probe ] && \
+             echo '{\"isolation\":\"microvm\",\"workspace\":\"mounted\",\"network_allowlist\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config::from_toml(&format!(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "plugin"
+            program = "{}"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            "#,
+            plugin.display()
+        ))
+        .unwrap();
+
+        let reason = no_agents_reason(&config).await;
+
+        // The agent was not refused for its sandbox: it failed some other way.
+        assert!(!reason.contains("fall short"), "{reason}");
+        assert!(reason.contains("could not be registered"), "{reason}");
     }
 
     #[test]

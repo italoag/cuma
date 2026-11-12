@@ -11,6 +11,8 @@ on:
       - "crates/cuma-sandbox/**"
       - "crates/cuma-config/src/sandbox.rs"
       - "crates/cuma-protocol-acp/src/adapter.rs"
+      - "crates/cuma-cli/src/harness.rs"
+      - "crates/cuma-workspace/src/confine.rs"
       - "plugins/**"
       - "ci/sandboxes/**"
       - ".github/workflows/sandboxes.yml"

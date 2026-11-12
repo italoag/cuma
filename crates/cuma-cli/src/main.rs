@@ -5,10 +5,12 @@
 //! end over the same core, not the product.
 
 mod commands;
+mod doctor;
 mod harness;
 mod mcp_tools;
 mod output;
 mod recorder;
+mod setup;
 
 use clap::{Parser, Subcommand};
 use cuma_core::error::Result;
@@ -134,6 +136,30 @@ enum Command {
 
     /// Check the installation and report anything wrong with it.
     Doctor,
+
+    /// Detect the agents this machine can run and write a configuration.
+    ///
+    /// Interactive: a wizard asks what cannot be detected, with a default for
+    /// every question. Non-interactive (`--yes`, or piped input): the defaults
+    /// are applied without prompting.
+    Setup {
+        /// Answer every question with its default; never prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Write `.cuma/config.toml` in the workspace instead of the global file.
+        #[arg(long, conflicts_with = "global")]
+        project: bool,
+
+        /// Write the user-level configuration (`~/.config/cuma/config.toml`).
+        /// This is the default; the flag exists for explicitness.
+        #[arg(long)]
+        global: bool,
+
+        /// Show what would be detected and written; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -184,6 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let loaded = cuma_config::Config::load(&workspace)?;
+    let load_warnings = loaded.warnings;
     let mut config = loaded.config;
 
     // CLI flags are the highest-precedence layer, applied after every file and
@@ -198,6 +225,10 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Held for the whole run: dropping it flushes exported traces.
     let _telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
+    // Loading ran before logging existed; what it noticed is told now.
+    for warning in &load_warnings {
+        tracing::warn!("{warning}");
+    }
 
     let command = match &cli.command {
         None | Some(Command::Chat) => "chat",
@@ -212,6 +243,7 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Sandbox { .. }) => "sandbox",
         Some(Command::Usage { .. }) => "usage",
         Some(Command::Doctor) => "doctor",
+        Some(Command::Setup { .. }) => "setup",
     };
 
     // One root span per invocation, so every session, task and attempt it
@@ -259,8 +291,14 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::usage(config, workspace, by_model, cli.json).await
             }
             Some(Command::Doctor) => {
-                commands::doctor(config, workspace, loaded.sources, cli.json).await
+                crate::doctor::run(config, workspace, loaded.sources, cli.json).await
             }
+            Some(Command::Setup {
+                yes,
+                project,
+                global,
+                dry_run,
+            }) => setup::run(config, workspace, yes, project, global, dry_run, cli.json).await,
         }
     }
     .instrument(tracing::info_span!("cuma", command))

@@ -125,6 +125,7 @@ adapters automatically. Any command that speaks ACP over stdio works.
 
 | | |
 |---|---|
+| `cuma setup [--project \| --global] [--yes]` | Detect installed agents and write a working config |
 | `cuma run "<goal>"` | Plan, route and execute |
 | `cuma explain "<goal>"` | Plan and route without executing |
 | `cuma agents list \| show \| discover [--registry] \| add <id>` | Agents, their health, and the ACP registry |
@@ -145,6 +146,7 @@ Every command takes `--json`, for CI and for other agents.
 
 | | |
 |---|---|
+| [Quickstart](QUICKSTART.md) | Zero to a verified `cuma run`, step by step |
 | [Target architecture](TARGET_ARCHITECTURE.md) | What the system is |
 | [Architecture](docs/ARCHITECTURE.md) | How the pieces fit |
 | [Protocols](docs/PROTOCOLS.md) | ACP, A2A, MCP |
@@ -181,7 +183,7 @@ apparatus.
 
 ## Status
 
-840 tests, clippy clean with warnings denied, checked on the MSRV. Verified
+866 tests, clippy clean with warnings denied, checked on the MSRV. Verified
 against a live ACP agent; against the real ACP client SDK driving CUMA as an
 agent (including concurrent sessions, cancellation and reload); against
 scripted A2A peers in both dialects over real HTTP and SSE; and against a real

@@ -1,6 +1,6 @@
 //! Translating ACP capability negotiation into domain capabilities.
 
-use agent_client_protocol::schema::v1::InitializeResponse;
+use agent_client_protocol::v1::schema::InitializeResponse;
 use cuma_core::{Capability, CapabilitySet};
 
 /// Map an ACP `initialize` response onto domain capabilities.

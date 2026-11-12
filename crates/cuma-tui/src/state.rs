@@ -202,6 +202,10 @@ pub struct AppState {
     pub memories: Vec<MemoryRow>,
     /// Set while a search runs.
     pub memory_searching: bool,
+    /// Animation frame for the spinner shown while work runs.
+    ///
+    /// The app loop ticks it before each redraw; rendering stays pure.
+    pub spinner: ratatui_bubbletea_components::SpinnerState,
 }
 
 impl AppState {

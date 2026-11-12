@@ -11,14 +11,28 @@ without optional features.
 
 ## Protocol SDKs
 
-### `agent-client-protocol` 2.0.0 — ACP
+### `agent-client-protocol` 5.2.0 — ACP
 
-The official Rust SDK (`github.com/agentclientprotocol/rust-sdk`), schema 1.5.0.
+The official Rust SDK (`github.com/agentclientprotocol/rust-sdk`), schema
+1.17.0.
 
-- **MSRV** 1.88.0. **Adopted.** Client, agent and proxy roles, the v1 schema,
-  JSON-RPC transport and process spawning.
+- **MSRV** 1.88.0. **Adopted** with `process`, `stdio` and
+  `unstable_end_turn_token_usage`. `process` gates `AcpAgent` (spawning),
+  `stdio` gates `Stdio` (the `serve` transport); both were unconditional in
+  2.x.
 - Read: `src/lib.rs`, `src/jsonrpc.rs`, `src/acp_agent.rs`, the schema's
   `v1/agent.rs` and `v1/client.rs`, and `examples/yolo_one_shot_client.rs`.
+- The 2.x → 5.x migration, verified against vendored sources:
+  - Schema types moved: `schema::v1::*` → `v1::schema::*`; `ConnectionTo<R>`
+    → `v1::ConnectionTo<R>` (the v1 marker lives in the type now);
+    `schema::ProtocolVersion` stayed put.
+  - `Agent::builder()`/`Client::builder()` → `Agent.v1()`/`Client.v1()`;
+    `on_receive_request`/`on_receive_notification` and the
+    `on_receive_*!` macros kept their shape, as did `respond`,
+    `respond_with_error`, `send_request`, `send_notification` and `spawn`.
+  - `Error::resource_not_found` is gone; the schema error constructors
+    (`v1::schema::Error::session_not_found(id).into()`) produce the same
+    `-32002` with better `data`.
 - Things the source settled that documentation did not:
   - A request handler runs inside the connection's dispatch loop and blocks
     every other message until it returns. CUMA's prompt handler therefore
@@ -35,7 +49,7 @@ The official Rust SDK (`github.com/agentclientprotocol/rust-sdk`), schema 1.5.0.
   is read against the format in the `agentclientprotocol/registry` repository
   (`FORMAT.md`, `registry.schema.json`).
 
-### `rmcp` 3.1.4 — MCP
+### `rmcp` 3.9.0 — MCP
 
 The official Model Context Protocol Rust SDK.
 
@@ -45,6 +59,8 @@ The official Model Context Protocol Rust SDK.
   `src/model/mrtr.rs`, `src/transport/io.rs`. `CallToolRequestParams` is
   `#[non_exhaustive]`; `call_tool` answers with `CallToolResponse`, of which
   `CallToolResult` is the `Complete` case.
+- 3.9 deprecated `ServerInfo` as an alias: `ServerConfig::new(..)` is the
+  same `InitializeResult` under its new name, so `get_info` returns it.
 
 ### A2A — implemented natively
 
@@ -125,10 +141,23 @@ authentication keeps working), `--allow-host` (filtered egress, from
 The `ratatui-bubbletea` family is published after all — as
 `ratatui-bubbletea-components`, `ratatui-bubbletea-theme` and `ratatui-tea`,
 all 0.2.0, MSRV 1.88, requiring ratatui 0.30 — although the umbrella name is
-not a crate. The TUI's view model is a pure state machine tested without a
-terminal, and its screens are simple tables and paragraphs, so none of the
-three was adopted. `ratatui-tea` had been declared in the workspace without
-any crate using it; the declaration is removed.
+not a crate.
+
+- **`ratatui-bubbletea-theme` — adopted.** `Theme::default()` (the CHARM
+  palette) is the TUI's single source of colours, borders and symbols:
+  rounded `titled_block`s, semantic `accent`/`success`/`warning`/`error`/
+  `muted` styles, and the compact `help_line` footer. Every ad-hoc `Color`
+  in `cuma-tui` now comes from it.
+- **`ratatui-bubbletea-components` — adopted.** `ThemedTable` draws the
+  Tasks/Agents/Models tables, `TextInput` the goal box (cursor at end
+  matches the append-only editing model), `Progress` turns the box into a
+  live bar while a session runs, and `SpinnerFrames`/`SpinnerState` drive
+  the status-line spinner — state ticked by the app loop, so rendering
+  stays a pure function of `AppState`.
+- **`ratatui-tea` — not adopted.** Its Bubble Tea app loop would invert the
+  boundary the design keeps: the TUI is a subscriber of the orchestrator's
+  event bus, not an Elm model owning the runtime. The components are
+  documented to work with a plain ratatui event loop.
 
 ## Skills: integrity
 
@@ -177,6 +206,7 @@ workspace's `rustls` features and no second HTTP stack is built.
 | `chrono`, `uuid`, `rand` | — | Timestamps, identifiers, jitter and key generation |
 | `async-trait` | 0.1 | Object-safe async ports |
 | `which`, `shell-words` | 8, 1 | Finding and parsing commands without a shell |
+| `dialoguer` | 0.12 | `cuma setup` prompts (Select/MultiSelect/Confirm/Input); `editor`/`password` off |
 | `tempfile` | 3 | Tests |
 
 ## Deliberate omissions
@@ -193,9 +223,19 @@ workspace's `rustls` features and no second HTTP stack is built.
 ## MSRV
 
 `rust-version = "1.88"`, the highest MSRV among linked dependencies (the ACP
-and MCP SDKs). Checked with the 1.88.0 toolchain. What wants more is kept
-behind a process boundary: `a2a-rs` (1.96), and the `ai-memory` and `rtk`
-binaries, which CUMA runs rather than links.
+and MCP SDKs, `ratatui-bubbletea-*` 0.2). Checked with the 1.88.0 toolchain.
+What wants more is kept behind a process boundary: `a2a-rs` (1.96), and the
+`ai-memory` and `rtk` binaries, which CUMA runs rather than links.
+
+Latest round, verified per crate: `agent-client-protocol` 5.2 (1.88),
+`agent-client-protocol-schema` 1.17 (1.88), `rmcp` 3.9 (1.88), `dirs` 7 (no
+declared MSRV; builds on 1.88), `rand` 0.10 (1.85; `RngExt` now gates
+`random_range`), `reqwest` 0.13.5 (1.85; `rustls-native-certs` was folded
+into `rustls` + `rustls-platform-verifier` in 0.13.2).
+
+Held back by upstream pins, not by choice: `matchit` 0.8.4 (`axum` 0.8
+requires `=0.8.4`) and `generic-array` 0.14.7 (`crypto-common` via
+`sha2`/`termwiz`). They move when their parents do.
 
 ## How to re-verify
 

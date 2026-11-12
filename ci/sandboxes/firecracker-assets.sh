@@ -13,7 +13,7 @@ set -eu
 dir=$1
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 version=${FIRECRACKER_VERSION:?set FIRECRACKER_VERSION, e.g. v1.17.0}
-rootfs_image=${ROOTFS_IMAGE:-public.ecr.aws/docker/library/alpine:3.22}
+rootfs_image=${ROOTFS_IMAGE:-mirror.gcr.io/library/alpine:3.22}
 arch=$(uname -m)
 mkdir -p "$dir"
 cd "$dir"

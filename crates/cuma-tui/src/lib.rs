@@ -14,4 +14,4 @@ mod view;
 
 pub use app::{Action, SkillSource, Sources, handle_key, run, run_with};
 pub use state::{AppState, InputMode, MemoryRow, Screen, SkillRow, TaskRow};
-pub use view::{execution_lines, plan_lines, status_line};
+pub use view::{execution_lines, help_line, plan_lines, status_line};

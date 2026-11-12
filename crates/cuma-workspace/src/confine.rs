@@ -86,6 +86,31 @@ const WRITABLE_IN_HOME: &[&str] = &[
     ".hex",
 ];
 
+/// Home-relative paths the toolchains write, beyond the dotdir scan: mise
+/// keeps its installs under `.local/share`, uv stores the pythons mise then
+/// symlinks, `.local/state` is the XDG state root — the `.local/state/<id>`
+/// directories agents create on first run can only be reached through it —
+/// and `Library/Caches` is the macOS cache root, where single-executable
+/// apps unpack and mise keeps its cache. `.local/share` itself stays
+/// unmapped: it holds arbitrary application data, not just toolchains.
+const WRITABLE_TOOLCHAIN_IN_HOME: &[&str] = &[
+    ".local/share/mise",
+    ".local/share/uv",
+    ".local/state",
+    "Library/Caches",
+];
+
+/// Home-relative paths that must stay visible, read-only: user-installed
+/// binaries. Under runtimes that already show all of `.local` this is a
+/// no-op; ai-jail mounts it because `.local` cannot be mapped whole (below).
+const READABLE_TOOLCHAIN_IN_HOME: &[&str] = &[".local/bin"];
+
+/// `.local` is never mounted whole under ai-jail: a read-only parent wins
+/// over any writable mount inside it, which would strand the toolchain and
+/// per-agent state directories it holds. `.local/bin` and the toolchain or
+/// `state` directories under it are mounted by name instead.
+const LOCAL_HOME_ENTRY: &str = ".local";
+
 /// Environment variables an agent keeps: what a process needs to run, reach
 /// the network through a proxy, find its toolchains, and log in the way
 /// coding agents usually do.
@@ -130,17 +155,24 @@ const KEPT_ENV: &[&str] = &[
     "OPENROUTER_API_KEY",
 ];
 
-/// Prefixes of kept variables: locale, XDG directories, and the agents' own
-/// configuration and credentials (`ANTHROPIC_API_KEY`, `CODEX_HOME`, …).
+/// Prefixes of kept variables: locale, and the agents' own configuration and
+/// credentials (`ANTHROPIC_API_KEY`, `CODEX_HOME`, …).
+///
+/// `XDG_*_HOME` is deliberately not kept: it describes the *orchestrator's*
+/// filesystem layout — which is unmounted inside the jail and often private
+/// to it — and forwarding it both breaks agents that follow it and leaks a
+/// path that is not theirs. Unset, they default into the mapped home.
 const KEPT_ENV_PREFIXES: &[&str] = &[
     "LC_",
-    "XDG_",
     "ANTHROPIC_",
     "CLAUDE_",
     "OPENAI_",
     "CODEX_",
     "GEMINI_",
     "GOOGLE_GENAI_",
+    // Corporate artifact stores: npm, Maven and cargo configuration files
+    // resolve `${JFROG_TOKEN}` for authentication.
+    "JFROG_",
 ];
 
 /// A runtime that can confine an agent.
@@ -387,12 +419,14 @@ impl AgentSandbox {
     /// `keep_env` names variables the agent needs beyond the baseline — its
     /// command's own assignments, secrets of MCP servers it will launch.
     /// `readable` names paths its own command refers to, which must stay
-    /// visible even where the profile would otherwise hide them.
+    /// visible even where the profile would otherwise hide them. `harness`
+    /// is the agent's binary name, for runtimes with built-in presets.
     pub fn launch_prefix(
         &self,
         workspace: &Path,
         keep_env: &[String],
         readable: &[PathBuf],
+        harness: Option<&str>,
     ) -> Option<Vec<String>> {
         let runtime = self.runtime?;
         let environment = std::env::vars_os()
@@ -400,6 +434,7 @@ impl AgentSandbox {
             .collect();
         let mut profile = Profile::for_workspace(self, workspace, keep_env, environment);
         profile.command_paths = readable.to_vec();
+        profile.harness = harness.map(str::to_owned);
         Some(match runtime {
             AgentRuntime::AiJail => profile.ai_jail(&self.allowed_hosts),
             AgentRuntime::Bubblewrap => profile.bubblewrap(),
@@ -429,6 +464,8 @@ struct Profile {
     cuma_executable: Option<PathBuf>,
     /// Paths the agent's command names, as written. Read-only.
     command_paths: Vec<PathBuf>,
+    /// The agent's binary name, when a runtime has a preset for it.
+    harness: Option<String>,
     network: bool,
     /// Variables to remove, by name. Values never appear on a command line.
     strip_env: Vec<String>,
@@ -468,6 +505,18 @@ impl Profile {
                     home_writable.push(path);
                 } else if !is_special_file(&path) {
                     home_readable.push(path);
+                }
+            }
+            for rel in WRITABLE_TOOLCHAIN_IN_HOME {
+                let path = home.join(rel);
+                if !is_special_file(&path) && path.exists() {
+                    home_writable.push(canonical(&path));
+                }
+            }
+            for rel in READABLE_TOOLCHAIN_IN_HOME {
+                let path = home.join(rel);
+                if !is_special_file(&path) && path.exists() {
+                    home_readable.push(canonical(&path));
                 }
             }
         }
@@ -511,6 +560,7 @@ impl Profile {
             extra_writable,
             cuma_executable,
             command_paths: Vec::new(),
+            harness: None,
             // An agent cut off from its model API cannot work, so the network
             // stays; ai-jail narrows it to the allowlist.
             network: true,
@@ -538,6 +588,13 @@ impl Profile {
             "--no-save-config".to_owned(),
             "--agent-state".to_owned(),
         ];
+        // ai-jail ships curated presets for the harnesses it knows: state
+        // directories, and a read-only installation directory a self-updater
+        // cannot corrupt. `--harness` applies one; an unknown name is a hard
+        // error, so only recognised binaries declare one.
+        if let Some(harness) = self.harness.as_deref().and_then(ai_jail_harness_preset) {
+            prefix.extend(["--harness".to_owned(), harness.to_owned()]);
+        }
         if allowed_hosts.is_empty() {
             prefix.push("--network".to_owned());
         } else {
@@ -545,23 +602,74 @@ impl Profile {
                 prefix.extend(["--allow-host".to_owned(), host.clone()]);
             }
         }
+        // The sandbox denies macOS trustd, so TLS clients — every agent
+        // talking to its API over HTTPS, and package downloads — fail
+        // certificate verification (OSStatus -26276). Re-enabling it is
+        // scoped to that one service; the network itself stays as set
+        // above. Only meaningful where seatbelt runs.
+        if cfg!(target_os = "macos") && self.network {
+            prefix.push("--macos-trustd".to_owned());
+        }
         for name in &self.forward_env {
             prefix.extend(["--env".to_owned(), name.clone()]);
         }
         // ai-jail makes its own working directory writable; the agent is
         // started from CUMA's, so the workspace is mapped explicitly, as is a
-        // worktree's repository and anything configured.
+        // worktree's repository and anything configured. `--agent-state`
+        // covers only ai-jail's own harness list, so the agent and toolchain
+        // directories the other runtimes see are mapped here too — except
+        // `.local`, whose children mount by name (LOCAL_HOME_ENTRY).
         let here = std::env::current_dir().ok();
-        for path in std::iter::once(&self.workspace)
+        let writable_roots: Vec<PathBuf> = std::iter::once(&self.workspace)
             .chain(self.git_common_dir.iter())
+            .chain(self.home_writable.iter())
             .chain(self.extra_writable.iter())
-        {
+            .cloned()
+            .collect();
+        for path in &writable_roots {
             if here.as_deref() != Some(path.as_path()) {
                 prefix.extend(["--rw-map".to_owned(), path.display().to_string()]);
             }
         }
-        for path in &self.command_paths {
+        let local = self.home.as_ref().map(|h| h.join(LOCAL_HOME_ENTRY));
+        for path in self
+            .home_readable
+            .iter()
+            // `.local` mounts its children by name, and a path a writable
+            // root already covers must not be shadowed read-only — under
+            // ai-jail the read-only parent wins.
+            .filter(|p| Some(p.as_path()) != local.as_deref())
+            .filter(|p| !writable_roots.iter().any(|w| p.starts_with(w)))
+            .chain(&self.command_paths)
+        {
             prefix.extend(["--map".to_owned(), path.display().to_string()]);
+        }
+        // ai-jail's allowlist passes XDG_*_HOME through — which describes
+        // the *orchestrator's* layout, unmounted and often private. Point
+        // the base dirs at the standard places under the mapped home: mise
+        // and XDG-aware agents then land in the directories mounted above.
+        // An operator naming one through `security.agent_env` wins.
+        if let Some(home) = &self.home {
+            // The cache root differs per OS and the mapped one must be used:
+            // `Library/Caches` is in WRITABLE_TOOLCHAIN_IN_HOME on macOS.
+            let cache = if cfg!(target_os = "macos") {
+                "Library/Caches"
+            } else {
+                ".cache"
+            };
+            for (var, rel) in [
+                ("XDG_CONFIG_HOME", ".config"),
+                ("XDG_DATA_HOME", ".local/share"),
+                ("XDG_STATE_HOME", ".local/state"),
+                ("XDG_CACHE_HOME", cache),
+            ] {
+                if !self.forward_env.iter().any(|e| e == var) {
+                    prefix.extend([
+                        "--env".to_owned(),
+                        format!("{var}={}", home.join(rel).display()),
+                    ]);
+                }
+            }
         }
         prefix.push("--".to_owned());
         prefix
@@ -793,6 +901,7 @@ fn is_kept(name: &str, extra: &[String]) -> bool {
     KEPT_ENV.contains(&name)
         || KEPT_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
         || is_network_setup(name)
+        || is_registry_setup(name)
         || extra.iter().any(|e| e == name)
 }
 
@@ -806,6 +915,7 @@ fn is_network_setup(name: &str) -> bool {
     upper.ends_with("PROXY")
         || [
             "CA_BUNDLE",
+            "CAFILE",
             "CAINFO",
             "CACERT",
             "CA_CERTS",
@@ -816,7 +926,53 @@ fn is_network_setup(name: &str) -> bool {
         .iter()
         .any(|marker| upper.contains(marker))
         || upper.ends_with("_CERT")
-        || ["NODE_OPTIONS", "JAVA_TOOL_OPTIONS", "LD_LIBRARY_PATH"].contains(&name)
+        || [
+            "NODE_OPTIONS",
+            "JAVA_TOOL_OPTIONS",
+            "JAVA_OPTS",
+            "LD_LIBRARY_PATH",
+        ]
+        .contains(&name)
+}
+
+/// Package-registry and mirror settings (`PIP_INDEX_URL`,
+/// `UV_DEFAULT_INDEX`, `DOCKER_DEFAULT_REGISTRY`, `COREPACK_NPM_REGISTRY`,
+/// `UV_PYTHON_INSTALL_MIRROR`, …).
+///
+/// On a managed network the public registry is unreachable and packages
+/// resolve through a mirror; the on-disk configuration files most tools
+/// read are already visible, but a variable names the same thing when one
+/// is set.
+fn is_registry_setup(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_REGISTRY")
+        || upper.ends_with("_INDEX")
+        || upper.ends_with("_INDEX_URL")
+        || upper.contains("MIRROR")
+}
+
+/// The ai-jail harness preset a binary name selects, if any.
+///
+/// ai-jail errors on a name it does not know, so the list mirrors the
+/// presets it ships (`ai-jail --help`) rather than guessing; common aliases
+/// fold into their preset. A name not listed simply gets no `--harness`.
+fn ai_jail_harness_preset(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "claude" | "claude-code" => "claude",
+        "codex" => "codex",
+        "gemini" | "gemini-cli" => "gemini",
+        "opencode" => "opencode",
+        "devin" => "devin",
+        "kiro" | "kiro-cli" => "kiro-cli",
+        "kimi" | "kimi-cli" => "kimi",
+        "grok" => "grok",
+        "crush" => "crush",
+        "pi" => "pi",
+        "jcode" => "jcode",
+        "soulforge" => "soulforge",
+        "bash" | "sh" => "bash",
+        _ => return None,
+    })
 }
 
 /// Variables a coding agent needs wherever it runs — its credentials and its
@@ -827,7 +983,7 @@ fn is_network_setup(name: &str) -> bool {
 pub fn is_portable_agent_env(name: &str) -> bool {
     KEPT_ENV_PREFIXES
         .iter()
-        .filter(|prefix| !matches!(**prefix, "LC_" | "XDG_"))
+        .filter(|prefix| !matches!(**prefix, "LC_"))
         .any(|prefix| name.starts_with(prefix))
         || ["GOOGLE_API_KEY", "OPENROUTER_API_KEY"].contains(&name)
         || name.to_ascii_uppercase().ends_with("PROXY")
@@ -871,7 +1027,7 @@ mod tests {
 
     fn prefix(runtime: AgentRuntime, workspace: &Path) -> Vec<String> {
         sandbox(runtime, SecurityConfig::default())
-            .launch_prefix(workspace, &[], &[])
+            .launch_prefix(workspace, &[], &[], None)
             .unwrap()
     }
 
@@ -1002,6 +1158,7 @@ mod tests {
                     Path::new("/cuma-test-elsewhere"),
                     &[],
                     std::slice::from_ref(&named),
+                    None,
                 )
                 .unwrap();
             let shown = args
@@ -1014,7 +1171,12 @@ mod tests {
     #[test]
     fn a_path_already_visible_is_not_bound_twice() {
         let args = sandbox(AgentRuntime::Bubblewrap, SecurityConfig::default())
-            .launch_prefix(Path::new("/tmp"), &[], &[PathBuf::from("/usr/bin/env")])
+            .launch_prefix(
+                Path::new("/tmp"),
+                &[],
+                &[PathBuf::from("/usr/bin/env")],
+                None,
+            )
             .unwrap();
         assert!(
             !args.iter().any(|a| a == "/usr/bin/env"),
@@ -1120,7 +1282,10 @@ mod tests {
         assert_eq!(open.level(), AgentConfinementLevel::Unavailable);
         assert!(open.describe().contains("UNCONFINED"));
         assert!(!open.refuses_agents());
-        assert!(open.launch_prefix(Path::new("/w"), &[], &[]).is_none());
+        assert!(
+            open.launch_prefix(Path::new("/w"), &[], &[], None)
+                .is_none()
+        );
 
         let strict = AgentSandbox::with_runtime(
             &SecurityConfig {

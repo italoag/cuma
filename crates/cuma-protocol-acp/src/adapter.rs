@@ -2,13 +2,14 @@
 
 use crate::capabilities::capabilities_from_initialize;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent, Usage,
     UsageUpdate,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent};
 use async_trait::async_trait;
 use cuma_core::error::{MetaAgentError, Result};
 use cuma_core::ports::{
@@ -254,7 +255,11 @@ impl AcpAdapter {
                 if path.is_absolute() {
                     Some(path.to_path_buf())
                 } else if index == 0 && !elsewhere {
-                    which::which(word).ok()
+                    // Canonicalized: `which` answers shims and symlinks whose
+                    // targets the sandbox must see, not the link itself.
+                    which::which(word)
+                        .ok()
+                        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
                 } else {
                     None
                 }
@@ -459,6 +464,11 @@ fn reported_cost(report: &UsageUpdate) -> Option<f64> {
         .then_some(cost.amount)
 }
 
+/// Why a launch's finish failed, as part of a task's failure.
+fn uncollected(err: &MetaAgentError) -> String {
+    format!("the agent's work could not be brought back from its sandbox: {err}")
+}
+
 /// Map an ACP stop reason onto success or a classified failure.
 fn interpret_stop_reason(reason: StopReason) -> std::result::Result<(), (ErrorClass, String)> {
     match reason {
@@ -532,7 +542,7 @@ impl AgentAdapter for AcpAdapter {
         let updates_for_handler = updates.clone();
 
         let turn = agent_client_protocol::Client
-            .builder()
+            .v1()
             .name("cuma")
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
@@ -600,12 +610,10 @@ impl AgentAdapter for AcpAdapter {
                 Ok((response.stop_reason, response.usage))
             })
             .await
-            .map_err(|err| {
-                // An ACP-level error is a transport or protocol failure. The
-                // orchestrator re-classifies from the message when this comes
-                // back as a generic protocol error.
-                MetaAgentError::protocol_msg("acp", format!("agent {agent_id} failed: {err}"))
-            });
+            // An ACP-level error is a transport or protocol failure. The
+            // orchestrator re-classifies from the message when this comes
+            // back as a generic protocol error.
+            .map_err(|err| format!("agent {agent_id} failed: {err}"));
 
         // The sandbox must not outlive the turn, and the agent's work comes
         // back whatever the turn's outcome — as it would have stayed in a
@@ -616,11 +624,15 @@ impl AgentAdapter for AcpAdapter {
         };
         let (stop_reason, turn_usage) = match turn {
             Ok(turn) => turn,
-            Err(err) => {
-                if let Err(collect) = collected {
-                    tracing::warn!(agent = %self.id, error = %collect, "closing the sandbox failed too");
-                }
-                return Err(err);
+            // Both failures are reported: work that could not come back — a
+            // conflict kept under .cuma/sandbox-results, say — must not hide
+            // behind the turn's own failure.
+            Err(reason) => {
+                let reason = match collected {
+                    Ok(()) => reason,
+                    Err(collect) => format!("{reason}; {}", uncollected(&collect)),
+                };
+                return Err(MetaAgentError::protocol_msg("acp", reason));
             }
         };
 
@@ -639,15 +651,18 @@ impl AgentAdapter for AcpAdapter {
         let (success, failure_class, failure_reason) =
             match (interpret_stop_reason(stop_reason), collected) {
                 (Ok(()), Ok(())) => (true, None, None),
-                (Err((class, reason)), _) => (false, Some(class), Some(reason)),
+                (Err((class, reason)), Ok(())) => (false, Some(class), Some(reason)),
+                (Err((class, reason)), Err(err)) => (
+                    false,
+                    Some(class),
+                    Some(format!("{reason}; {}", uncollected(&err))),
+                ),
                 // The agent finished, but its work did not reach the
                 // workspace: the task did not happen.
                 (Ok(()), Err(err)) => (
                     false,
                     Some(ErrorClass::TaskFailure),
-                    Some(format!(
-                        "the agent's work could not be brought back from its sandbox: {err}"
-                    )),
+                    Some(uncollected(&err)),
                 ),
             };
 
@@ -693,7 +708,7 @@ impl AcpAdapter {
         let agent_id = self.id.clone();
 
         let response = agent_client_protocol::Client
-            .builder()
+            .v1()
             .name("cuma")
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 connection
@@ -747,7 +762,7 @@ impl AcpAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use agent_client_protocol::schema::v1::Cost;
+    use agent_client_protocol::v1::schema::Cost;
 
     #[test]
     fn a_sandboxed_agent_is_launched_under_its_prefix_with_quoting_intact() {
@@ -1007,6 +1022,8 @@ mod tests {
         opened: std::sync::Mutex<Vec<LaunchPurpose>>,
         finished: AtomicUsize,
         aborted: AtomicUsize,
+        /// Finishing fails, as a merge with a conflict does.
+        conflicts: std::sync::atomic::AtomicBool,
     }
 
     struct Ended(Arc<Lifecycle>);
@@ -1015,6 +1032,11 @@ mod tests {
     impl cuma_core::ports::SandboxSession for Ended {
         async fn finish(&self) -> Result<()> {
             self.0.finished.fetch_add(1, SeqCst);
+            if self.0.conflicts.load(SeqCst) {
+                return Err(MetaAgentError::Other(
+                    "changed in both places: a.txt; kept in .cuma/sandbox-results/s1".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -1048,8 +1070,23 @@ mod tests {
     }
 
     /// The minimal ACP agent fixture, or `None` without python3.
+    /// `python3` must not only exist but start: a shim for a missing runtime
+    /// (mise, asdf) resolves in `which` yet exits nonzero on any invocation.
+    fn working_python3() -> bool {
+        which::which("python3").is_ok_and(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     fn minimal_agent() -> Option<String> {
-        which::which("python3").ok()?;
+        if !working_python3() {
+            return None;
+        }
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/minimal_agent.py"
@@ -1101,6 +1138,27 @@ mod tests {
         assert_eq!(lifecycle.finished.load(SeqCst), 1);
         tokio::task::yield_now().await;
         assert_eq!(lifecycle.aborted.load(SeqCst), 0, "finished, not aborted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_whose_work_cannot_be_collected_reports_both() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.conflicts.store(true, SeqCst);
+        // An agent that dies before it says anything.
+        let adapter = AcpAdapter::new("crashing", "false")
+            .with_launcher(Arc::new(Recording(Arc::clone(&lifecycle))));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = adapter
+            .execute(request(), tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent crashing failed"), "{err}");
+        assert!(
+            err.contains("could not be brought back") && err.contains("sandbox-results/s1"),
+            "{err}"
+        );
+        assert_eq!(lifecycle.finished.load(SeqCst), 1);
     }
 
     #[tokio::test]

@@ -8,12 +8,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use agent_client_protocol::Agent;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
     StopReason, TextContent,
 };
-use agent_client_protocol::{Agent, ConnectionTo};
 use cuma_config::{Config, LimitsConfig};
 use cuma_core::{
     AgentDescriptor, AgentProtocol, Capability, CapabilitySet, CostProfile, Known, ModelDescriptor,
@@ -122,11 +123,11 @@ async fn drive(orchestrator: Orchestrator, goal: &str) -> TurnOutcome {
     let transcript_for_handler = Arc::clone(&transcript);
 
     let stop_reason = agent_client_protocol::Client
-        .builder()
+        .v1()
         .name("test-editor")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                if let agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk) =
+                if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) =
                     &notification.update
                     && let ContentBlock::Text(text) = &chunk.content
                     && let Ok(mut guard) = transcript_for_handler.lock()
@@ -344,11 +345,11 @@ async fn with_client<R>(
 ) -> R {
     let transcripts = Arc::clone(transcripts);
     agent_client_protocol::Client
-        .builder()
+        .v1()
         .name("editor")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                use agent_client_protocol::schema::v1::SessionUpdate;
+                use agent_client_protocol::v1::schema::SessionUpdate;
                 let (prefix, chunk) = match &notification.update {
                     SessionUpdate::AgentMessageChunk(chunk) => ("", chunk),
                     SessionUpdate::UserMessageChunk(chunk) => ("USER: ", chunk),
@@ -461,7 +462,7 @@ async fn a_client_can_cancel_a_running_prompt() {
             connection.send_request(PromptRequest::new(session.clone(), text("write docs")));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         connection.send_notification(
-            agent_client_protocol::schema::v1::CancelNotification::new(session),
+            agent_client_protocol::v1::schema::CancelNotification::new(session),
         )?;
         Ok(pending.block_task().await?.stop_reason)
     })
@@ -526,7 +527,7 @@ async fn a_persisted_session_can_be_loaded_by_a_new_process() {
             .block_task()
             .await?;
         connection
-            .send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
+            .send_request(agent_client_protocol::v1::schema::LoadSessionRequest::new(
                 loaded_id,
                 std::env::temp_dir(),
             ))
@@ -566,7 +567,7 @@ async fn loading_an_unknown_session_is_an_error() {
     );
 
     let result = agent_client_protocol::Client
-        .builder()
+        .v1()
         .connect_with(
             byte_streams(client_side),
             |connection: ConnectionTo<Agent>| async move {
@@ -575,8 +576,8 @@ async fn loading_an_unknown_session_is_an_error() {
                     .block_task()
                     .await?;
                 Ok(connection
-                    .send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
-                        agent_client_protocol::schema::v1::SessionId::new("cuma-missing"),
+                    .send_request(agent_client_protocol::v1::schema::LoadSessionRequest::new(
+                        agent_client_protocol::v1::schema::SessionId::new("cuma-missing"),
                         std::env::temp_dir(),
                     ))
                     .block_task()

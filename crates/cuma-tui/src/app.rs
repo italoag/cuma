@@ -222,6 +222,10 @@ async fn event_loop(
 
     loop {
         if redraw {
+            // The spinner animates only while there is work to watch.
+            if state.running || state.memory_searching {
+                state.spinner.tick();
+            }
             terminal
                 .draw(|frame| view::draw(frame, state))
                 .map_err(|err| MetaAgentError::Other(format!("cannot draw: {err}")))?;
