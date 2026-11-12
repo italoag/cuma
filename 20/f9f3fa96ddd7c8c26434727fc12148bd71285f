@@ -1,0 +1,34 @@
+GATES.md
+  s_53bdd8bbaf392d::t_17daebab732b29 15-16
+  s_53bdd8bbaf392d::t_a53f4bc10a8877 20-21
+  s_53bdd8bbaf392d::t_1c8c32477e54c2 24,27,29,34,37
+  s_53bdd8bbaf392d::t_552e9259a101da 44,47-55
+  s_53bdd8bbaf392d::t_28797c56409ebe 30
+  s_53bdd8bbaf392d::t_766ec2605e9e8c 1-8,13,18,23,25-26,28,31,33,35-36,38,40-41,43,45-46
+  s_53bdd8bbaf392d::t_1e5de47821b36e 10-11
+  s_53bdd8bbaf392d::t_ba5e4e05c65c70 9
+  s_53bdd8bbaf392d::t_96706b23d7fc08 12
+  s_53bdd8bbaf392d::t_e976c94d26e6af 14
+  s_53bdd8bbaf392d::t_2cc4c50a60a7bf 17
+  s_53bdd8bbaf392d::t_67efe8da9a30e3 19
+  s_53bdd8bbaf392d::t_bdd64699921ae2 22
+  s_53bdd8bbaf392d::t_f41057e0b273ec 32
+  s_53bdd8bbaf392d::t_0fb2ee0312a4dd 39
+  s_53bdd8bbaf392d::t_c24b7899528db7 42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "20f9f3fa96ddd7c8c26434727fc12148bd71285f",
+  "prompts": {},
+  "sessions": {
+    "s_53bdd8bbaf392d": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "glittery-produce",
+        "model": "unknown"
+      },
+      "human_author": "Italo A. G. <182202+italoag@users.noreply.github.com>"
+    }
+  }
+}
