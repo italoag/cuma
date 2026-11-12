@@ -592,11 +592,7 @@ impl Profile {
         // directories, and a read-only installation directory a self-updater
         // cannot corrupt. `--harness` applies one; an unknown name is a hard
         // error, so only recognised binaries declare one.
-        if let Some(harness) = self
-            .harness
-            .as_deref()
-            .and_then(ai_jail_harness_preset)
-        {
+        if let Some(harness) = self.harness.as_deref().and_then(ai_jail_harness_preset) {
             prefix.extend(["--harness".to_owned(), harness.to_owned()]);
         }
         if allowed_hosts.is_empty() {
@@ -930,8 +926,13 @@ fn is_network_setup(name: &str) -> bool {
         .iter()
         .any(|marker| upper.contains(marker))
         || upper.ends_with("_CERT")
-        || ["NODE_OPTIONS", "JAVA_TOOL_OPTIONS", "JAVA_OPTS", "LD_LIBRARY_PATH"]
-            .contains(&name)
+        || [
+            "NODE_OPTIONS",
+            "JAVA_TOOL_OPTIONS",
+            "JAVA_OPTS",
+            "LD_LIBRARY_PATH",
+        ]
+        .contains(&name)
 }
 
 /// Package-registry and mirror settings (`PIP_INDEX_URL`,
@@ -1170,7 +1171,12 @@ mod tests {
     #[test]
     fn a_path_already_visible_is_not_bound_twice() {
         let args = sandbox(AgentRuntime::Bubblewrap, SecurityConfig::default())
-            .launch_prefix(Path::new("/tmp"), &[], &[PathBuf::from("/usr/bin/env")], None)
+            .launch_prefix(
+                Path::new("/tmp"),
+                &[],
+                &[PathBuf::from("/usr/bin/env")],
+                None,
+            )
             .unwrap();
         assert!(
             !args.iter().any(|a| a == "/usr/bin/env"),
@@ -1276,9 +1282,10 @@ mod tests {
         assert_eq!(open.level(), AgentConfinementLevel::Unavailable);
         assert!(open.describe().contains("UNCONFINED"));
         assert!(!open.refuses_agents());
-        assert!(open
-            .launch_prefix(Path::new("/w"), &[], &[], None)
-            .is_none());
+        assert!(
+            open.launch_prefix(Path::new("/w"), &[], &[], None)
+                .is_none()
+        );
 
         let strict = AgentSandbox::with_runtime(
             &SecurityConfig {

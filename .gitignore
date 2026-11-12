@@ -18,3 +18,8 @@
 *.swp
 .idea/
 .vscode/
+.devin/
+.claude/
+.junie/
+.agents/
+.windsurf/

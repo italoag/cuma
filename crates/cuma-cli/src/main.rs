@@ -5,6 +5,7 @@
 //! end over the same core, not the product.
 
 mod commands;
+mod doctor;
 mod harness;
 mod mcp_tools;
 mod output;
@@ -290,7 +291,7 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::usage(config, workspace, by_model, cli.json).await
             }
             Some(Command::Doctor) => {
-                commands::doctor(config, workspace, loaded.sources, cli.json).await
+                crate::doctor::run(config, workspace, loaded.sources, cli.json).await
             }
             Some(Command::Setup {
                 yes,

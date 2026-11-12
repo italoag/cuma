@@ -407,10 +407,17 @@ fn local_agents(config: &Config) -> impl Iterator<Item = (&String, &cuma_config:
         .filter(|(_, agent)| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"))
 }
 
+/// The warning recorded when memory is enabled but unreachable.
+///
+/// `cuma doctor`'s memory check reports the same fact itself; the constant
+/// lets it claim the warning's exact text so the report never lists it twice.
+pub(crate) const MEMORY_UNREACHABLE: &str =
+    "long-term memory is enabled but its backend is not reachable; running without recall";
+
 /// Probe each plugin sandbox a local agent uses. A plugin says what it
 /// enforces only when asked, so it is asked before it is judged — else an
 /// allowlist it does enforce would refuse it unheard.
-async fn probe_plugins(
+pub(crate) async fn probe_plugins(
     config: &Config,
     sandboxes: &cuma_sandbox::Registry,
     warnings: &mut Vec<String>,
@@ -747,11 +754,7 @@ pub async fn build_orchestrator(
     // --- memory -----------------------------------------------------------
     let memory = memory_store(&config, &workspace);
     if config.memory.enabled && !memory.is_available().await {
-        warnings.push(
-            "long-term memory is enabled but its backend is not reachable; \
-             running without recall"
-                .to_owned(),
-        );
+        warnings.push(MEMORY_UNREACHABLE.to_owned());
     }
     let mut orchestrator = orchestrator.with_memory(memory);
 
