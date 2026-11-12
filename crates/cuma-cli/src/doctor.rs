@@ -786,6 +786,7 @@ pub async fn run(
     workspace: PathBuf,
     sources: Vec<ConfigSource>,
     json: bool,
+    logs: harness::LogBuffer,
 ) -> Result<()> {
     let claimed = Claimed::default();
     let ctx = Ctx {
@@ -820,6 +821,13 @@ pub async fn run(
         .unwrap_or(0);
     let live = paint.tty && !json && columns > 0;
     let mut board = Board::new(paint, columns);
+
+    // While the board owns the screen, log lines wait in a buffer rather than
+    // landing mid-frame and corrupting it. Only relevant when stderr reaches
+    // the same terminal.
+    if live && std::io::stderr().is_terminal() {
+        logs.hold();
+    }
 
     if !json {
         board.header(&workspace);
@@ -859,6 +867,9 @@ pub async fn run(
     if live && missing {
         board.draw(&reports, &claimed);
     }
+
+    // The board is final; the held log lines take their place below it.
+    logs.release();
 
     if json {
         let claims = claimed.lock().map(|c| c.clone()).unwrap_or_default();

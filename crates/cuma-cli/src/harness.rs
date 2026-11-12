@@ -170,12 +170,12 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
     // Logs go to stderr so that `--json` output on stdout stays parseable when
     // both are enabled.
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
-    let mut layers = vec![log_layer(
-        json || config.telemetry.json_logs,
-        std::io::stderr,
-    )];
-    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
     let mut telemetry = Telemetry::default();
+    let log_buffer = telemetry.log_buffer.clone();
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
+    let mut layers = vec![log_layer(json || config.telemetry.json_logs, move || {
+        log_buffer.clone()
+    })];
     let mut deferred_warning = None;
 
     if let Some(endpoint) = &config.telemetry.otlp_endpoint {
@@ -239,9 +239,67 @@ where
     }
 }
 
+/// A stderr sink that can hold lines back while a live report owns the
+/// screen, then replay them.
+///
+/// `cuma doctor` redraws its report in place; a log line landing mid-frame
+/// would corrupt the cursor tracking. While held, writes queue in memory;
+/// [`LogBuffer::release`] writes the queue to stderr and returns the sink to
+/// passthrough.
+#[derive(Clone, Default)]
+pub struct LogBuffer {
+    held: Arc<std::sync::atomic::AtomicBool>,
+    queued: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl LogBuffer {
+    /// Start queueing writes.
+    pub fn hold(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop queueing and replay everything held back.
+    pub fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
+        let queued = self
+            .queued
+            .lock()
+            .map(|mut queued| std::mem::take(&mut *queued))
+            .unwrap_or_default();
+        if !queued.is_empty() {
+            use std::io::Write as _;
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(&queued);
+            let _ = err.flush();
+        }
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.held.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(mut queued) = self.queued.lock()
+        {
+            queued.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        std::io::stderr().lock().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.held.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        std::io::stderr().lock().flush()
+    }
+}
+
 /// Keeps trace export alive for the process, and flushes it on the way out.
 #[derive(Default)]
 pub struct Telemetry {
+    /// The sink log lines write through; `cuma doctor` holds it while its
+    /// board owns the screen.
+    pub log_buffer: LogBuffer,
     #[cfg(feature = "otel")]
     provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }

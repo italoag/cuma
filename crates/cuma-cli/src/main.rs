@@ -224,7 +224,7 @@ async fn run(cli: Cli) -> Result<()> {
     overrides.apply(&mut config)?;
 
     // Held for the whole run: dropping it flushes exported traces.
-    let _telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
+    let telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
     // Loading ran before logging existed; what it noticed is told now.
     for warning in &load_warnings {
         tracing::warn!("{warning}");
@@ -291,7 +291,14 @@ async fn run(cli: Cli) -> Result<()> {
                 commands::usage(config, workspace, by_model, cli.json).await
             }
             Some(Command::Doctor) => {
-                crate::doctor::run(config, workspace, loaded.sources, cli.json).await
+                crate::doctor::run(
+                    config,
+                    workspace,
+                    loaded.sources,
+                    cli.json,
+                    telemetry.log_buffer.clone(),
+                )
+                .await
             }
             Some(Command::Setup {
                 yes,
