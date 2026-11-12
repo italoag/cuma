@@ -2,13 +2,14 @@
 
 use crate::capabilities::capabilities_from_initialize;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent, Usage,
     UsageUpdate,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent};
 use async_trait::async_trait;
 use cuma_core::error::{MetaAgentError, Result};
 use cuma_core::ports::{
@@ -254,7 +255,11 @@ impl AcpAdapter {
                 if path.is_absolute() {
                     Some(path.to_path_buf())
                 } else if index == 0 && !elsewhere {
-                    which::which(word).ok()
+                    // Canonicalized: `which` answers shims and symlinks whose
+                    // targets the sandbox must see, not the link itself.
+                    which::which(word)
+                        .ok()
+                        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
                 } else {
                     None
                 }
@@ -537,7 +542,7 @@ impl AgentAdapter for AcpAdapter {
         let updates_for_handler = updates.clone();
 
         let turn = agent_client_protocol::Client
-            .builder()
+            .v1()
             .name("cuma")
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
@@ -703,7 +708,7 @@ impl AcpAdapter {
         let agent_id = self.id.clone();
 
         let response = agent_client_protocol::Client
-            .builder()
+            .v1()
             .name("cuma")
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 connection
@@ -757,7 +762,7 @@ impl AcpAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use agent_client_protocol::schema::v1::Cost;
+    use agent_client_protocol::v1::schema::Cost;
 
     #[test]
     fn a_sandboxed_agent_is_launched_under_its_prefix_with_quoting_intact() {
@@ -1065,8 +1070,23 @@ mod tests {
     }
 
     /// The minimal ACP agent fixture, or `None` without python3.
+    /// `python3` must not only exist but start: a shim for a missing runtime
+    /// (mise, asdf) resolves in `which` yet exits nonzero on any invocation.
+    fn working_python3() -> bool {
+        which::which("python3").is_ok_and(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     fn minimal_agent() -> Option<String> {
-        which::which("python3").ok()?;
+        if !working_python3() {
+            return None;
+        }
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/minimal_agent.py"

@@ -1700,7 +1700,7 @@ pub async fn mcp(config: Config, action: McpAction, json: bool) -> Result<()> {
 }
 
 /// Where the ACP registry is cached between runs.
-fn registry_cache(workspace: &std::path::Path) -> PathBuf {
+pub(crate) fn registry_cache(workspace: &std::path::Path) -> PathBuf {
     workspace
         .join(".cuma")
         .join("cache")

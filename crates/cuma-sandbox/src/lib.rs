@@ -118,6 +118,9 @@ pub struct LaunchRequest {
     pub state: Vec<PathBuf>,
     /// Hosts the agent may reach; empty means unrestricted.
     pub allowed_hosts: Vec<String>,
+    /// The agent's binary name — `devin`, `opencode`. Runtimes with
+    /// built-in harness presets (ai-jail) apply theirs when it matches.
+    pub harness: Option<String>,
 }
 
 impl LaunchRequest {
@@ -130,6 +133,7 @@ impl LaunchRequest {
             readable: Vec::new(),
             state: Vec::new(),
             allowed_hosts: Vec::new(),
+            harness: None,
         }
     }
 

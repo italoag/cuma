@@ -6,7 +6,7 @@ use cuma_core::ports::AgentAdapter;
 use cuma_orchestrator::Orchestrator;
 use cuma_planner::HeuristicPlanner;
 use cuma_protocol_a2a::A2aDiscovery;
-use cuma_protocol_acp::AcpConfigDiscovery;
+use cuma_protocol_acp::{AcpAdapter, AcpConfigDiscovery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -487,6 +487,8 @@ struct ProviderLauncher {
     /// `env` and `security.agent_env`.
     env: Vec<String>,
     allowed_hosts: Vec<String>,
+    /// The binary its command starts, for runtimes with harness presets.
+    harness: Option<String>,
 }
 
 impl ProviderLauncher {
@@ -506,6 +508,13 @@ impl ProviderLauncher {
                 .collect(),
             env,
             allowed_hosts: security.network_allowlist.clone(),
+            harness: agent.command.as_deref().and_then(|command| {
+                command
+                    .split_whitespace()
+                    .next()
+                    .and_then(|program| Path::new(program).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            }),
         }
     }
 
@@ -525,6 +534,7 @@ impl ProviderLauncher {
             readable: readable.to_vec(),
             state: self.state.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
+            harness: self.harness.clone(),
         }
     }
 }
@@ -690,20 +700,37 @@ pub async fn build_orchestrator(
             names.join(", ")
         ));
     }
-    let acp_adapters: Vec<_> = acp
+    let acp_adapters: Vec<Arc<AcpAdapter>> = acp
         .adapters()
         .into_iter()
         .filter(|adapter| !refused.contains_key(adapter.agent_id().as_str()))
+        .map(Arc::new)
         .collect();
-    for adapter in acp_adapters {
+    // Each negotiation launches and handshakes a real agent process — the
+    // slowest phase of startup. They are independent, so they run together:
+    // wall time is the slowest agent's, not the sum of all of them.
+    let negotiations = futures::future::join_all(acp_adapters.iter().map(|adapter| {
+        let adapter = Arc::clone(adapter);
+        async move {
+            let started = std::time::Instant::now();
+            let result = adapter.refresh_capabilities().await;
+            (adapter, started, result)
+        }
+    }))
+    .await;
+    for (adapter, started, result) in negotiations {
         // Negotiate capabilities where possible; register with configured
         // capabilities where not.
-        let failure = adapter
-            .refresh_capabilities()
-            .await
+        let failure = result
             .err()
             .map(|err| format!("ACP negotiation failed ({err})"));
-        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
+        tracing::info!(
+            agent = %adapter.agent_id(),
+            ms = started.elapsed().as_millis() as u64,
+            ok = failure.is_none(),
+            "agent capability negotiation"
+        );
+        register(&mut orchestrator, adapter, failure, &mut warnings).await;
     }
 
     // --- A2A agents -------------------------------------------------------

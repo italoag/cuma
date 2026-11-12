@@ -32,7 +32,7 @@ pub use session::{SessionRegistry, SessionState, Turn};
 pub use translate::{advertised_capabilities, event_to_session_update, stop_reason_for};
 pub use workspaces::{BuildFuture, Builder, Workspaces};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
@@ -134,7 +134,7 @@ where
     let prompt_sessions = sessions.clone();
 
     Agent
-        .builder()
+        .v1()
         .name(AGENT_NAME)
         // --- initialize ---------------------------------------------------
         .on_receive_request(
@@ -203,9 +203,10 @@ where
                     };
                     let Some(state) = sessions.load(&request.session_id, path.clone()).await else {
                         let _ = responder.respond_with_error(
-                            agent_client_protocol::Error::resource_not_found(Some(
-                                request.session_id.to_string(),
-                            )),
+                            agent_client_protocol::v1::schema::Error::session_not_found(
+                                request.session_id.clone(),
+                            )
+                            .into(),
                         );
                         return Ok(());
                     };
@@ -299,8 +300,8 @@ where
 async fn run_prompt(
     orchestrator: &Arc<Orchestrator>,
     sessions: &SessionRegistry,
-    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
-    session_id: &agent_client_protocol::schema::v1::SessionId,
+    connection: &agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Client>,
+    session_id: &agent_client_protocol::v1::schema::SessionId,
     goal: &str,
 ) -> StopReason {
     // Each prompt runs as its own orchestrator session. Its id is chosen here,

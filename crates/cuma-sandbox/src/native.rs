@@ -51,7 +51,12 @@ impl NativeProvider {
         self.sandbox
             .clone()
             .with_state(request.state.iter().cloned())
-            .launch_prefix(&request.workspace, &request.keep_env, &request.readable)
+            .launch_prefix(
+                &request.workspace,
+                &request.keep_env,
+                &request.readable,
+                request.harness.as_deref(),
+            )
             .unwrap_or_default()
     }
 }

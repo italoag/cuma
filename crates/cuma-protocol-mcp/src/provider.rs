@@ -505,9 +505,24 @@ mod tests {
 
     // --- connection reuse, against a real server process ------------------
 
+    /// `python3` must not only exist but start: a shim for a missing runtime
+    /// (mise, asdf) resolves in `which` yet exits nonzero on any invocation.
+    fn working_python3() -> bool {
+        which::which("python3").is_ok_and(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     /// A provider over the counting fixture, or `None` without python3.
     fn counting_provider() -> Option<McpToolProvider> {
-        which::which("python3").ok()?;
+        if !working_python3() {
+            return None;
+        }
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/counting_server.py"

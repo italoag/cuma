@@ -52,6 +52,7 @@ impl Backoff {
             return base;
         }
 
+        use rand::RngExt as _;
         let jitter = self.jitter.clamp(0.0, 1.0);
         #[allow(clippy::cast_precision_loss)]
         let base_ms = base.as_millis() as f64;
