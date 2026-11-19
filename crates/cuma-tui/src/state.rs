@@ -381,7 +381,8 @@ impl AppState {
         }
     }
 
-    fn log(&mut self, line: String) {
+    /// Append a line to the log, dropping the oldest past the cap.
+    pub(crate) fn log(&mut self, line: String) {
         self.logs.push(line);
         if self.logs.len() > MAX_LOG_LINES {
             // Drop the oldest lines; the database keeps the full record.

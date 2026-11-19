@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["fuzz", "legacy"]
 members = [
     "crates/cuma-core",
     "crates/cuma-config",
@@ -87,6 +88,7 @@ which = "8"
 dialoguer = { version = "0.12", default-features = false }
 # `tempdir` is deprecated; `tempfile` is its maintained successor.
 tempfile = "3.27"
+arbitrary = { version = "1.5", features = ["derive"] }
 
 # --- protocol SDKs (validated against crates.io index, see DEPENDENCY_ANALYSIS.md) ---
 agent-client-protocol = { version = "5.2", features = ["process", "stdio", "unstable_end_turn_token_usage"] }

@@ -58,6 +58,17 @@ pub trait SkillSource: Send + Sync {
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()>;
 }
 
+/// Captured log lines, for the Logs screen.
+///
+/// Defined here for the same reason as [`SkillSource`]: the interface
+/// depends on what it shows, not on how logging is done. The CLI's tracing
+/// layer writes into an implementation of this, and the loop drains it into
+/// the view model — a write to the terminal would land on top of the frame.
+pub trait LogSource: Send + Sync {
+    /// Every line recorded since the last call, oldest first.
+    fn drain(&self) -> Vec<String>;
+}
+
 /// What the interface can show beyond the orchestrator's own state.
 #[derive(Default, Clone)]
 pub struct Sources {
@@ -65,6 +76,8 @@ pub struct Sources {
     pub skills: Option<Arc<dyn SkillSource>>,
     /// Long-term memory.
     pub memory: Option<Arc<dyn cuma_core::ports::MemoryStore>>,
+    /// Captured log lines.
+    pub logs: Option<Arc<dyn LogSource>>,
 }
 
 /// Translate a keystroke into an action, given the current mode.
@@ -221,6 +234,10 @@ async fn event_loop(
     let mut redraw = true;
 
     loop {
+        // Captured log lines belong on the Logs screen — a write to the
+        // terminal here would tear the frame the way a stray stderr line does.
+        redraw |= collect_logs(state, &sources);
+
         if redraw {
             // The spinner animates only while there is work to watch.
             if state.running || state.memory_searching {
@@ -384,6 +401,23 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+/// Fold lines a [`LogSource`] captured into the view model.
+///
+/// Returns whether anything arrived, so the caller knows to repaint.
+fn collect_logs(state: &mut AppState, sources: &Sources) -> bool {
+    let Some(logs) = &sources.logs else {
+        return false;
+    };
+    let lines = logs.drain();
+    if lines.is_empty() {
+        return false;
+    }
+    for line in lines {
+        state.log(line);
+    }
+    true
 }
 
 /// How long a memory search may take before the interface gives up on it.
@@ -663,5 +697,40 @@ mod tests {
 
         assert_eq!(handle_key(&mut state, press(KeyCode::F(7))), Action::None);
         assert_eq!(format!("{state:?}"), before);
+    }
+
+    #[derive(Default)]
+    struct StubLogs(std::sync::Mutex<Vec<String>>);
+
+    impl LogSource for StubLogs {
+        fn drain(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn lines_from_a_log_source_reach_the_logs_screen() {
+        let mut state = AppState::new();
+        let sources = Sources {
+            logs: Some(Arc::new(StubLogs(std::sync::Mutex::new(vec![
+                "first".to_owned(),
+                "second".to_owned(),
+            ])))),
+            ..Sources::default()
+        };
+
+        assert!(collect_logs(&mut state, &sources));
+        assert_eq!(state.logs, vec!["first", "second"]);
+        assert!(
+            !collect_logs(&mut state, &sources),
+            "a drain is not repeated"
+        );
+    }
+
+    #[test]
+    fn a_missing_log_source_changes_nothing() {
+        let mut state = AppState::new();
+        assert!(!collect_logs(&mut state, &Sources::default()));
+        assert!(state.logs.is_empty());
     }
 }

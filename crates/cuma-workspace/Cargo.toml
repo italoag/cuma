@@ -21,6 +21,8 @@ which.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
+arbitrary.workspace = true
+rand.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

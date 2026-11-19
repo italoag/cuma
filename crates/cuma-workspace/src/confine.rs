@@ -1231,10 +1231,10 @@ mod tests {
             extra_writable: Vec::new(),
             cuma_executable: None,
             command_paths: Vec::new(),
+            harness: None,
             network: true,
             strip_env: vec!["SECRET".into()],
             forward_env: Vec::new(),
-            harness: None,
         };
         let text = profile.seatbelt_profile();
         let deny_writes = text.find("(deny file-write*)").unwrap();

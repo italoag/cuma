@@ -496,7 +496,11 @@ async fn explain_plan(
 }
 
 /// Launch the TUI.
-pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
+///
+/// `logs` is the tap `main` installed as the tracing writer: the interface
+/// drains it onto the Logs screen, and whatever is left when it exits still
+/// goes to stderr.
+pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogTap>) -> Result<()> {
     let (orchestrator, warnings) =
         harness::build_orchestrator(config.clone(), workspace.clone()).await?;
     for warning in &warnings {
@@ -515,7 +519,27 @@ pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
         .enabled
         .then(|| harness::memory_store(&config, &workspace));
 
-    cuma_tui::run_with(orchestrator, cuma_tui::Sources { skills, memory }).await
+    let outcome = cuma_tui::run_with(
+        orchestrator,
+        cuma_tui::Sources {
+            skills,
+            memory,
+            logs: logs
+                .as_ref()
+                .map(|tap| Arc::new(tap.clone()) as Arc<dyn cuma_tui::LogSource>),
+        },
+    )
+    .await;
+
+    // The terminal is restored by now, so lines the loop had not drained yet
+    // — including whatever an error path logged — still reach stderr.
+    if let Some(tap) = logs {
+        for line in cuma_tui::LogSource::drain(&tap) {
+            eprintln!("{line}");
+        }
+    }
+
+    outcome
 }
 
 /// The skill manager, as the TUI's Skills screen sees it.

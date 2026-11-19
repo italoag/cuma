@@ -9,7 +9,7 @@ use cuma_protocol_a2a::A2aDiscovery;
 use cuma_protocol_acp::{AcpAdapter, AcpConfigDiscovery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The command-line flags that override configuration, kept so they can be
 /// applied again to the configuration of another workspace.
@@ -155,6 +155,22 @@ type OutputLayer = Box<dyn tracing_subscriber::Layer<Filtered> + Send + Sync>;
 /// `--json` switches to structured output, which is what CI and other agents
 /// want; a human at a terminal gets the readable formatter.
 pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
+    let log_buffer = LogBuffer::default();
+    let writer_buffer = log_buffer.clone();
+    let mut telemetry = init_tracing_to(config, verbosity, json, move || writer_buffer.clone());
+    telemetry.log_buffer = log_buffer;
+    telemetry
+}
+
+/// Set up logging, with formatted events written to `writer`.
+///
+/// `init_tracing` is this with stderr. The TUI passes a [`LogTap`]: nothing
+/// may write to the terminal while the interface owns it, so its log lines
+/// are drained onto the Logs screen instead.
+pub fn init_tracing_to<W>(config: &Config, verbosity: u8, json: bool, writer: W) -> Telemetry
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -168,14 +184,11 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
         .unwrap_or_else(|_| EnvFilter::new(format!("cuma={level},warn")));
 
     // Logs go to stderr so that `--json` output on stdout stays parseable when
-    // both are enabled.
+    // both are enabled; `writer` decides where they actually land.
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
+    let mut layers = vec![log_layer(json || config.telemetry.json_logs, writer)];
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
     let mut telemetry = Telemetry::default();
-    let log_buffer = telemetry.log_buffer.clone();
-    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
-    let mut layers = vec![log_layer(json || config.telemetry.json_logs, move || {
-        log_buffer.clone()
-    })];
     let mut deferred_warning = None;
 
     if let Some(endpoint) = &config.telemetry.otlp_endpoint {
@@ -294,6 +307,111 @@ impl std::io::Write for LogBuffer {
     }
 }
 
+/// Log lines captured for the TUI's Logs screen.
+///
+/// While the interface owns the terminal nothing may write to it — a stray
+/// line tears the frame — so `chat` installs this as the tracing writer and
+/// the event loop drains it into the view model. It is also the
+/// [`cuma_tui::LogSource`] that loop polls.
+#[derive(Clone, Default)]
+pub struct LogTap {
+    inner: Arc<Mutex<TapInner>>,
+}
+
+#[derive(Default)]
+struct TapInner {
+    /// Finished lines, oldest first.
+    lines: Vec<String>,
+    /// Bytes of a line still being written.
+    pending: Vec<u8>,
+}
+
+/// The tap never grows without bound: the Logs screen keeps 500 lines, and a
+/// wedged interface must not turn a log flood into a memory leak.
+const MAX_TAP_LINES: usize = 1_000;
+
+impl LogTap {
+    /// Buffer `bytes`, emitting each `\n`-terminated line.
+    fn push(&self, bytes: &[u8]) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.pending.extend_from_slice(bytes);
+        while let Some(end) = inner.pending.iter().position(|byte| *byte == b'\n') {
+            let line = inner.pending.drain(..=end).collect::<Vec<_>>();
+            let text = strip_ansi(String::from_utf8_lossy(&line).trim_end());
+            if !text.is_empty() {
+                inner.lines.push(text);
+            }
+        }
+        let overflow = inner.lines.len().saturating_sub(MAX_TAP_LINES);
+        if overflow > 0 {
+            inner.lines.drain(..overflow);
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogTap {
+    type Writer = TapWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TapWriter { tap: self.clone() }
+    }
+}
+
+/// The `io::Write` the fmt layer gets: bytes are queued, never sent to a
+/// terminal. `write` always succeeds — a logging failure must not become a
+/// crash inside the interface.
+pub struct TapWriter {
+    tap: LogTap,
+}
+
+impl std::io::Write for TapWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.tap.push(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl cuma_tui::LogSource for LogTap {
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lines,
+        )
+    }
+}
+
+/// Remove ANSI escape sequences — the formatter emits SGR colors — so a line
+/// reads as plain text on the Logs screen.
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            plain.push(ch);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+        // CSI: parameter and intermediate bytes, then a final byte 0x40..=0x7e.
+        for next in chars.by_ref() {
+            if ('\u{40}'..='\u{7e}').contains(&next) {
+                break;
+            }
+        }
+    }
+    plain
+}
 /// Keeps trace export alive for the process, and flushes it on the way out.
 #[derive(Default)]
 pub struct Telemetry {
@@ -918,6 +1036,60 @@ mod tests {
         assert!(logged.contains("kept: cuma at info"), "{logged}");
         assert!(logged.contains("kept: a dependency's warning"), "{logged}");
         assert!(!logged.contains("dropped"), "{logged}");
+    }
+
+    #[test]
+    fn records_written_to_a_log_tap_drain_as_plain_lines() {
+        let tap = LogTap::default();
+        let subscriber = subscriber(
+            tracing_subscriber::EnvFilter::new("cuma=info"),
+            vec![log_layer(false, tap.clone())],
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "cuma_router", "first captured line");
+            tracing::warn!(target: "cuma_orchestrator", "second captured line");
+        });
+
+        let drained = cuma_tui::LogSource::drain(&tap);
+        assert_eq!(drained.len(), 2, "{drained:?}");
+        assert!(drained[0].contains("first captured line"), "{drained:?}");
+        assert!(drained[1].contains("second captured line"), "{drained:?}");
+        assert!(
+            drained.iter().all(|line| !line.contains('\u{1b}')),
+            "ansi escapes must not reach the screen: {drained:?}"
+        );
+        assert!(cuma_tui::LogSource::drain(&tap).is_empty());
+    }
+
+    #[test]
+    fn a_line_split_across_writes_is_completed_before_it_drains() {
+        use std::io::Write as _;
+
+        let tap = LogTap::default();
+        let mut writer = <LogTap as tracing_subscriber::fmt::MakeWriter>::make_writer(&tap);
+
+        writer.write_all(b"one\ntwo").unwrap();
+        assert_eq!(cuma_tui::LogSource::drain(&tap), vec!["one".to_owned()]);
+
+        writer.write_all(b" halves\n").unwrap();
+        assert_eq!(
+            cuma_tui::LogSource::drain(&tap),
+            vec!["two halves".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_tap_drops_the_oldest_lines_past_its_cap() {
+        let tap = LogTap::default();
+        for index in 0..MAX_TAP_LINES + 10 {
+            tap.push(format!("{index}\n").as_bytes());
+        }
+
+        let drained = cuma_tui::LogSource::drain(&tap);
+        assert_eq!(drained.len(), MAX_TAP_LINES);
+        assert_eq!(drained[0], "10");
+        assert_eq!(drained[MAX_TAP_LINES - 1], (MAX_TAP_LINES + 9).to_string());
     }
 
     #[tokio::test]

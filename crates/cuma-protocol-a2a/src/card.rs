@@ -466,4 +466,39 @@ mod tests {
     fn an_implausibly_long_tag_is_dropped() {
         assert_eq!(sanitize_tag(&"x".repeat(500)), None);
     }
+
+    #[test]
+    fn arbitrary_card_tags_never_produce_unsafe_or_empty_capabilities() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xA2AC_A2D1);
+        let mut buf = [0u8; 256];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(tags) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let card = card_with_skills(vec![AgentSkill {
+                id: tags.first().cloned().unwrap_or_default(),
+                name: "fuzz".into(),
+                tags,
+                ..AgentSkill::default()
+            }]);
+            let caps = capabilities_from_card(&card);
+            assert!(!caps.is_empty());
+            for cap in caps.iter() {
+                if let Capability::Custom(name) = cap {
+                    assert!(!name.is_empty());
+                    assert!(name.len() <= MAX_TAG_LEN);
+                    assert!(!name.starts_with('.'));
+                    assert!(!name.contains(".."));
+                    assert!(!name.contains('/'));
+                    assert!(!name.chars().any(char::is_whitespace));
+                }
+            }
+        }
+    }
 }

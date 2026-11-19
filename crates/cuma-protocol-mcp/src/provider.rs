@@ -10,6 +10,7 @@ use rmcp::transport::TokioChildProcess;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::RwLock;
 
 /// The largest tool result accepted, in characters.
@@ -158,7 +159,13 @@ impl McpToolProvider {
     }
 
     /// Build the child-process transport for one server.
-    fn transport(config: &McpServerConfig) -> Result<TokioChildProcess> {
+    ///
+    /// stderr is piped, never inherited: a server writing to the terminal
+    /// would land on top of the TUI's frame. The returned handle is drained
+    /// into the log by [`Self::drain_stderr`].
+    fn transport(
+        config: &McpServerConfig,
+    ) -> Result<(TokioChildProcess, Option<tokio::process::ChildStderr>)> {
         let mut command = tokio::process::Command::new(&config.command);
         command.args(&config.args);
 
@@ -166,12 +173,39 @@ impl McpToolProvider {
             command.env(key, value);
         }
 
-        TokioChildProcess::new(command).map_err(|err| {
-            MetaAgentError::protocol_msg(
-                "mcp",
-                format!("cannot launch MCP server {:?}: {err}", config.command),
-            )
-        })
+        let (process, stderr) = TokioChildProcess::builder(command)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                MetaAgentError::protocol_msg(
+                    "mcp",
+                    format!("cannot launch MCP server {:?}: {err}", config.command),
+                )
+            })?;
+        Ok((process, stderr))
+    }
+
+    /// Route a server's stderr into the log, line by line.
+    ///
+    /// The task ends when the child exits and the pipe reaches EOF; the
+    /// transport's drop guard kills the child, so it cannot outlive it.
+    fn drain_stderr(name: &str, stderr: tokio::process::ChildStderr) {
+        let server = name.to_owned();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        tracing::info!(server = %server, "mcp server stderr: {line}");
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::debug!(server = %server, "mcp server stderr read failed: {err}");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Run `operation` on a live connection to `name`, opening one if needed.
@@ -224,7 +258,10 @@ impl McpToolProvider {
             return Ok(Arc::clone(connection));
         }
 
-        let transport = Self::transport(config)?;
+        let (transport, stderr) = Self::transport(config)?;
+        if let Some(stderr) = stderr {
+            Self::drain_stderr(name, stderr);
+        }
         let service = ().serve(transport).await.map_err(|err| {
             MetaAgentError::protocol_msg("mcp", format!("{name}: initialize failed: {err}"))
         })?;
@@ -619,5 +656,30 @@ mod tests {
         // And the next call simply opens a new one.
         let (_, calls) = pid_and_calls(&provider.call_tool("whoami", Value::Null).await.unwrap());
         assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_servers_stderr_is_piped_for_the_log_not_the_terminal() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        if which::which("sh").is_err() {
+            return;
+        }
+        let config = McpServerConfig::new("sh")
+            .arg("-c")
+            .arg("echo mcp-stderr-sentinel >&2; exec sleep 30");
+        let (process, stderr) = McpToolProvider::transport(&config).expect("sh must launch");
+
+        // `None` would mean the child inherited the terminal — the bug this
+        // guards against.
+        let mut lines =
+            tokio::io::BufReader::new(stderr.expect("stderr must be piped, not inherited")).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the server's stderr never arrived")
+            .expect("stderr read failed")
+            .expect("stderr closed before a line");
+        assert_eq!(line, "mcp-stderr-sentinel");
+        drop(process);
     }
 }

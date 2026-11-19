@@ -75,7 +75,7 @@ impl std::fmt::Display for MergeReport {
 /// link to anything but a file unpacked before it; anything that is not a
 /// file, a directory or a link. Links are unpacked as they are: the merge
 /// judges where they point.
-fn unpack(archive: &Path, dir: &Path) -> Result<()> {
+pub fn unpack(archive: &Path, dir: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     // Made here, so nothing in it can predate the archive.

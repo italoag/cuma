@@ -19,6 +19,8 @@ tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
+arbitrary.workspace = true
+rand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]

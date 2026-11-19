@@ -409,4 +409,79 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn zero_max_attempts_clamps_to_one_and_negative_jitter_is_deterministic() {
+        let policy = RetryPolicy::with_max_attempts(0);
+        assert_eq!(policy.max_attempts, 1);
+
+        let b = Backoff {
+            base_ms: 250,
+            multiplier: 2.0,
+            max_ms: 1000,
+            jitter: -0.5,
+        };
+        let mut r = rng();
+        assert_eq!(b.delay_with_jitter(2, &mut r), b.delay_for(2));
+    }
+
+    #[test]
+    fn arbitrary_retry_policies_always_terminate_within_budget() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::Rng;
+
+        let classes = [
+            ErrorClass::RateLimit,
+            ErrorClass::QuotaExceeded,
+            ErrorClass::AuthenticationFailure,
+            ErrorClass::AgentCrash,
+            ErrorClass::Timeout,
+            ErrorClass::ProtocolError,
+            ErrorClass::ContextOverflow,
+            ErrorClass::ToolFailure,
+            ErrorClass::ModelUnavailable,
+            ErrorClass::ConnectionFailure,
+            ErrorClass::InvalidResponse,
+            ErrorClass::TaskFailure,
+            ErrorClass::SecurityViolation,
+            ErrorClass::Configuration,
+            ErrorClass::Cancelled,
+            ErrorClass::Unknown,
+        ];
+
+        let mut r = rng();
+        let mut buf = [0u8; 64];
+        for _ in 0..64 {
+            r.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok((max_a, per_t, base, max_ms, class_idx, alts)) =
+                <(u8, u8, u16, u16, u8, bool)>::arbitrary(&mut u)
+            else {
+                continue;
+            };
+            let policy = RetryPolicy {
+                max_attempts: u32::from(max_a.clamp(1, 20)),
+                max_attempts_per_target: u32::from(per_t.clamp(1, 10)),
+                backoff: Backoff {
+                    base_ms: u64::from(base),
+                    multiplier: 2.0,
+                    max_ms: u64::from(max_ms),
+                    jitter: 0.25,
+                },
+            };
+            let class = classes[usize::from(class_idx) % classes.len()];
+            let mut attempts = 0u32;
+            let mut on_target = 0u32;
+            loop {
+                attempts += 1;
+                on_target += 1;
+                assert!(attempts <= policy.max_attempts + 1);
+                match policy.decide(class, attempts, on_target, alts, &mut r) {
+                    RetryDecision::RetrySameTarget { .. } => {}
+                    RetryDecision::Reroute { .. } => on_target = 0,
+                    RetryDecision::Replan { .. } | RetryDecision::GiveUp { .. } => break,
+                }
+            }
+        }
+    }
 }

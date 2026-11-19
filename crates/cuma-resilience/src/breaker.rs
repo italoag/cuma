@@ -489,4 +489,53 @@ mod tests {
         assert!(registry.allows(&agent, None));
         assert!(registry.health(&agent).is_routable());
     }
+
+    #[test]
+    fn breaker_states_map_to_expected_health_and_track_error_and_cooldown_boundaries() {
+        assert_eq!(BreakerState::Closed.to_health(), HealthState::Healthy);
+        assert_eq!(BreakerState::HalfOpen.to_health(), HealthState::Degraded);
+        assert_eq!(BreakerState::Open.to_health(), HealthState::Unavailable);
+
+        let mut cfg = config();
+        cfg.success_threshold = 2;
+        let mut b = CircuitBreaker::new(cfg);
+        assert_eq!(b.last_error(), None);
+
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(ErrorClass::AgentCrash, "crashed", t0);
+        }
+        assert_eq!(b.last_error(), Some("crashed"));
+        assert_eq!(
+            b.state_at(t0 + Duration::from_millis(999)),
+            BreakerState::Open
+        );
+        assert_eq!(
+            b.state_at(t0 + Duration::from_millis(1000)),
+            BreakerState::HalfOpen
+        );
+
+        // First half-open success is not enough when success_threshold == 2.
+        b.record_success();
+        assert_eq!(b.last_error(), None);
+        assert_eq!(
+            b.state_at(t0 + Duration::from_millis(1000)),
+            BreakerState::HalfOpen
+        );
+
+        // Second consecutive success closes the breaker.
+        b.record_success();
+        assert_eq!(
+            b.state_at(t0 + Duration::from_millis(1000)),
+            BreakerState::Closed
+        );
+
+        // A success recorded while still Open shifts it to HalfOpen rather than ignoring it.
+        for _ in 0..3 {
+            b.record_failure(ErrorClass::Timeout, "timed out", t0);
+        }
+        assert_eq!(b.state_at(t0), BreakerState::Open);
+        b.record_success();
+        assert_eq!(b.state_at(t0), BreakerState::HalfOpen);
+    }
 }

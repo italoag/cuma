@@ -106,6 +106,34 @@ Behaviour varies per attempt, which is what makes retry and fallback testable.
 
 **Every new failure mode gets a mock before it gets a handler.**
 
+### Mutation testing and fuzzing
+
+Mutation testing targets pure, deterministic domain and security modules via
+`.cargo/mutants.toml` and `.config/nextest.toml` (`test_tool = "nextest"` with a
+`mutants` fail-fast profile), skipping I/O wrappers, TUI rendering and prose
+formatters:
+
+```bash
+make mutants        # run targeted mutation suite via cargo-mutants + nextest
+make mutants-diff   # mutate only lines touched in the current git diff
+```
+
+Structure-aware property tests using `arbitrary::Unstructured` with a
+deterministic `StdRng` run on stable Rust inside `cargo test` and
+`cargo nextest run`. Coverage-guided LLVM `libFuzzer` targets live in the
+excluded `fuzz/` workspace (`cargo-fuzz` + `arbitrary` on `nightly`):
+
+- `a2a_wire_and_card` — A2A 1.0/0.3 wire parsers, round-trips, Agent Card tag sanitization
+- `llm_plan_and_dag` — untrusted LLM plan parsing and `TaskGraph` DAG invariants
+- `security_guards` — `CommandGuard`, skill manifest parsing/validation, signature checks
+- `sandbox_tar_unpack` — custom tar unpacker against path-traversal and link escapes
+- `router_and_resilience` — routing score bounds, retry termination, ownership ledger conflicts
+
+```bash
+make fuzz-check     # compile all 5 libFuzzer targets
+make fuzz-smoke     # run 2,000 smoke iterations per target
+```
+
 ### Live sandbox tests
 
 Each sandbox provider has a test that runs an ACP agent inside the real
