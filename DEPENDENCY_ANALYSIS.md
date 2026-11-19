@@ -190,6 +190,13 @@ workspace's `rustls` features and no second HTTP stack is built.
 `criterion` 0.8.2 (MSRV 1.86), a dev-dependency with default features off
 (no plotting, no rayon).
 
+## Mutation testing and fuzzing
+
+| Crate | Version | MSRV | Why |
+|---|---|---|---|
+| `arbitrary` | 1.5 (`derive`) | 1.71 | Structure-aware property tests (`[dev-dependencies]`) and `cargo-fuzz` targets |
+| `libfuzzer-sys` | 0.4.13 | nightly | Isolated in `fuzz/` (listed in `workspace.exclude` so MSRV 1.88 is unaffected) |
+
 ## Core dependencies
 
 | Crate | Version | Why |
@@ -219,6 +226,7 @@ workspace's `rustls` features and no second HTTP stack is built.
 | `dashmap` | Low-contention concurrency; standard locks suffice. |
 | Provider SDKs | Providers (`cuma-providers`) are a few HTTP calls over `reqwest` behind `LlmProvider`, used for the harness's own reasoning only (ADR-002). |
 | `toml_edit` | `cuma agents add` appends one escaped table rather than rewriting a user's file. |
+| `bolero` | 0.13.7 pulls in `rand` 0.9 alongside the workspace's `rand` 0.10 and requires `unexpected_cfgs` overrides; `arbitrary::Unstructured` + seeded `StdRng` covers deterministic property testing under `cargo test`/`nextest`, while `cargo-fuzz` + `libfuzzer-sys` handles `libFuzzer` runs in `fuzz/`. |
 
 ## MSRV
 

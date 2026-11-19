@@ -699,4 +699,58 @@ mod tests {
             "a total built on an estimate is an estimate"
         );
     }
+
+    #[test]
+    fn a_task_with_an_explicit_id_retains_that_id() {
+        let custom = TaskId::new("custom-task-42");
+        let task = Task::with_id(custom.clone(), TaskSpec::new("x", TaskType::General));
+        assert_eq!(task.id, custom);
+    }
+
+    #[test]
+    fn arbitrary_task_graphs_preserve_dag_and_priority_invariants() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xDA60_0001);
+        let mut buf = [0u8; 512];
+        for _ in 0..48 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(nodes) = Vec::<(u8, Vec<u8>)>::arbitrary(&mut u) else {
+                continue;
+            };
+            let count = nodes.len().min(10);
+            if count == 0 {
+                continue;
+            }
+            let ids: Vec<TaskId> = (0..count).map(|i| TaskId::new(format!("t{i}"))).collect();
+            let mut graph = TaskGraph::new();
+            for (i, (priority, deps)) in nodes.into_iter().take(count).enumerate() {
+                let mut spec = TaskSpec::new(format!("task {i}"), TaskType::General);
+                spec.priority = priority;
+                spec.dependencies = deps
+                    .into_iter()
+                    .take(4)
+                    .map(|d| ids[usize::from(d) % count].clone())
+                    .collect();
+                graph.add(Task::with_id(ids[i].clone(), spec));
+            }
+            if graph.validate().is_ok() {
+                let ready = graph.ready_tasks();
+                assert!(!ready.is_empty());
+                for pair in ready.windows(2) {
+                    assert!(pair[0].spec.priority >= pair[1].spec.priority);
+                }
+                let root = ready[0].id.clone();
+                if let Some(t) = graph.get_mut(&root) {
+                    t.status = TaskStatus::Failed;
+                }
+                for skipped in graph.cascade_skip(&root) {
+                    assert_eq!(graph.get(&skipped).unwrap().status, TaskStatus::Skipped);
+                }
+            }
+        }
+    }
 }

@@ -1,0 +1,64 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "cuma-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.5.0", features = ["derive"] }
+serde_json = "1"
+rand = "0.10"
+tempfile = "3.27"
+
+cuma-core = { path = "../crates/cuma-core" }
+cuma-config = { path = "../crates/cuma-config" }
+cuma-resilience = { path = "../crates/cuma-resilience" }
+cuma-registry = { path = "../crates/cuma-registry" }
+cuma-router = { path = "../crates/cuma-router" }
+cuma-planner = { path = "../crates/cuma-planner" }
+cuma-skills = { path = "../crates/cuma-skills" }
+cuma-workspace = { path = "../crates/cuma-workspace" }
+cuma-protocol-a2a = { path = "../crates/cuma-protocol-a2a" }
+cuma-sandbox = { path = "../crates/cuma-sandbox" }
+
+[[bin]]
+name = "a2a_wire_and_card"
+path = "fuzz_targets/a2a_wire_and_card.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "llm_plan_and_dag"
+path = "fuzz_targets/llm_plan_and_dag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "security_guards"
+path = "fuzz_targets/security_guards.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sandbox_tar_unpack"
+path = "fuzz_targets/sandbox_tar_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "router_and_resilience"
+path = "fuzz_targets/router_and_resilience.rs"
+test = false
+doc = false
+bench = false

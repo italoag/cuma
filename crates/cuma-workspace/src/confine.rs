@@ -1074,15 +1074,18 @@ mod tests {
             let path = home.join(hidden).display().to_string();
             assert!(!bound.contains(&path), "{hidden} must stay hidden");
         }
+        let allowed_toolchain: Vec<PathBuf> = WRITABLE_TOOLCHAIN_IN_HOME
+            .iter()
+            .map(|rel| home.join(rel))
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+            .collect();
         for writable in pairs(&args, "--bind-try") {
-            let name = Path::new(&writable)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            if Path::new(&writable).starts_with(&home) {
+            let path = Path::new(&writable);
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.starts_with(&home) {
                 assert!(
-                    WRITABLE_IN_HOME.contains(&name.as_str()),
+                    WRITABLE_IN_HOME.contains(&name.as_str())
+                        || allowed_toolchain.iter().any(|allowed| allowed == path),
                     "{writable} writable"
                 );
             }
@@ -1231,6 +1234,7 @@ mod tests {
             extra_writable: Vec::new(),
             cuma_executable: None,
             command_paths: Vec::new(),
+            harness: None,
             network: true,
             strip_env: vec!["SECRET".into()],
             forward_env: Vec::new(),

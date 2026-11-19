@@ -24,6 +24,8 @@ futures.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+arbitrary.workspace = true
+rand.workspace = true
 cuma-planner.workspace = true
 cuma-testkit.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

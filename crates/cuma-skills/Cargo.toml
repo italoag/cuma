@@ -25,6 +25,8 @@ reqwest.workspace = true
 shell-words.workspace = true
 
 [dev-dependencies]
+arbitrary.workspace = true
+rand.workspace = true
 criterion.workspace = true
 axum.workspace = true
 tempfile.workspace = true

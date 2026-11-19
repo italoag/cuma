@@ -111,7 +111,7 @@ fn risk_for(task_type: TaskType) -> Risk {
 /// do not exist, and may try to smuggle instructions through the description
 /// field. Unparseable lines are skipped, forward or self references are
 /// dropped, and descriptions are treated purely as data.
-pub(crate) fn parse_plan(reply: &str, available: &CapabilitySet) -> Option<TaskGraph> {
+pub fn parse_plan(reply: &str, available: &CapabilitySet) -> Option<TaskGraph> {
     let mut graph = TaskGraph::new();
     let mut ids: Vec<TaskId> = Vec::new();
     let mut pending: Vec<(TaskSpec, Vec<usize>)> = Vec::new();
@@ -450,5 +450,27 @@ review | 1 | Review it";
             Risk::ReadOnly,
             "the declared type still governs risk"
         );
+    }
+
+    #[test]
+    fn arbitrary_model_replies_never_yield_invalid_or_deadlocked_graphs() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x91AA_0001);
+        let mut buf = [0u8; 512];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(reply) = String::arbitrary(&mut u) else {
+                continue;
+            };
+            if let Some(graph) = parse_plan(&reply, &CapabilitySet::new()) {
+                assert!(graph.validate().is_ok());
+                assert!(graph.len() >= 2);
+                assert!(!graph.ready_tasks().is_empty());
+            }
+        }
     }
 }

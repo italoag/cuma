@@ -556,4 +556,104 @@ mod tests {
         assert!(text.contains("REFUSED"));
         assert!(text.contains("Blockers:"));
     }
+
+    #[test]
+    fn assess_fetched_judges_a_skill_by_its_evidence_rather_than_its_provisional_label() {
+        let mut m = manifest("https://registry.example/skills/rust-debug");
+        m.trust = TrustLevel::Untrusted;
+        let report = assess_fetched(
+            &m,
+            &evidence(
+                "sha256:aa",
+                Some("sha256:aa"),
+                crate::integrity::SignatureCheck::Absent,
+            ),
+        );
+        assert!(report.permitted);
+        assert_eq!(report.trust, TrustLevel::Verified);
+    }
+
+    #[test]
+    fn a_file_source_is_local_and_community_trusted_while_missing_version_and_unknown_key_warn() {
+        let mut m = manifest("file:./my-skill");
+        m.version = "   ".into();
+        m.trust = TrustLevel::Trusted;
+        m.requested_permissions = (0..12)
+            .map(|i| format!("filesystem:read:./dir{i}"))
+            .collect();
+
+        let report_at_limit = validate_with(
+            &m,
+            &evidence(
+                "sha256:aa",
+                Some("sha256:aa"),
+                crate::integrity::SignatureCheck::UnknownKey {
+                    key: "stranger".into(),
+                },
+            ),
+        );
+        assert!(report_at_limit.permitted);
+        assert_eq!(report_at_limit.trust, TrustLevel::Community);
+        assert!(
+            report_at_limit
+                .warnings
+                .iter()
+                .any(|w| w.contains("no version"))
+        );
+        assert!(
+            report_at_limit
+                .warnings
+                .iter()
+                .any(|w| w.contains("trusted_keys"))
+        );
+        assert!(!report_at_limit.warnings.iter().any(|w| w.contains("a lot")));
+
+        m.requested_permissions
+            .push("filesystem:read:./dir12".into());
+        let report_over_limit = validate(&m);
+        assert!(
+            report_over_limit
+                .warnings
+                .iter()
+                .any(|w| w.contains("a lot"))
+        );
+    }
+
+    #[test]
+    fn arbitrary_manifests_never_exceed_their_claimed_or_evidence_derived_trust() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5E11_0002);
+        let mut buf = [0u8; 256];
+        let trusts = [
+            TrustLevel::Trusted,
+            TrustLevel::Verified,
+            TrustLevel::Community,
+            TrustLevel::Untrusted,
+        ];
+
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(source) = String::arbitrary(&mut u) else {
+                continue;
+            };
+            let Ok(perms) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let Ok(trust_idx) = u8::arbitrary(&mut u) else {
+                continue;
+            };
+            let mut m = manifest(&source);
+            m.requested_permissions = perms.into_iter().take(16).collect();
+            m.trust = trusts[usize::from(trust_idx) % trusts.len()];
+            let report = validate(&m);
+            assert!(report.trust >= m.trust);
+            if source.trim().to_ascii_lowercase().starts_with("generated:") {
+                assert_eq!(report.trust, TrustLevel::Untrusted);
+            }
+        }
+    }
 }

@@ -223,8 +223,15 @@ async fn run(cli: Cli) -> Result<()> {
     };
     overrides.apply(&mut config)?;
 
+    // Chat owns the terminal: its log lines are captured for the Logs screen
+    // instead of written to stderr, where they would tear the frame.
+    let chat_logs =
+        matches!(&cli.command, None | Some(Command::Chat)).then(harness::LogTap::default);
     // Held for the whole run: dropping it flushes exported traces.
-    let telemetry = harness::init_tracing(&config, cli.verbose, cli.json);
+    let telemetry = match &chat_logs {
+        Some(tap) => harness::init_tracing_to(&config, cli.verbose, cli.json, tap.clone()),
+        None => harness::init_tracing(&config, cli.verbose, cli.json),
+    };
     // Loading ran before logging existed; what it noticed is told now.
     for warning in &load_warnings {
         tracing::warn!("{warning}");
@@ -259,7 +266,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let goal = goal.join(" ");
                 commands::run_goal(config, workspace, &goal, true, cli.json).await
             }
-            Some(Command::Chat) | None => commands::chat(config, workspace).await,
+            Some(Command::Chat) | None => commands::chat(config, workspace, chat_logs).await,
             Some(Command::Serve {
                 protocol,
                 bind,

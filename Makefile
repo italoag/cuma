@@ -23,7 +23,8 @@ LIVE_TESTS := docker microsandbox wasmer agentos kubernetes opensandbox e2b arcb
 
 .PHONY: all help \
 	build release run setup doctor doc \
-	check ci fmt fmt-check lint lint-otel test test-crate bench bench-check \
+	check ci fmt fmt-check lint lint-otel test test-nextest test-crate bench bench-check \
+	mutants mutants-diff fuzz-check fuzz-smoke \
 	msrv actionlint cover \
 	live $(addprefix live-,$(LIVE_TESTS)) \
 	skill-keygen skill-sign skill-verify \
@@ -74,6 +75,23 @@ lint-otel: ## Clippy with the optional `otel` feature enabled.
 
 test: ## The whole test suite.
 	cargo test --workspace
+
+test-nextest: ## The whole test suite via cargo-nextest.
+	cargo nextest run --workspace
+
+mutants: ## Targeted mutation testing via cargo-mutants + cargo-nextest (.cargo/mutants.toml).
+	cargo mutants
+
+mutants-diff: ## Mutation testing scoped to uncommitted git changes.
+	cargo mutants --in-diff git
+
+fuzz-check: ## Build all cargo-fuzz targets (needs nightly + cargo-fuzz).
+	cargo +nightly fuzz build
+
+fuzz-smoke: ## Run 2000-iteration smoke fuzzing on every target (needs nightly + cargo-fuzz).
+	@for t in a2a_wire_and_card llm_plan_and_dag security_guards sandbox_tar_unpack router_and_resilience; do \
+		cargo +nightly fuzz run $$t -- -runs=2000 || exit 1; \
+	done
 
 test-crate: ## One crate: `make test-crate CRATE=cuma-router` (ARGS for a filter).
 ifeq ($(CRATE),)

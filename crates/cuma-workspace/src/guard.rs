@@ -315,6 +315,56 @@ mod tests {
     #[test]
     fn a_permissive_guard_allows_everything_for_sandboxed_execution() {
         let guard = CommandGuard::permissive();
-        assert!(guard.screen("rm -rf /").is_allowed());
+        let verdict = guard.screen("rm -rf /");
+        assert!(verdict.is_allowed());
+        assert_eq!(verdict.reason(), None);
+    }
+
+    #[test]
+    fn non_recursive_deletion_of_a_protected_root_is_still_refused() {
+        let guard = default_guard();
+        for command in ["rm /", "rm -f /etc", "echo build && rm /usr/"] {
+            let verdict = guard.screen(command);
+            assert!(!verdict.is_allowed(), "{command:?} should be refused");
+            assert!(
+                verdict.reason().unwrap().contains("outside any project"),
+                "got {:?}",
+                verdict.reason()
+            );
+        }
+        assert!(guard.screen("echo rm_tool").is_allowed());
+    }
+
+    #[test]
+    fn arbitrary_commands_never_bypass_empty_or_allowlist_rules() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x60A2_D001);
+        let mut buf = [0u8; 256];
+        let allow_guard = CommandGuard::new(&SecurityConfig {
+            command_allowlist: vec!["cargo".into()],
+            ..SecurityConfig::default()
+        });
+        let default = default_guard();
+
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(cmd) = String::arbitrary(&mut u) else {
+                continue;
+            };
+            if cmd.trim().is_empty() {
+                assert!(!default.screen(&cmd).is_allowed());
+            }
+            if !cmd
+                .split_whitespace()
+                .next()
+                .is_some_and(|b| b.to_ascii_lowercase().starts_with("cargo"))
+            {
+                assert!(!allow_guard.screen(&cmd).is_allowed());
+            }
+        }
     }
 }

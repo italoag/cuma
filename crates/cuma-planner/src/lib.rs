@@ -18,4 +18,4 @@ mod heuristic;
 mod llm;
 
 pub use heuristic::HeuristicPlanner;
-pub use llm::{LlmPlanner, unsatisfiable_capabilities};
+pub use llm::{LlmPlanner, parse_plan, unsatisfiable_capabilities};

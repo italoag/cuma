@@ -155,6 +155,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,8 +858,10 @@ dependencies = [
 name = "cuma-config"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "cuma-core",
  "dirs",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -863,9 +874,11 @@ dependencies = [
 name = "cuma-core"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "async-trait",
  "chrono",
  "futures",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -934,8 +947,10 @@ dependencies = [
 name = "cuma-planner"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "async-trait",
  "cuma-core",
+ "rand 0.10.2",
  "serde",
  "tokio",
  "tracing",
@@ -945,6 +960,7 @@ dependencies = [
 name = "cuma-protocol-a2a"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "async-trait",
  "axum",
  "chrono",
@@ -954,6 +970,7 @@ dependencies = [
  "cuma-planner",
  "cuma-testkit",
  "futures",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -1029,6 +1046,7 @@ dependencies = [
 name = "cuma-resilience"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "cuma-core",
  "rand 0.10.2",
  "serde",
@@ -1040,11 +1058,13 @@ dependencies = [
 name = "cuma-router"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "chrono",
  "cuma-config",
  "cuma-core",
  "cuma-registry",
  "cuma-resilience",
+ "rand 0.10.2",
  "serde",
  "tokio",
  "tracing",
@@ -1102,6 +1122,7 @@ dependencies = [
 name = "cuma-skills"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -1110,6 +1131,7 @@ dependencies = [
  "cuma-config",
  "cuma-core",
  "ed25519-dalek",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -1163,11 +1185,13 @@ dependencies = [
 name = "cuma-workspace"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "async-trait",
  "chrono",
  "cuma-config",
  "cuma-core",
  "dirs",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -1315,6 +1339,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
