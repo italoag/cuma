@@ -1075,17 +1075,17 @@ mod tests {
             assert!(!bound.contains(&path), "{hidden} must stay hidden");
         }
         for writable in pairs(&args, "--bind-try") {
-            let name = Path::new(&writable)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            if Path::new(&writable).starts_with(&home) {
-                assert!(
-                    WRITABLE_IN_HOME.contains(&name.as_str()),
-                    "{writable} writable"
-                );
-            }
+            let path = Path::new(&writable);
+            let Ok(rel) = path.strip_prefix(&home) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().into_owned();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                WRITABLE_IN_HOME.contains(&name.as_str())
+                    || WRITABLE_TOOLCHAIN_IN_HOME.contains(&rel.as_str()),
+                "{writable} writable"
+            );
         }
     }
 
@@ -1234,6 +1234,7 @@ mod tests {
             network: true,
             strip_env: vec!["SECRET".into()],
             forward_env: Vec::new(),
+            harness: None,
         };
         let text = profile.seatbelt_profile();
         let deny_writes = text.find("(deny file-write*)").unwrap();

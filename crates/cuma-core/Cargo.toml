@@ -16,7 +16,6 @@ async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
-futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

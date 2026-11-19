@@ -22,7 +22,6 @@ ed25519-dalek.workspace = true
 sha2.workspace = true
 base64.workspace = true
 reqwest.workspace = true
-shell-words.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
