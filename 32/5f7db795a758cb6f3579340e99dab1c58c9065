@@ -1,0 +1,44 @@
+crates/cuma-tui/src/app.rs
+  s_7224be0657f3b0::t_5963f62a601682 701-723,728-735
+  s_7224be0657f3b0::t_fbbb12a3815311 724-727
+  s_7224be0657f3b0::t_c16f580084207c 406-422
+  s_7224be0657f3b0::t_51e9764f5fd111 61-71,79-80
+  s_7224be0657f3b0::t_a583c02db1ab35 237-240
+crates/cuma-cli/src/main.rs
+  s_7224be0657f3b0::t_8262aed452fb95 226-227,232-234,269
+  s_7224be0657f3b0::t_fbbb12a3815311 228-229
+crates/cuma-cli/src/harness.rs
+  s_7224be0657f3b0::t_0652fba75f0171 187,189,310-358,360-365,367-414
+  s_7224be0657f3b0::t_a009451fde5d8f 163-169,171-173
+  s_7224be0657f3b0::t_91f44569cb7d20 366
+  s_7224be0657f3b0::t_2e967dffa036e9 1041-1069,1071-1072,1074-1094
+  s_7224be0657f3b0::t_fbbb12a3815311 170,359,1070,1073
+  s_7224be0657f3b0::t_814e739a90b786 12
+crates/cuma-cli/src/commands.rs
+  s_7224be0657f3b0::t_fbbb12a3815311 503
+  s_7224be0657f3b0::t_3e7e9e1a1085b0 499-502,522-542
+crates/cuma-tui/src/state.rs
+  s_7224be0657f3b0::t_79f3e1e08b2c51 384-385
+crates/cuma-protocol-mcp/src/provider.rs
+  s_7224be0657f3b0::t_fb9b3a609c52da 13,162-168,176-208,261-264
+  s_7224be0657f3b0::t_fbbb12a3815311 671,675-676
+  s_7224be0657f3b0::t_2e967dffa036e9 660-670,672-674,677-684
+crates/cuma-tui/src/lib.rs
+  s_7224be0657f3b0::t_44b2bce4066a4d 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "325f7db795a758cb6f3579340e99dab1c58c9065",
+  "prompts": {},
+  "sessions": {
+    "s_7224be0657f3b0": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "spiral-hare",
+        "model": "unknown"
+      },
+      "human_author": "Italo A. G. <182202+italoag@users.noreply.github.com>"
+    }
+  }
+}
