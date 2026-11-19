@@ -202,6 +202,10 @@ pub struct AppState {
     pub memories: Vec<MemoryRow>,
     /// Set while a search runs.
     pub memory_searching: bool,
+    /// Animation frame for the spinner shown while work runs.
+    ///
+    /// The app loop ticks it before each redraw; rendering stays pure.
+    pub spinner: ratatui_bubbletea_components::SpinnerState,
 }
 
 impl AppState {
@@ -377,7 +381,8 @@ impl AppState {
         }
     }
 
-    fn log(&mut self, line: String) {
+    /// Append a line to the log, dropping the oldest past the cap.
+    pub(crate) fn log(&mut self, line: String) {
         self.logs.push(line);
         if self.logs.len() > MAX_LOG_LINES {
             // Drop the oldest lines; the database keeps the full record.

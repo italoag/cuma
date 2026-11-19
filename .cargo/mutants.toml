@@ -1,0 +1,38 @@
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile", "mutants"]
+gitignore = true
+minimum_test_timeout = 45.0
+timeout_multiplier = 3.0
+build_timeout_multiplier = 15.0
+
+examine_globs = [
+    "crates/cuma-core/src/task.rs",
+    "crates/cuma-core/src/capability.rs",
+    "crates/cuma-core/src/agent.rs",
+    "crates/cuma-core/src/error.rs",
+    "crates/cuma-resilience/src/retry.rs",
+    "crates/cuma-resilience/src/breaker.rs",
+    "crates/cuma-resilience/src/classify.rs",
+    "crates/cuma-router/src/score.rs",
+    "crates/cuma-router/src/router.rs",
+    "crates/cuma-router/src/adaptive.rs",
+    "crates/cuma-skills/src/validation.rs",
+    "crates/cuma-skills/src/integrity.rs",
+    "crates/cuma-skills/src/package.rs",
+    "crates/cuma-workspace/src/ownership.rs",
+    "crates/cuma-workspace/src/guard.rs",
+    "crates/cuma-workspace/src/index.rs",
+    "crates/cuma-config/src/merge.rs",
+    "crates/cuma-config/src/model.rs",
+    "crates/cuma-config/src/env.rs",
+    "crates/cuma-config/src/sandbox.rs",
+    "crates/cuma-usage/src/lib.rs",
+    "crates/cuma-protocol-a2a/src/wire.rs",
+    "crates/cuma-protocol-a2a/src/card.rs",
+    "crates/cuma-planner/src/heuristic.rs",
+    "crates/cuma-planner/src/llm.rs",
+]
+
+exclude_re = [
+    "::(render|describe|to_prompt|fmt)\\b",
+]

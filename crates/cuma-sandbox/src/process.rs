@@ -43,9 +43,18 @@ pub(crate) async fn run(
     output: Output<'_>,
     timeout: Duration,
 ) -> Result<String> {
+    // How the command appears in errors: `-e NAME=value` shows its name only.
     let shown = || {
         let mut words = vec![program.to_owned()];
-        words.extend(args.iter().cloned());
+        let mut after_env = false;
+        for arg in args {
+            let redacted = match arg.split_once('=') {
+                Some((name, _)) if after_env => format!("{name}=…"),
+                _ => arg.clone(),
+            };
+            after_env = matches!(arg.as_str(), "-e" | "--env");
+            words.push(redacted);
+        }
         let mut line = shell_words::join(words);
         if line.len() > 300 {
             let cut = (0..=300)
@@ -96,23 +105,32 @@ pub(crate) async fn run(
             }
         }
     };
-    if let (Input::Bytes(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin
-            .write_all(bytes)
-            .await
-            .map_err(|e| failure(sandbox, format!("{}: writing its input: {e}", shown())))?;
-    }
-
-    let finished = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            failure(
-                sandbox,
-                format!("{} timed out after {}s", shown(), timeout.as_secs()),
-            )
-        })?
-        .map_err(|e| failure(sandbox, format!("{}: {e}", shown())))?;
+    // Input is written while output is read, both under the timeout: a
+    // program that writes before it has read everything cannot stall us.
+    let stdin = match input {
+        Input::Bytes(bytes) => child.stdin.take().map(|stdin| (stdin, bytes)),
+        _ => None,
+    };
+    let feed = async move {
+        if let Some((mut stdin, bytes)) = stdin {
+            stdin.write_all(bytes).await?;
+            // Dropped here: the program sees the end of its input.
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let (fed, finished) = tokio::time::timeout(timeout, async {
+        tokio::join!(feed, child.wait_with_output())
+    })
+    .await
+    .map_err(|_| {
+        failure(
+            sandbox,
+            format!("{} timed out after {}s", shown(), timeout.as_secs()),
+        )
+    })?;
+    let finished = finished.map_err(|e| failure(sandbox, format!("{}: {e}", shown())))?;
     if finished.status.success() {
+        fed.map_err(|e| failure(sandbox, format!("{}: writing its input: {e}", shown())))?;
         return Ok(String::from_utf8_lossy(&finished.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&finished.stderr);
@@ -144,6 +162,43 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_program_that_writes_before_reading_a_large_input_does_not_stall() {
+        // More than a pipe holds, each way: written all first, then read, it
+        // would block forever.
+        let input = vec![b'x'; 300_000];
+        let out = run(
+            "t",
+            "sh",
+            &args(&[
+                "-c",
+                "head -c 300000 /dev/zero | tr '\\0' y; wc -c | tr -d ' '",
+            ]),
+            Input::Bytes(&input),
+            Output::Capture,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(out.ends_with("300000\n"), "{}", &out[out.len() - 20..]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_shows_variable_names_but_never_their_values() {
+        let err = run(
+            "t",
+            "sh",
+            &args(&["-c", "exit 3", "-e", "TOKEN=hunter2"]),
+            Input::Nothing,
+            Output::Capture,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("TOKEN=…") && !err.contains("hunter2"), "{err}");
     }
 
     #[tokio::test]

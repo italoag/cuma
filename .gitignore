@@ -1,7 +1,13 @@
 # Rust
 /target/
+/mutants.out*/
 **/*.rs.bk
 *.pdb
+
+# Fuzzing (cargo-fuzz artifacts stay local)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
 
 # CUMA runtime state
 /.cuma/*.db
@@ -18,3 +24,8 @@
 *.swp
 .idea/
 .vscode/
+.devin/
+.claude/
+.junie/
+.agents/
+.windsurf/

@@ -46,6 +46,9 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Which layers contributed, in application order.
     pub sources: Vec<ConfigSource>,
+    /// What the caller should tell the user once logging is set up: loading
+    /// happens before it, so these cannot be logged here.
+    pub warnings: Vec<String>,
 }
 
 impl Config {
@@ -57,10 +60,13 @@ impl Config {
     pub fn load(project_root: &Path) -> Result<LoadedConfig> {
         let mut config = Config::default();
         let mut sources = vec![ConfigSource::Default];
+        let mut warnings = Vec::new();
 
-        if let Some(global) = global_config_path()
-            && global.exists()
-        {
+        if let Some(global) = global_config_file(
+            global_config_path(),
+            legacy_global_config_path(),
+            &mut warnings,
+        ) {
             let layer = Self::from_file(&global)?;
             config.merge(layer);
             sources.push(ConfigSource::File(global));
@@ -78,7 +84,11 @@ impl Config {
         }
 
         config.validate()?;
-        Ok(LoadedConfig { config, sources })
+        Ok(LoadedConfig {
+            config,
+            sources,
+            warnings,
+        })
     }
 
     /// Parse one TOML file.
@@ -109,6 +119,39 @@ pub fn global_config_path() -> Option<PathBuf> {
     base.map(|dir| dir.join("cuma").join("config.toml"))
 }
 
+/// Where the global configuration lived before it moved to
+/// [`global_config_path`]: `~/Library/Application Support/cuma` on macOS.
+fn legacy_global_config_path() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        dirs::config_dir().map(|dir| dir.join("cuma").join("config.toml"))
+    } else {
+        None
+    }
+}
+
+/// The global file to load: the documented one, else one left at the old
+/// location — read, and named in `warnings` and in `cuma doctor`'s sources,
+/// rather than silently dropped by an upgrade.
+fn global_config_file(
+    documented: Option<PathBuf>,
+    legacy: Option<PathBuf>,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if let Some(path) = documented.as_ref().filter(|path| path.exists()) {
+        return Some(path.clone());
+    }
+    let legacy = legacy.filter(|path| path.exists())?;
+    warnings.push(format!(
+        "the global configuration was read from its old location, {}; move it to {}",
+        legacy.display(),
+        documented
+            .as_deref()
+            .unwrap_or(Path::new("~/.config/cuma/config.toml"))
+            .display()
+    ));
+    Some(legacy)
+}
+
 /// `$XDG_CONFIG_HOME` when it is absolute — the XDG specification ignores a
 /// relative one — and `~/.config` otherwise.
 #[cfg(not(windows))]
@@ -136,6 +179,37 @@ pub fn expand_home(path: &str) -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn a_global_file_left_at_the_old_location_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let documented = dir.path().join("new/cuma/config.toml");
+        let legacy = dir.path().join("old/cuma/config.toml");
+        let mut warnings = Vec::new();
+        let file = |warnings: &mut Vec<String>| {
+            global_config_file(Some(documented.clone()), Some(legacy.clone()), warnings)
+        };
+        assert_eq!(file(&mut warnings), None);
+        assert!(warnings.is_empty());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "").unwrap();
+        assert_eq!(
+            file(&mut warnings),
+            Some(legacy.clone()),
+            "an upgrade must not drop it"
+        );
+        assert_eq!(warnings.len(), 1, "and the user is told: {warnings:?}");
+        assert!(warnings[0].contains("old location"), "{warnings:?}");
+        warnings.clear();
+        std::fs::create_dir_all(documented.parent().unwrap()).unwrap();
+        std::fs::write(&documented, "").unwrap();
+        assert_eq!(
+            file(&mut warnings),
+            Some(documented.clone()),
+            "the documented location wins"
+        );
+        assert!(warnings.is_empty());
+    }
 
     #[test]
     fn a_leading_tilde_is_the_home_directory_and_nothing_else_is_touched() {

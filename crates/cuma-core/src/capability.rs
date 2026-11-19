@@ -256,6 +256,7 @@ mod tests {
             .with(Capability::Vision);
 
         let m = agent.match_against(&required);
+        assert!(!m.is_complete());
         assert!((m.score - 0.5).abs() < f64::EPSILON);
         assert_eq!(m.missing, vec![Capability::Vision]);
     }
@@ -265,5 +266,49 @@ mod tests {
         let m = CapabilitySet::new().match_against(&CapabilitySet::new());
         assert!(m.is_complete());
         assert!((m.score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn inserting_a_duplicate_capability_reports_false() {
+        let mut set = CapabilitySet::new();
+        assert!(set.insert(Capability::Testing));
+        assert!(!set.insert(Capability::Testing));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn collecting_and_extending_preserve_unique_capabilities() {
+        let mut set: CapabilitySet = [Capability::Testing, Capability::Testing, Capability::Vision]
+            .into_iter()
+            .collect();
+        assert_eq!(set.len(), 2);
+        set.extend([Capability::Documentation, Capability::Testing]);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&Capability::Documentation));
+    }
+
+    #[test]
+    fn arbitrary_capability_sets_satisfy_match_score_bounds() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5EED_CAFE);
+        let mut buf = [0u8; 256];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(agent_raw) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let Ok(req_raw) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let agent: CapabilitySet = agent_raw.iter().map(|s| Capability::parse(s)).collect();
+            let req: CapabilitySet = req_raw.iter().map(|s| Capability::parse(s)).collect();
+            let m = agent.match_against(&req);
+            assert!((0.0..=1.0).contains(&m.score));
+            assert_eq!(m.is_complete(), m.missing.is_empty());
+        }
     }
 }

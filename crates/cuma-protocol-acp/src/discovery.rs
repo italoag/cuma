@@ -241,10 +241,25 @@ mod tests {
         assert!(discovery.discover().await.unwrap().is_empty());
     }
 
+    /// `python3` must not only exist but start: a shim for a missing runtime
+    /// (mise, asdf) resolves in `which` yet exits nonzero on any invocation.
+    fn working_python3() -> bool {
+        which::which("python3").is_ok_and(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     /// The minimal ACP agent fixture, configured with `documentation` and a
     /// model, or `None` without python3.
     fn minimal_agent() -> Option<Config> {
-        which::which("python3").ok()?;
+        if !working_python3() {
+            return None;
+        }
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/minimal_agent.py"

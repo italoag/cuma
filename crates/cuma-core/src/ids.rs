@@ -54,22 +54,34 @@ macro_rules! id_newtype {
 
 id_newtype!(
     /// Identifies a registered agent (`codex`, `claude-code`, `remote-architect`).
-    AgentId, "agent");
+    AgentId,
+    "agent"
+);
 id_newtype!(
     /// Identifies a model exposed by an agent.
-    ModelId, "model");
+    ModelId,
+    "model"
+);
 id_newtype!(
     /// Identifies a task or subtask in the plan DAG.
-    TaskId, "task");
+    TaskId,
+    "task"
+);
 id_newtype!(
     /// Identifies one execution attempt of one task against one agent+model.
-    AttemptId, "attempt");
+    AttemptId,
+    "attempt"
+);
 id_newtype!(
     /// Identifies a harness session (one user-facing conversation).
-    SessionId, "session");
+    SessionId,
+    "session"
+);
 id_newtype!(
     /// Identifies an installable skill.
-    SkillId, "skill");
+    SkillId,
+    "skill"
+);
 
 #[cfg(test)]
 mod tests {

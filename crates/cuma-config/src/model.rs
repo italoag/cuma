@@ -869,4 +869,35 @@ mod tests {
         assert_eq!(descriptor.models[0].id.as_str(), "gpt-x");
         assert_eq!(descriptor.metadata["team"], "platform");
     }
+
+    #[test]
+    fn arbitrary_finite_weights_normalize_to_unit_sum_or_default() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xC0AF_1601);
+        let mut buf = [0u8; 64];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok((q, c, l, r, x)) = <(u16, u16, u16, u16, u16)>::arbitrary(&mut u) else {
+                continue;
+            };
+            let w = RouterWeights {
+                quality: f64::from(q),
+                cost: f64::from(c),
+                latency: f64::from(l),
+                reliability: f64::from(r),
+                context: f64::from(x),
+            };
+            if w.sum() <= 0.0 {
+                assert!(w.validate().is_err());
+                assert!((w.normalized().sum() - 1.0).abs() < 1e-9);
+            } else {
+                assert!(w.validate().is_ok());
+                assert!((w.normalized().sum() - 1.0).abs() < 1e-9);
+            }
+        }
+    }
 }

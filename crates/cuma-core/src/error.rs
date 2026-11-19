@@ -290,6 +290,7 @@ mod tests {
         let class = ErrorClass::RateLimit;
         assert!(class.is_retryable_on_same_target());
         assert!(class.is_reroutable());
+        assert!(!class.requires_replan());
     }
 
     #[test]

@@ -17,7 +17,10 @@ tracing.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
+arbitrary.workspace = true
+rand.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

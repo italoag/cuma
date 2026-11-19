@@ -6,7 +6,10 @@ Lowest first. Later layers override earlier ones **field by field**:
 
 1. Built-in defaults
 2. `~/.config/cuma/config.toml` — macOS included; `$XDG_CONFIG_HOME/cuma/config.toml`
-   when that is set, `%APPDATA%\cuma\config.toml` on Windows
+   when that is set, `%APPDATA%\cuma\config.toml` on Windows. Earlier versions
+   read `~/Library/Application Support/cuma/config.toml` on macOS: a file left
+   there is still read when the new one does not exist, with a warning, and
+   `cuma doctor` names it. Move it.
 3. `./.cuma/config.toml`
 4. `CUMA_*` environment variables
 5. CLI flags

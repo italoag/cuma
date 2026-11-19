@@ -370,4 +370,81 @@ mod tests {
             "notes were: {notes:?}"
         );
     }
+
+    #[test]
+    fn rate_limited_and_unavailable_health_states_scale_reliability_distinctly() {
+        let mut a = agent("a", CapabilitySet::new());
+        a.performance_profile.historical_success_rate = Known::Reported(1.0);
+
+        a.health.state = HealthState::RateLimited;
+        let (limited, known) = reliability(&a, None);
+        assert!(known);
+        assert!((limited - 0.3).abs() < 1e-9);
+
+        a.health.state = HealthState::Unavailable;
+        let (unavailable, _) = reliability(&a, None);
+        assert_eq!(unavailable, 0.0);
+
+        let mut model = ModelDescriptor::minimal(a.id.clone(), "exact", "exact");
+        model.context_window = Known::Reported(8_000);
+        assert_eq!(context(Some(&model), Some(8_000)), (0.0, true));
+    }
+
+    #[test]
+    fn arbitrary_finite_profiles_keep_all_dimension_scores_bounded() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5C02_E001);
+        let mut buf = [0u8; 128];
+        let states = [
+            HealthState::Healthy,
+            HealthState::Degraded,
+            HealthState::RateLimited,
+            HealthState::Unavailable,
+            HealthState::Unknown,
+        ];
+
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok((state_idx, lat, succ, cod, reas, in_p, out_p, win, est, comp)) =
+                <(u8, u32, u8, u8, u8, u16, u16, u32, u32, u8)>::arbitrary(&mut u)
+            else {
+                continue;
+            };
+            let mut t = task(TaskType::Implementation);
+            t.spec.complexity = f64::from(comp) / 100.0;
+            t.spec.estimated_tokens = Some(u64::from(est));
+
+            let mut a = agent("fuzz", t.spec.required_capabilities.clone());
+            a.health.state = states[usize::from(state_idx) % states.len()];
+            a.performance_profile = PerformanceProfile {
+                typical_latency_ms: Known::Reported(u64::from(lat)),
+                throughput_tps: Known::Unknown,
+                historical_success_rate: Known::Reported(f64::from(succ) / 50.0),
+                coding_score: Known::Reported(f64::from(cod) / 50.0),
+                reasoning_score: Known::Reported(f64::from(reas) / 50.0),
+            };
+            let mut model = ModelDescriptor::minimal(a.id.clone(), "m", "m");
+            model.context_window = Known::Reported(u64::from(win));
+            model.cost = CostProfile {
+                input_per_mtok: Known::Reported(f64::from(in_p) / 100.0),
+                output_per_mtok: Known::Reported(f64::from(out_p) / 100.0),
+                cache_read_per_mtok: Known::Unknown,
+            };
+
+            let (scores, _) = all(&a, Some(&model), &t);
+            for v in [
+                scores.quality,
+                scores.cost,
+                scores.latency,
+                scores.reliability,
+                scores.context,
+            ] {
+                assert!((0.0..=1.0).contains(&v), "score out of bounds: {v}");
+            }
+        }
+    }
 }
