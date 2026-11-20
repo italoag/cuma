@@ -1061,6 +1061,10 @@ impl AgentAdapter for A2aAdapter {
     async fn health_check(&self) -> Result<()> {
         self.fetch_card().await.map(|_| ())
     }
+
+    async fn refresh(&self) -> Result<AgentDescriptor> {
+        self.refresh_from_card().await
+    }
 }
 
 /// Finds A2A agents declared in configuration.

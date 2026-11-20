@@ -8,7 +8,7 @@
 use crate::state::{AppState, InputMode, Screen};
 use crate::view;
 use cuma_core::error::{MetaAgentError, Result};
-use cuma_core::{Event, EventSubscriber};
+use cuma_core::{AgentId, Event, EventSubscriber};
 use cuma_orchestrator::Orchestrator;
 use ratatui::crossterm::event::{
     Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -44,6 +44,16 @@ pub enum Action {
         /// What it should become.
         enabled: bool,
     },
+    /// Run this agent's sign-in journey.
+    Authenticate {
+        /// The agent.
+        agent: AgentId,
+    },
+    /// Re-interrogate this agent after something about it changed.
+    Reprobe {
+        /// The agent.
+        agent: AgentId,
+    },
 }
 
 /// Installed skills, for the Skills screen.
@@ -69,6 +79,28 @@ pub trait LogSource: Send + Sync {
     fn drain(&self) -> Vec<String>;
 }
 
+/// An agent's sign-in journey, for the Models screen.
+///
+/// Defined here for the same reason as [`SkillSource`]: the interface owns
+/// the terminal the journey runs on — releasing it for an interactive login
+/// and taking it back — while the harness owns what the journey does.
+#[async_trait::async_trait]
+pub trait AgentAuthSource: Send + Sync {
+    /// Whether signing this agent in needs the real terminal released.
+    ///
+    /// A `terminal` method is interactive by definition; it cannot run inside
+    /// the interface's own frame.
+    async fn needs_terminal(&self, agent: &AgentId) -> bool;
+    /// Run the agent's sign-in journey to its end.
+    ///
+    /// Called either on the live terminal (agent-managed methods) or after
+    /// the interface has released it (terminal methods). Returns a one-line
+    /// summary for the status bar.
+    async fn authenticate(&self, agent: &AgentId) -> Result<String>;
+    /// Re-interrogate the agent and update what the interface shows.
+    async fn reprobe(&self, agent: &AgentId) -> Result<String>;
+}
+
 /// What the interface can show beyond the orchestrator's own state.
 #[derive(Default, Clone)]
 pub struct Sources {
@@ -78,6 +110,8 @@ pub struct Sources {
     pub memory: Option<Arc<dyn cuma_core::ports::MemoryStore>>,
     /// Captured log lines.
     pub logs: Option<Arc<dyn LogSource>>,
+    /// Agent sign-in journeys.
+    pub auth: Option<Arc<dyn AgentAuthSource>>,
 }
 
 /// Translate a keystroke into an action, given the current mode.
@@ -155,6 +189,30 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
                     None => Action::None,
                 }
             }
+            KeyCode::Down | KeyCode::Char('j') if state.screen == Screen::Models => {
+                state.move_model_cursor(1);
+                Action::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') if state.screen == Screen::Models => {
+                state.move_model_cursor(-1);
+                Action::Redraw
+            }
+            KeyCode::Char('a') if state.screen == Screen::Models => {
+                match state.selected_model_agent() {
+                    Some(agent) => Action::Authenticate {
+                        agent: agent.id.clone(),
+                    },
+                    None => Action::None,
+                }
+            }
+            KeyCode::Char('r') if state.screen == Screen::Models => {
+                match state.selected_model_agent() {
+                    Some(agent) => Action::Reprobe {
+                        agent: agent.id.clone(),
+                    },
+                    None => Action::None,
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 state.scroll_down(1);
                 Action::Redraw
@@ -192,13 +250,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Action {
 /// The terminal is restored on every exit path, including an error, because
 /// leaving raw mode on makes the user's shell unusable.
 pub async fn run(orchestrator: Orchestrator) -> Result<()> {
-    run_with(orchestrator, Sources::default()).await
+    run_with(Arc::new(orchestrator), Sources::default()).await
 }
 
 /// Run the interface with skills and memory to browse.
-pub async fn run_with(orchestrator: Orchestrator, sources: Sources) -> Result<()> {
-    let orchestrator = Arc::new(orchestrator);
-
+///
+/// The orchestrator arrives shared: sources the caller wires — the sign-in
+/// journey, say — may hold the same `Arc`.
+pub async fn run_with(orchestrator: Arc<Orchestrator>, sources: Sources) -> Result<()> {
     let mut state = AppState::new();
     state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
     state.memory_attached = sources.memory.is_some();
@@ -231,6 +290,8 @@ async fn event_loop(
         None;
     type Recall = (String, Result<Vec<cuma_core::ports::MemoryEntry>>);
     let mut recall: Option<tokio::task::JoinHandle<Recall>> = None;
+    type SignIn = (AgentId, Result<String>);
+    let mut sign_in: Option<tokio::task::JoinHandle<SignIn>> = None;
     let mut redraw = true;
 
     loop {
@@ -309,6 +370,58 @@ async fn event_loop(
                             }
                             redraw = true;
                         }
+                        Action::Authenticate { agent } => {
+                            let Some(source) = &sources.auth else {
+                                state.notice = Some("sign-in is not available here".to_owned());
+                                redraw = true;
+                                continue;
+                            };
+                            if sign_in.is_some() {
+                                state.notice = Some("a sign-in is already running".to_owned());
+                            } else if source.needs_terminal(&agent).await {
+                                // A terminal method is interactive: hand the
+                                // real terminal to it, then take it back.
+                                let _ = ratatui::try_restore();
+                                let outcome = source.authenticate(&agent).await;
+                                *terminal = ratatui::try_init().map_err(|err| {
+                                    MetaAgentError::Other(format!(
+                                        "cannot re-initialize the terminal: {err}"
+                                    ))
+                                })?;
+                                state.notice = Some(outcome.unwrap_or_else(|err| err.to_string()));
+                                state.set_agents(
+                                    orchestrator.agents().snapshot().await.all().to_vec(),
+                                );
+                            } else {
+                                let source = Arc::clone(source);
+                                let agent = agent.clone();
+                                state.notice = Some(format!("signing {agent} in…"));
+                                sign_in = Some(tokio::spawn(async move {
+                                    let result = source.authenticate(&agent).await;
+                                    (agent, result)
+                                }));
+                            }
+                            redraw = true;
+                        }
+                        Action::Reprobe { agent } => {
+                            let Some(source) = &sources.auth else {
+                                state.notice = Some("re-probe is not available here".to_owned());
+                                redraw = true;
+                                continue;
+                            };
+                            if sign_in.is_some() {
+                                state.notice = Some("a sign-in is already running".to_owned());
+                            } else {
+                                let source = Arc::clone(source);
+                                let agent = agent.clone();
+                                state.notice = Some(format!("re-probing {agent}…"));
+                                sign_in = Some(tokio::spawn(async move {
+                                    let result = source.reprobe(&agent).await;
+                                    (agent, result)
+                                }));
+                            }
+                            redraw = true;
+                        }
                         Action::None => {}
                     },
                     TerminalEvent::Resize(_, _) => redraw = true,
@@ -350,6 +463,23 @@ async fn event_loop(
                     Err(err) => format!("session task panicked: {err}"),
                 });
 
+                state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
+                redraw = true;
+            }
+
+            // Sign-in or re-probe completion.
+            signed = async {
+                match sign_in.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                sign_in = None;
+                state.notice = Some(match signed {
+                    Ok((_, Ok(summary))) => summary,
+                    Ok((agent, Err(err))) => format!("{agent}: {err}"),
+                    Err(err) => format!("sign-in stopped: {err}"),
+                });
                 state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
                 redraw = true;
             }
@@ -397,6 +527,9 @@ async fn event_loop(
         handle.abort();
     }
     if let Some(handle) = recall {
+        handle.abort();
+    }
+    if let Some(handle) = sign_in {
         handle.abort();
     }
 
@@ -551,6 +684,73 @@ mod tests {
             handle_key(&mut state, press(KeyCode::Up));
         }
         assert_eq!(state.scroll, 0);
+    }
+
+    fn an_agent(id: &str) -> cuma_core::AgentDescriptor {
+        cuma_core::AgentDescriptor::new(id, id, cuma_core::AgentProtocol::Acp)
+    }
+
+    #[test]
+    fn the_models_cursor_moves_rows_and_selects_their_agent() {
+        let mut state = AppState::new();
+        state.go_to(Screen::Models);
+        state.set_agents(vec![an_agent("one"), an_agent("two")]);
+
+        handle_key(&mut state, press(KeyCode::Char('j')));
+        assert_eq!(
+            state.selected_model_agent().map(|a| a.id.as_str()),
+            Some("two")
+        );
+
+        handle_key(&mut state, press(KeyCode::Char('k')));
+        assert_eq!(
+            state.selected_model_agent().map(|a| a.id.as_str()),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn a_on_models_asks_for_the_selected_agents_sign_in() {
+        let mut state = AppState::new();
+        state.go_to(Screen::Models);
+        state.set_agents(vec![an_agent("copilot")]);
+
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('a'))),
+            Action::Authenticate {
+                agent: AgentId::new("copilot")
+            }
+        );
+    }
+
+    #[test]
+    fn r_on_models_asks_for_a_reprobe() {
+        let mut state = AppState::new();
+        state.go_to(Screen::Models);
+        state.set_agents(vec![an_agent("junie")]);
+
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('r'))),
+            Action::Reprobe {
+                agent: AgentId::new("junie")
+            }
+        );
+    }
+
+    #[test]
+    fn a_and_r_elsewhere_do_nothing() {
+        let mut state = AppState::new();
+        state.go_to(Screen::Agents);
+        state.set_agents(vec![an_agent("copilot")]);
+
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('a'))),
+            Action::None
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('r'))),
+            Action::None
+        );
     }
 
     #[test]

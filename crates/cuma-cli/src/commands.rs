@@ -519,14 +519,16 @@ pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogT
         .enabled
         .then(|| harness::memory_store(&config, &workspace));
 
+    let orchestrator = Arc::new(orchestrator);
     let outcome = cuma_tui::run_with(
-        orchestrator,
+        Arc::clone(&orchestrator),
         cuma_tui::Sources {
             skills,
             memory,
             logs: logs
                 .as_ref()
                 .map(|tap| Arc::new(tap.clone()) as Arc<dyn cuma_tui::LogSource>),
+            auth: Some(Arc::new(crate::auth::CliAuth::new(orchestrator))),
         },
     )
     .await;

@@ -4,10 +4,11 @@ use crate::capabilities::capabilities_from_initialize;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    AuthMethod, AuthenticateRequest, ContentBlock, InitializeRequest, McpServer, McpServerStdio,
-    NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    StopReason, TextContent, Usage, UsageUpdate,
+    AuthCapabilities, AuthMethod, AuthenticateRequest, ClientCapabilities, ContentBlock,
+    InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent, Usage,
+    UsageUpdate,
 };
 use agent_client_protocol::{AcpAgent, Agent, UntypedMessage};
 use async_trait::async_trait;
@@ -16,8 +17,8 @@ use cuma_core::ports::{
     AgentAdapter, ExecutionRequest, ExecutionUpdate, LaunchPurpose, SandboxLaunch,
 };
 use cuma_core::{
-    AgentDescriptor, AgentId, AgentProtocol, AttemptId, ErrorClass, ExecutionOutcome,
-    ModelDescriptor, Risk, TokenUsage,
+    AgentDescriptor, AgentId, AgentProtocol, AttemptId, AuthMethodInfo, AuthMethodKind, ErrorClass,
+    ExecutionOutcome, ModelDescriptor, Risk, TokenUsage,
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -609,6 +610,16 @@ fn current_model_id(raw: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// What CUMA can do for the agent, declared at `initialize`.
+///
+/// `auth.terminal` is honest: `cuma auth` reproduces the configured
+/// invocation on the user's real terminal — outside the sandbox, where the
+/// agent's own credential store lives.
+fn initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true)))
+}
+
 /// Run `authenticate` once for every agent-managed method the agent
 /// advertised.
 ///
@@ -637,6 +648,45 @@ async fn authenticate_with_advertised_methods(
     }
 }
 
+/// The agent's advertised sign-in methods, as the interface presents them.
+///
+/// An unofficial `_meta.terminal-auth` block names the exact login invocation
+/// and outranks the generic shape — it is the agent speaking most precisely
+/// about its own sign-in. Per the spec a `terminal` method means the
+/// configured agent invocation plus the method's `args`.
+fn auth_method_infos(methods: &[AuthMethod], command: &str) -> Vec<AuthMethodInfo> {
+    methods
+        .iter()
+        .map(|method| {
+            let info = |kind: AuthMethodKind, invocation: Option<String>| AuthMethodInfo {
+                id: method.id().0.to_string(),
+                kind,
+                description: method.description().map(str::to_owned),
+                invocation,
+            };
+            if let Some(invocation) = method.meta().and_then(terminal_auth_invocation) {
+                return info(AuthMethodKind::Terminal, Some(invocation));
+            }
+            match method {
+                // Per the spec a `terminal` method is run by the user in a
+                // terminal — the client must not send it to `authenticate`.
+                AuthMethod::Terminal(terminal) => {
+                    let program = command.split_whitespace().next().unwrap_or(command);
+                    let args = terminal.args.join(" ");
+                    let invocation = if args.is_empty() {
+                        program.to_owned()
+                    } else {
+                        format!("{program} {args}")
+                    };
+                    info(AuthMethodKind::Terminal, Some(invocation))
+                }
+                AuthMethod::Agent(_) => info(AuthMethodKind::Agent, None),
+                _ => info(AuthMethodKind::Other, None),
+            }
+        })
+        .collect()
+}
+
 /// The sign-in instruction an agent advertised, turned into user guidance.
 ///
 /// Per the spec a `terminal` method is run by the user in a terminal — the
@@ -644,19 +694,11 @@ async fn authenticate_with_advertised_methods(
 /// same idea in an unofficial `_meta.terminal-auth` block instead (copilot
 /// does), and agent-managed methods get their description quoted verbatim.
 fn auth_hint(methods: &[AuthMethod], command: &str) -> String {
-    for method in methods {
-        // An unofficial `terminal-auth` marker names the full invocation and
-        // is honoured before anything else — it is the agent speaking most
-        // precisely about its own login.
-        if let Some(invocation) = method.meta().and_then(terminal_auth_invocation) {
+    for info in auth_method_infos(methods, command) {
+        if info.kind == AuthMethodKind::Terminal
+            && let Some(invocation) = info.invocation
+        {
             return format!(": sign in by running `{invocation}` in a terminal");
-        }
-        // Per the spec a `terminal` method is run by the user in a
-        // terminal — the client must not send it to `session/authenticate`.
-        if let AuthMethod::Terminal(terminal) = method {
-            let program = command.split_whitespace().next().unwrap_or(command);
-            let args = terminal.args.join(" ");
-            return format!(": sign in by running `{program} {args}` in a terminal");
         }
     }
     methods
@@ -807,7 +849,7 @@ impl AgentAdapter for AcpAdapter {
             )
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 let init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(initialize_request())
                     .block_task()
                     .await?;
 
@@ -925,6 +967,14 @@ impl AgentAdapter for AcpAdapter {
         }
         Ok(())
     }
+
+    async fn authenticate(&self, method_id: &str) -> Result<()> {
+        AcpAdapter::authenticate(self, method_id).await
+    }
+
+    async fn refresh(&self) -> Result<AgentDescriptor> {
+        self.refresh_capabilities().await
+    }
 }
 
 impl AcpAdapter {
@@ -950,7 +1000,7 @@ impl AcpAdapter {
             .name("cuma")
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 let response = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(initialize_request())
                     .block_task()
                     .await?;
 
@@ -1019,6 +1069,16 @@ impl AcpAdapter {
             .metadata
             .insert("acp_command".to_owned(), self.command.clone());
 
+        // Persisted even when the session probe below fails — how the agent
+        // signs in is exactly what an unavailable agent's row must explain.
+        if let Ok(methods) =
+            serde_json::to_string(&auth_method_infos(&response.auth_methods, &self.command))
+        {
+            descriptor
+                .metadata
+                .insert("acp_auth_methods".to_owned(), methods);
+        }
+
         match session {
             Ok(raw) => {
                 for model in models_from_session_new(&raw, &self.id) {
@@ -1057,6 +1117,37 @@ impl AcpAdapter {
         }
 
         Ok(descriptor.clone())
+    }
+
+    /// Ask the agent to run an advertised agent-managed sign-in method.
+    ///
+    /// The connection is made without the sandbox on purpose: the method is
+    /// where credentials are created, and a sandbox that cannot see the
+    /// platform's credential store (the macOS Keychain, say) would write them
+    /// somewhere the agent cannot later read.
+    async fn authenticate(&self, method_id: &str) -> Result<()> {
+        let id = agent_client_protocol::v1::schema::AuthMethodId::new(method_id);
+        let agent = self.spawn_handle(&self.command)?;
+        let agent_id = self.id.clone();
+        agent_client_protocol::Client
+            .v1()
+            .name("cuma")
+            .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(initialize_request())
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(AuthenticateRequest::new(id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| MetaAgentError::Authentication {
+                target: agent_id.to_string(),
+                message: format!("authentication `{method_id}` failed: {err}"),
+            })
     }
 }
 

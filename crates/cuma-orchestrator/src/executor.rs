@@ -7,8 +7,8 @@ use cuma_core::ports::{
     AgentAdapter, ContextManager, ExecutionUpdate, MemoryStore, Planner, PlanningContext,
 };
 use cuma_core::{
-    AgentHandoff, AgentId, AttemptId, Event, EventBus, EventKind, ExecutionOutcome, ModelId,
-    SessionId, Task, TaskGraph, TaskId, TaskStatus, TokenUsage,
+    AgentDescriptor, AgentHandoff, AgentId, AttemptId, Event, EventBus, EventKind,
+    ExecutionOutcome, ModelId, SessionId, Task, TaskGraph, TaskId, TaskStatus, TokenUsage,
 };
 use cuma_registry::{AgentRegistry, ModelRegistry};
 use cuma_resilience::{CircuitBreakerRegistry, RetryDecision, RetryPolicy, classify_message};
@@ -158,6 +158,61 @@ impl Orchestrator {
         self.agents.register(descriptor).await;
         self.adapters.insert(adapter.agent_id().clone(), adapter);
         Ok(())
+    }
+
+    /// The adapter that reaches an agent, for operations outside a plan —
+    /// capability re-negotiation and the sign-in journey.
+    #[must_use]
+    pub fn adapter(&self, id: &AgentId) -> Option<Arc<dyn AgentAdapter>> {
+        self.adapters.get(id).cloned()
+    }
+
+    /// Re-interrogate an agent and update what the registry believes about it.
+    ///
+    /// Called after a sign-in and when the operator asks for a re-probe. A
+    /// successful negotiation marks the agent healthy — a previous failure is
+    /// the very thing the operator just fixed — while a failed one records
+    /// why, so the interface shows the reason rather than a stale state.
+    pub async fn reprobe_agent(&self, id: &AgentId) -> Result<AgentDescriptor> {
+        let Some(adapter) = self.adapters.get(id) else {
+            return Err(MetaAgentError::Configuration(format!(
+                "no agent named {id} is registered"
+            )));
+        };
+        match adapter.refresh().await {
+            Ok(descriptor) => {
+                self.models.register_agent_models(&descriptor).await;
+                self.agents.register(descriptor.clone()).await;
+                self.agents
+                    .set_health(id, cuma_core::HealthState::Healthy, None)
+                    .await;
+                Ok(descriptor)
+            }
+            Err(err) => {
+                self.agents
+                    .set_health(
+                        id,
+                        cuma_core::HealthState::Unavailable,
+                        Some(err.to_string()),
+                    )
+                    .await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Drive one sign-in method the agent manages itself.
+    ///
+    /// `method_id` is one of the agent's advertised `AuthMethodKind::Agent`
+    /// methods. Terminal methods never reach this call — the interface runs
+    /// them on the user's own terminal.
+    pub async fn authenticate_agent(&self, id: &AgentId, method_id: &str) -> Result<()> {
+        let Some(adapter) = self.adapters.get(id) else {
+            return Err(MetaAgentError::Configuration(format!(
+                "no agent named {id} is registered"
+            )));
+        };
+        adapter.authenticate(method_id).await
     }
 
     /// Give agents the instructions of enabled skills relevant to their task.

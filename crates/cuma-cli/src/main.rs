@@ -4,6 +4,7 @@
 //! other agents need the harness without a terminal UI. The TUI is one front
 //! end over the same core, not the product.
 
+mod auth;
 mod commands;
 mod doctor;
 mod harness;
@@ -89,6 +90,16 @@ enum Command {
     Agents {
         #[command(subcommand)]
         action: commands::AgentAction,
+    },
+
+    /// Sign an agent in, or show every agent's sign-in state.
+    Auth {
+        /// The agent to sign in; without one, prints the table.
+        agent: Option<String>,
+
+        /// Run only this advertised sign-in method.
+        #[arg(long, value_name = "ID")]
+        method: Option<String>,
     },
 
     /// Inspect models.
@@ -243,6 +254,7 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Explain { .. }) => "explain",
         Some(Command::Serve { .. }) => "serve",
         Some(Command::Agents { .. }) => "agents",
+        Some(Command::Auth { .. }) => "auth",
         Some(Command::Models { .. }) => "models",
         Some(Command::Skills { .. }) => "skills",
         Some(Command::Mcp { .. }) => "mcp",
@@ -284,6 +296,9 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Some(Command::Agents { action }) => {
                 commands::agents(config, workspace, action, cli.json).await
+            }
+            Some(Command::Auth { agent, method }) => {
+                auth::run(config, workspace, agent, method, cli.json).await
             }
             Some(Command::Models { action }) => commands::models(config, action, cli.json).await,
             Some(Command::Skills { action }) => {

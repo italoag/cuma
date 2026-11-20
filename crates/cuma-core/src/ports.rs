@@ -101,9 +101,32 @@ pub trait AgentAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Re-run capability negotiation and return the updated descriptor.
+    ///
+    /// The default answers from what the adapter already holds; adapters that
+    /// can interrogate their agent override it. Called after a sign-in and
+    /// when the operator asks an agent to be re-probed.
+    async fn refresh(&self) -> Result<AgentDescriptor> {
+        self.describe().await
+    }
+
     /// Release resources (terminate a child process, close a session).
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Ask the agent to run one of its advertised authentication methods.
+    ///
+    /// `method_id` is the id of a [`crate::agent::AuthMethodKind::Agent`]
+    /// method; terminal methods are run by the user and never reach this
+    /// call. The default reports the flow as unsupported rather than
+    /// pretending it ran.
+    async fn authenticate(&self, method_id: &str) -> Result<()> {
+        let _ = method_id;
+        Err(crate::error::MetaAgentError::Authentication {
+            target: self.agent_id().to_string(),
+            message: "this adapter does not support driven authentication".to_owned(),
+        })
     }
 }
 

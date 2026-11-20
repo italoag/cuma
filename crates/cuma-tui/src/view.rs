@@ -8,8 +8,8 @@
 //! are the tested core; the ratatui widgets below are a thin dressing over
 //! them, so a layout change cannot silently change what is displayed.
 
-use crate::state::{AppState, InputMode, Screen};
-use cuma_core::TaskStatus;
+use crate::state::{AppState, InputMode, ModelRow, Screen};
+use cuma_core::{AuthMethodKind, TaskStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -132,6 +132,14 @@ pub fn execution_lines(state: &AppState) -> Vec<String> {
 fn help_bindings(state: &AppState) -> &'static [(&'static str, &'static str)] {
     match state.input_mode {
         InputMode::Editing => &[("Enter", "submit"), ("Esc", "cancel")],
+        InputMode::Navigating if state.screen == Screen::Models => &[
+            ("Tab/Shift-Tab", "screens"),
+            ("i", "new goal"),
+            ("↑↓", "select"),
+            ("a", "sign in"),
+            ("r", "re-probe"),
+            ("q", "quit"),
+        ],
         InputMode::Navigating => &[
             ("Tab/Shift-Tab", "screens"),
             ("1-9", "jump"),
@@ -417,53 +425,157 @@ fn draw_agents(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(&table, area);
 }
 
-fn draw_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let render_price = |price: cuma_core::Known<f64>| {
-        price
-            .value()
-            .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
+/// A price as the table shows it: never a number we do not actually know.
+fn render_price(price: cuma_core::Known<f64>) -> String {
+    price
+        .value()
+        .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
+}
+
+/// Lines for the Models screen's navigable list.
+///
+/// Agent sections and their models are one flat list the cursor walks; pure,
+/// so it can be tested without a terminal.
+pub fn model_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
+    if state.agents.is_empty() {
+        return vec![
+            Line::from("No agents are registered."),
+            Line::from(""),
+            Line::from(theme.muted("Configure one under [agents.*] in .cuma/config.toml.")),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    for (index, row) in state.model_rows().iter().enumerate() {
+        let selected = index == state.model_cursor;
+        let cursor = if selected {
+            theme.selected
+        } else {
+            Style::default()
+        };
+        match *row {
+            ModelRow::Agent(agent_index) => {
+                let agent = &state.agents[agent_index];
+                let (marker, health_style) = if agent.is_routable() {
+                    ("●", theme.success)
+                } else {
+                    ("✗", theme.error)
+                };
+                let health = state
+                    .agent_health
+                    .get(&agent.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", agent.health.state));
+                let auth = if agent.auth_methods().is_empty() {
+                    String::new()
+                } else {
+                    "sign-in advertised".to_owned()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} {:<18}", agent.id), cursor),
+                    Span::styled(format!("{health:<13}"), health_style),
+                    Span::raw(format!("{:>3} models  ", agent.models.len())),
+                    theme.muted(auth),
+                ]));
+            }
+            ModelRow::Model(agent_index, model_index) => {
+                let model = &state.agents[agent_index].models[model_index];
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {:<26}", model.id), cursor),
+                    theme.muted(format!(
+                        "{:>6}  {:>6}  {}",
+                        model
+                            .context_window
+                            .value()
+                            .map_or_else(|| "-".to_owned(), |w| format!("{}K", w / 1000)),
+                        render_price(model.cost.input_per_mtok),
+                        render_price(model.cost.output_per_mtok),
+                    )),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// Lines for the selected agent's detail pane: what failed, and how to sign
+/// it back in. Pure, so it can be tested without a terminal.
+pub fn model_detail_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
+    let Some(agent) = state.selected_model_agent() else {
+        return Vec::new();
     };
 
-    let rows: Vec<Row<'_>> = state
-        .agents
-        .iter()
-        .flat_map(|agent| agent.models.iter())
-        .map(|model| {
-            Row::new(vec![
-                Span::raw(model.id.to_string()),
-                Span::raw(model.agent_id.to_string()),
-                Span::raw(
-                    model
-                        .context_window
-                        .value()
-                        .map_or_else(|| "-".to_owned(), |w| format!("{}K", w / 1000)),
-                ),
-                Span::raw(render_price(model.cost.input_per_mtok)),
-                Span::raw(render_price(model.cost.output_per_mtok)),
-            ])
-        })
-        .collect();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {} ", agent.id), theme.title),
+            theme.muted(format!("({:?})", agent.protocol)),
+        ]),
+        Line::from(format!(
+            " health: {:?}   capabilities: {}",
+            agent.health.state,
+            agent.capabilities.len()
+        )),
+    ];
 
-    let table = ThemedTable::new(
-        rows,
-        [
-            Constraint::Length(24),
-            Constraint::Length(18),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Min(14),
-        ],
-    )
-    .header(Row::new(vec![
-        "Model",
-        "Agent",
-        "Context",
-        "In $/Mtok",
-        "Out $/Mtok",
-    ]))
-    .title(" Models ");
+    if let Some(error) = &agent.health.last_error {
+        lines.push(Line::from(theme.error(format!(" error: {error}"))));
+    }
 
-    frame.render_widget(&table, area);
+    let methods = agent.auth_methods();
+    if methods.is_empty() {
+        if !agent.is_routable() {
+            lines.push(Line::from(theme.muted(
+                " the agent advertises no sign-in method — its credentials come \
+                 from its own environment or config (agents.<id>.env)",
+            )));
+        }
+    } else {
+        lines.push(Line::from(theme.accent(" sign-in:")));
+        for method in &methods {
+            let kind = match method.kind {
+                AuthMethodKind::Terminal => "terminal",
+                AuthMethodKind::Agent => "agent",
+                AuthMethodKind::Other => "method",
+            };
+            let detail = method
+                .invocation
+                .as_deref()
+                .or(method.description.as_deref())
+                .unwrap_or("");
+            lines.push(Line::from(format!(
+                "   {kind:<9} {:<22} {detail}",
+                method.id
+            )));
+        }
+    }
+
+    lines.push(Line::from(theme.muted(
+        " a sign in · r re-probe — sign-in runs on your terminal, outside the sandbox",
+    )));
+    lines
+}
+
+fn draw_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(10)])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(model_lines(state))
+            .block(theme().titled_block(" Models "))
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll, 0)),
+        panes[0],
+    );
+    frame.render_widget(
+        Paragraph::new(model_detail_lines(state))
+            .block(theme().titled_block(" Agent "))
+            .wrap(Wrap { trim: false }),
+        panes[1],
+    );
 }
 
 fn draw_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -754,6 +866,54 @@ mod tests {
         assert!(rendered.contains("1 result for \"auth\""));
         assert!(rendered.contains("notes/auth.md"));
         assert!(rendered.contains("tokens live in src/auth.rs"));
+    }
+
+    #[test]
+    fn the_models_screen_shows_the_agents_error_and_its_sign_in_methods() {
+        use cuma_core::HealthState;
+
+        let mut agent =
+            cuma_core::AgentDescriptor::new("copilot", "copilot", cuma_core::AgentProtocol::Acp);
+        agent.health.state = HealthState::Unavailable;
+        agent.health.last_error = Some(
+            "agent copilot requires authentication: sign in by running `copilot login`".to_owned(),
+        );
+        agent.metadata.insert(
+            "acp_auth_methods".to_owned(),
+            r#"[{"id":"copilot-login","kind":"terminal","description":"GitHub Copilot sign-in","invocation":"copilot login"}]"#.to_owned(),
+        );
+
+        let mut state = AppState::new();
+        state.set_agents(vec![agent]);
+
+        let list = text(&model_lines(&state));
+        assert!(list.contains("copilot"));
+        assert!(list.contains("Unavailable"));
+        assert!(list.contains("sign-in advertised"));
+
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("requires authentication"));
+        assert!(detail.contains("copilot-login"));
+        assert!(detail.contains("terminal"));
+        assert!(detail.contains("copilot login"));
+    }
+
+    #[test]
+    fn the_models_detail_names_the_environment_path_when_no_method_is_advertised() {
+        use cuma_core::HealthState;
+
+        let mut agent =
+            cuma_core::AgentDescriptor::new("kiro", "kiro", cuma_core::AgentProtocol::Acp);
+        agent.health.state = HealthState::Unavailable;
+        agent.health.last_error = Some("negotiation failed".to_owned());
+
+        let mut state = AppState::new();
+        state.set_agents(vec![agent]);
+
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("negotiation failed"));
+        assert!(detail.contains("no sign-in method"));
+        assert!(detail.contains("agents.<id>.env"));
     }
 
     use crate::state::TaskRow;

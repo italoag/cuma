@@ -35,8 +35,8 @@ pub mod ports;
 pub mod task;
 
 pub use agent::{
-    AgentAuth, AgentDescriptor, AgentHealth, AgentLimits, AgentProtocol, CostProfile, HealthState,
-    Known, ModelDescriptor, PerformanceProfile,
+    AgentAuth, AgentDescriptor, AgentHealth, AgentLimits, AgentProtocol, AuthMethodInfo,
+    AuthMethodKind, CostProfile, HealthState, Known, ModelDescriptor, PerformanceProfile,
 };
 pub use capability::{Capability, CapabilityMatch, CapabilitySet};
 pub use error::{ErrorClass, MetaAgentError, Result};

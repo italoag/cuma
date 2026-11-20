@@ -131,6 +131,19 @@ pub struct MemoryRow {
     pub content: String,
 }
 
+/// One selectable line on the Models screen.
+///
+/// Every agent owns a header row — even one that advertises no models, since
+/// that is exactly the row whose error the user came to read — and each of
+/// its models is a row beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRow {
+    /// An agent's own row, by index into `AppState::agents`.
+    Agent(usize),
+    /// A model row: agent index, then model index within that agent.
+    Model(usize, usize),
+}
+
 /// What keystrokes currently mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -194,6 +207,8 @@ pub struct AppState {
     pub skills: Option<Vec<SkillRow>>,
     /// The selected skill on the Skills screen.
     pub skill_cursor: usize,
+    /// The selected row on the Models screen.
+    pub model_cursor: usize,
     /// Whether a memory backend is attached.
     pub memory_attached: bool,
     /// The last memory query.
@@ -526,6 +541,40 @@ impl AppState {
     /// Replace the cached agent list.
     pub fn set_agents(&mut self, agents: Vec<cuma_core::AgentDescriptor>) {
         self.agents = agents;
+        let last = self.model_rows().len().saturating_sub(1);
+        self.model_cursor = self.model_cursor.min(last);
+    }
+
+    /// The Models screen's selectable lines, agent section by agent section.
+    pub fn model_rows(&self) -> Vec<ModelRow> {
+        let mut rows = Vec::new();
+        for (agent_index, agent) in self.agents.iter().enumerate() {
+            rows.push(ModelRow::Agent(agent_index));
+            rows.extend(
+                (0..agent.models.len())
+                    .map(|model_index| ModelRow::Model(agent_index, model_index)),
+            );
+        }
+        rows
+    }
+
+    /// Move the Models cursor by `delta`, clamped to the rows that exist.
+    pub fn move_model_cursor(&mut self, delta: isize) {
+        let len = self.model_rows().len();
+        if len == 0 {
+            self.model_cursor = 0;
+            return;
+        }
+        let next = self.model_cursor.saturating_add_signed(delta);
+        self.model_cursor = next.min(len - 1);
+    }
+
+    /// The agent the Models cursor points at — the row's own agent, or the
+    /// agent that owns the selected model.
+    pub fn selected_model_agent(&self) -> Option<&cuma_core::AgentDescriptor> {
+        match self.model_rows().get(self.model_cursor)? {
+            ModelRow::Agent(agent) | ModelRow::Model(agent, _) => self.agents.get(*agent),
+        }
     }
 }
 
@@ -623,6 +672,77 @@ mod tests {
         assert_eq!(state.tasks[0].status, TaskStatus::Completed);
         assert_eq!(state.tasks[0].marker(), "✓");
         assert_eq!(state.completed_count(), 1);
+    }
+
+    fn agent_with_models(id: &str, models: usize) -> cuma_core::AgentDescriptor {
+        let mut agent = cuma_core::AgentDescriptor::new(id, id, cuma_core::AgentProtocol::Acp);
+        for index in 0..models {
+            agent.models.push(cuma_core::ModelDescriptor::minimal(
+                agent.id.clone(),
+                format!("{id}-m{index}"),
+                format!("{id} model {index}"),
+            ));
+        }
+        agent
+    }
+
+    #[test]
+    fn model_rows_walk_agents_then_their_models() {
+        let mut state = AppState::new();
+        state.set_agents(vec![
+            agent_with_models("solo", 0),
+            agent_with_models("paired", 2),
+        ]);
+
+        assert_eq!(
+            state.model_rows(),
+            vec![
+                ModelRow::Agent(0),
+                ModelRow::Agent(1),
+                ModelRow::Model(1, 0),
+                ModelRow::Model(1, 1),
+            ],
+            "an agent with no models still owns a row — it is where its error lives"
+        );
+    }
+
+    #[test]
+    fn the_model_cursor_selects_the_owning_agent() {
+        let mut state = AppState::new();
+        state.set_agents(vec![
+            agent_with_models("first", 1),
+            agent_with_models("second", 1),
+        ]);
+
+        state.move_model_cursor(3);
+        assert_eq!(
+            state.selected_model_agent().map(|a| a.id.as_str()),
+            Some("second")
+        );
+
+        state.move_model_cursor(10);
+        assert_eq!(
+            state.selected_model_agent().map(|a| a.id.as_str()),
+            Some("second"),
+            "the cursor clamps to the last row"
+        );
+
+        state.move_model_cursor(-10);
+        assert_eq!(
+            state.selected_model_agent().map(|a| a.id.as_str()),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn a_shrinking_agent_list_clamps_the_model_cursor() {
+        let mut state = AppState::new();
+        state.set_agents(vec![agent_with_models("only", 5)]);
+        state.move_model_cursor(5);
+        assert_eq!(state.model_cursor, 5);
+
+        state.set_agents(vec![agent_with_models("only", 0)]);
+        assert_eq!(state.model_cursor, 0);
     }
 
     #[test]
