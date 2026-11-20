@@ -147,10 +147,18 @@ impl AiMemoryCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // The backend prefixes its real error with startup noise — the
+            // last non-empty line is what actually failed; the whole banner
+            // would drown a warn line it appears in.
+            let detail = stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim();
             return Err(MetaAgentError::Memory(format!(
                 "the memory backend exited with {}: {}",
-                output.status,
-                stderr.trim()
+                output.status, detail
             )));
         }
 
@@ -392,9 +400,18 @@ impl MemoryStore for AiMemoryCli {
         let limit = limit.to_string();
         let output = self
             .run(&["search", query, "--limit", &limit, "--json"])
-            .await?;
+            .await;
 
-        Ok(Self::parse_recall(&output))
+        match output {
+            Ok(output) => Ok(Self::parse_recall(&output)),
+            // An unregistered project is an empty store, not a failure:
+            // nothing was ever written for it, so nothing can be recalled.
+            Err(err) if err.to_string().contains("not found") => {
+                tracing::debug!(error = %err, "memory recall skipped; the project is not registered");
+                Ok(Vec::new())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn remember(&self, content: &str, kind: &str) -> Result<String> {
@@ -463,6 +480,25 @@ mod tests {
         let memory = AiMemoryCli::new("definitely-not-a-real-binary-7f2a");
         let id = memory.remember("something", "note").await.unwrap();
         assert!(id.starts_with("not-stored:"));
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_reports_the_line_that_failed_not_its_banner() {
+        let memory =
+            AiMemoryCli::new("sh -c 'echo startup-banner >&2; echo real-error-line >&2; exit 1'");
+
+        let err = memory.remember("x", "note").await.unwrap_err().to_string();
+        assert!(err.contains("real-error-line"), "{err}");
+        assert!(!err.contains("startup-banner"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_project_is_an_empty_recall_not_an_error() {
+        let memory = AiMemoryCli::new(
+            "sh -c 'echo startup >&2; echo \"project foo not found in workspace default\" >&2; exit 1'",
+        );
+
+        assert!(memory.recall("anything", 5).await.unwrap().is_empty());
     }
 
     #[tokio::test]

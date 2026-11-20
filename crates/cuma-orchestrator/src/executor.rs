@@ -270,6 +270,17 @@ impl Orchestrator {
                 task_count: graph.len(),
             },
         ));
+        // One event per task, so interfaces can list the plan rather than
+        // only its size — `TaskPlanned` alone cannot name what was planned.
+        for task in graph.iter() {
+            self.events.publish(Event::task(
+                session_id.clone(),
+                task.id.clone(),
+                EventKind::TaskCreated {
+                    description: task.spec.description.clone(),
+                },
+            ));
+        }
 
         let graph = self.execute_graph(&session_id, graph).await?;
 
