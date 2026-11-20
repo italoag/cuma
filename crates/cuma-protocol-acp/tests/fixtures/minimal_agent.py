@@ -33,7 +33,40 @@ for line in sys.stdin:
             "agentInfo": {"name": "minimal", "version": "0.0.1"},
         }
     elif method == "session/new":
-        result = {"sessionId": "session-1"}
+        result = {
+            "sessionId": "session-1",
+            # The newer shape: a select whose category is `model`.
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "fixture-fast",
+                    "options": [
+                        {"value": "fixture-fast", "name": "Fixture Fast"},
+                        {"value": "fixture-smart", "name": "Fixture Smart"},
+                    ],
+                },
+                {
+                    "id": "mode",
+                    "name": "Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "normal",
+                    "options": [{"value": "normal", "name": "Normal"}],
+                },
+            ],
+            # The legacy shape older agents still send; one id overlaps the
+            # select on purpose so discovery must dedupe.
+            "models": {
+                "currentModelId": "fixture-fast",
+                "availableModels": [
+                    {"modelId": "legacy-only", "name": "Legacy Only"},
+                    {"modelId": "fixture-fast", "name": "Fixture Fast"},
+                ],
+            },
+        }
     elif method == "session/prompt":
         send({
             "jsonrpc": "2.0",

@@ -19,9 +19,9 @@ mod model;
 pub mod sandbox;
 
 pub use model::{
-    AgentConfig, Config, LimitsConfig, McpServerSettings, MemoryConfig, RouterConfig,
-    RouterWeights, RoutingStrategy, RtkConfig, RtkMode, SecurityConfig, SkillAutoInstall,
-    SkillsConfig, TaskIsolation, TelemetryConfig,
+    AgentConfig, AgentPermissionPolicy, Config, LimitsConfig, McpServerSettings, MemoryConfig,
+    RouterConfig, RouterWeights, RoutingStrategy, RtkConfig, RtkMode, SecurityConfig,
+    SkillAutoInstall, SkillsConfig, TaskIsolation, TelemetryConfig,
 };
 pub use sandbox::SandboxSettings;
 

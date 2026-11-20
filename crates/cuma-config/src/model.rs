@@ -335,6 +335,9 @@ pub struct AgentConfig {
     pub state: Vec<String>,
     /// Variables the agent needs, by name, forwarded into its sandbox.
     pub env: Vec<String>,
+    /// How this agent's permission requests are answered, overriding
+    /// `security.agent_permission_policy`.
+    pub permission_policy: Option<AgentPermissionPolicy>,
 }
 
 impl Default for AgentConfig {
@@ -351,6 +354,7 @@ impl Default for AgentConfig {
             sandbox: None,
             state: Vec::new(),
             env: Vec::new(),
+            permission_policy: None,
         }
     }
 }
@@ -588,6 +592,28 @@ pub struct SecurityConfig {
     /// one is accepted, so a token can be rotated. Empty: no authentication,
     /// which is only allowed on a loopback address.
     pub a2a_server_token_refs: Vec<String>,
+    /// How agent permission requests are answered when nobody is watching.
+    /// An unattended run cannot prompt a human, so policy decides from the
+    /// task's risk instead. `agents.<id>.permission_policy` overrides it per
+    /// agent.
+    pub agent_permission_policy: AgentPermissionPolicy,
+}
+
+/// How an agent's permission requests are answered.
+///
+/// The default approves only read-only and low-risk work: `always-allow` is
+/// only appropriate for agents running inside a sandbox, which is why it is
+/// not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPermissionPolicy {
+    /// Approve everything the agent asks.
+    AlwaysAllow,
+    /// Approve read-only and low-risk work; refuse the rest.
+    #[default]
+    AllowLowRisk,
+    /// Refuse everything the agent asks.
+    AlwaysDeny,
 }
 
 impl Default for SecurityConfig {
@@ -607,6 +633,7 @@ impl Default for SecurityConfig {
             agent_sandbox: crate::sandbox::AUTO.to_owned(),
             trusted_workspaces: Vec::new(),
             a2a_server_token_refs: Vec::new(),
+            agent_permission_policy: AgentPermissionPolicy::AllowLowRisk,
         }
     }
 }

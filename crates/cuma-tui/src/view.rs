@@ -12,13 +12,14 @@ use crate::state::{AppState, InputMode, Screen};
 use cuma_core::TaskStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Tabs, Wrap};
 use ratatui_bubbletea_components::{
     Progress, SpinnerFrames, TextInput, TextInputState, ThemedTable,
 };
 use ratatui_bubbletea_theme::Theme;
+use tui_markdown::{Options, StyleSheet};
 
 /// The interface's single source of colours, borders and symbols.
 ///
@@ -33,6 +34,45 @@ fn theme() -> Theme {
 fn spinner_frame(state: &AppState) -> &'static str {
     let frames = SpinnerFrames::DOTS.frames();
     frames[state.spinner.frame_index() % frames.len()]
+}
+
+/// Maps markdown constructs onto the Charm palette so the agent's output in
+/// the chat picks up the same colours as the rest of the interface instead of
+/// the renderer's default cyan look.
+#[derive(Clone, Copy)]
+struct ChatStyleSheet(Theme);
+
+impl StyleSheet for ChatStyleSheet {
+    fn heading(&self, level: u8) -> Style {
+        let base = if level == 1 {
+            self.0.title
+        } else {
+            self.0.accent
+        };
+        base.add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::new()
+            .fg(self.0.palette.accent)
+            .bg(self.0.palette.selected_background)
+    }
+
+    fn link(&self) -> Style {
+        self.0.accent.add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        self.0.muted.add_modifier(Modifier::ITALIC)
+    }
+
+    fn heading_meta(&self) -> Style {
+        self.0.muted
+    }
+
+    fn metadata_block(&self) -> Style {
+        self.0.muted
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,15 +263,17 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut lines: Vec<Line<'_>> = Vec::new();
     if !state.goal.is_empty() {
         lines.push(theme.title("You"));
-        lines.push(Line::from(format!("> {}", state.goal)));
+        lines.push(Line::from(vec![
+            theme.accent("> "),
+            theme.span(state.goal.clone()),
+        ]));
         lines.push(Line::from(""));
     }
 
     if !state.transcript.is_empty() {
         lines.push(theme.title("Agent"));
-        for line in state.transcript.lines() {
-            lines.push(Line::from(line.to_owned()));
-        }
+        let options = Options::new(ChatStyleSheet(theme));
+        lines.extend(tui_markdown::from_str_with_options(&state.transcript, &options).lines);
     }
 
     if lines.is_empty() {
@@ -857,6 +899,35 @@ mod tests {
         let rendered = render(&state);
         assert!(rendered.contains("implement OAuth"));
         assert!(rendered.contains("inspect repository"));
+    }
+
+    #[test]
+    fn the_agent_transcript_renders_markdown_with_theme_styles() {
+        let mut state = AppState::new();
+        state.transcript = "## Result\n\nplain **bold** and `code`".into();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let bold_cells = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::BOLD))
+            .count();
+        assert!(bold_cells > 0, "markdown bold reached the buffer unstyled");
+
+        let accent = theme().palette.accent;
+        let code_cells = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == accent)
+            .count();
+        assert!(
+            code_cells > 0,
+            "markdown code spans did not pick up the theme accent"
+        );
     }
 
     #[test]

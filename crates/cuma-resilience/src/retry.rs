@@ -170,11 +170,12 @@ impl RetryPolicy {
 
         // Terminal classes: no amount of retrying or rerouting helps, and
         // pretending otherwise burns tokens and hides the real problem.
+        // `AuthenticationFailure` is absent here on purpose: credentials are
+        // agent-scoped, so while retrying this agent is pointless, another
+        // agent may hold working ones — the reroute branch below decides.
         if matches!(
             class,
-            ErrorClass::AuthenticationFailure
-                | ErrorClass::SecurityViolation
-                | ErrorClass::Configuration
+            ErrorClass::SecurityViolation | ErrorClass::Configuration
         ) {
             return RetryDecision::GiveUp {
                 reason: format!("{class:?} is not recoverable by retrying"),
@@ -321,9 +322,19 @@ mod tests {
     }
 
     #[test]
-    fn auth_failures_give_up_at_once() {
+    fn auth_failures_reroute_when_another_agent_exists() {
         let policy = RetryPolicy::default();
         let decision = policy.decide(ErrorClass::AuthenticationFailure, 1, 1, true, &mut rng());
+        assert!(
+            matches!(decision, RetryDecision::Reroute { .. }),
+            "credentials are agent-scoped: the next agent may be fine"
+        );
+    }
+
+    #[test]
+    fn auth_failures_give_up_when_there_is_nowhere_else_to_go() {
+        let policy = RetryPolicy::default();
+        let decision = policy.decide(ErrorClass::AuthenticationFailure, 1, 1, false, &mut rng());
         assert!(matches!(decision, RetryDecision::GiveUp { .. }));
         assert!(!decision.continues());
     }

@@ -13,6 +13,7 @@ cuma-core.workspace = true
 cuma-orchestrator.workspace = true
 cuma-usage.workspace = true
 ratatui.workspace = true
+tui-markdown.workspace = true
 ratatui-bubbletea-theme.workspace = true
 ratatui-bubbletea-components.workspace = true
 crossterm.workspace = true

@@ -856,7 +856,8 @@ pub async fn build_orchestrator(
     probe_plugins(&config, &sandboxes, &mut warnings).await;
     let mut acp = AcpConfigDiscovery::new(config.clone())
         .with_mcp_servers(shared)
-        .with_kept_env(shared_mcp_secret_names(&config));
+        .with_kept_env(shared_mcp_secret_names(&config))
+        .with_permission_policy(config.security.agent_permission_policy.into());
     let mut reported = BTreeSet::new();
     for (id, agent) in local_agents(&config) {
         let Some(provider) = sandboxes.for_agent(id) else {

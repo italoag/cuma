@@ -55,6 +55,7 @@ models = []                        # assumed when the agent enumerates none
 sandbox = "vm"                     # overrides security.agent_sandbox for this agent
 state = ["~/.codex"]               # directories it keeps its login in; writable in its sandbox
 env = ["OPENAI_API_KEY"]           # variables it needs, by name — never values
+permission_policy = "always-allow" # overrides security.agent_permission_policy for this agent
 
 [agents.architect]
 protocol = "a2a"
@@ -107,6 +108,10 @@ agent_sandbox = "auto"             # auto | ai-jail | bubblewrap | sandbox-exec 
                                    # | the name of a [sandboxes.<name>] section
 trusted_workspaces = []            # ACP session dirs whose own .cuma/config.toml applies; ~ expanded
 a2a_server_token_refs = []         # env vars holding bearer tokens A2A callers must present
+agent_permission_policy = "allow-low-risk"
+                                   # allow-low-risk | always-allow | always-deny —
+                                   # how agent permission requests are answered unattended;
+                                   # always-allow is only appropriate inside a sandbox
 
 [limits]
 max_parallel_tasks = 4

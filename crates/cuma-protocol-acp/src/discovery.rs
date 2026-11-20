@@ -29,6 +29,9 @@ pub struct AcpConfigDiscovery {
     /// Launchers for particular agents, in place of `launcher`.
     agent_launchers: std::collections::BTreeMap<String, Arc<dyn crate::AgentLauncher>>,
     kept_env: Vec<String>,
+    /// How discovered agents answer permission requests, unless the agent's
+    /// own config overrides it.
+    permission_policy: crate::PermissionPolicy,
 }
 
 impl AcpConfigDiscovery {
@@ -41,7 +44,17 @@ impl AcpConfigDiscovery {
             launcher: None,
             agent_launchers: std::collections::BTreeMap::new(),
             kept_env: Vec::new(),
+            permission_policy: crate::PermissionPolicy::AllowLowRisk,
         }
+    }
+
+    /// How the discovered agents answer permission requests.
+    ///
+    /// `agents.<id>.permission_policy` still wins for the agent that sets it.
+    #[must_use]
+    pub fn with_permission_policy(mut self, policy: crate::PermissionPolicy) -> Self {
+        self.permission_policy = policy;
+        self
     }
 
     /// Start every discovered agent through `launcher`.
@@ -105,10 +118,16 @@ impl AcpConfigDiscovery {
             let mut descriptor = AgentDescriptor::new(id.as_str(), id.as_str(), AgentProtocol::Acp);
             agent_config.apply_to(&mut descriptor);
 
+            // The agent's own setting wins over the discovery-wide one.
+            let policy = agent_config
+                .permission_policy
+                .map(crate::PermissionPolicy::from)
+                .unwrap_or(self.permission_policy);
             let adapter = AcpAdapter::new(id.as_str(), command)
                 .with_descriptor(descriptor)
                 .with_mcp_servers(self.mcp_servers.clone())
-                .with_kept_env(self.kept_env.clone());
+                .with_kept_env(self.kept_env.clone())
+                .with_permission_policy(policy);
             let adapter = match self.agent_launchers.get(id).or(self.launcher.as_ref()) {
                 Some(launcher) => adapter.with_launcher(Arc::clone(launcher)),
                 None => adapter,
@@ -295,7 +314,28 @@ mod tests {
             descriptor.capabilities.contains(&Capability::Documentation),
             "configured, and beyond what ACP can say"
         );
-        assert_eq!(descriptor.models.len(), 1, "ACP enumerates no models");
+        // One configured model plus every model `session/new` advertised in
+        // either shape — `fixture-fast` arrives twice and is counted once.
+        let discovered: Vec<&str> = descriptor.models.iter().map(|m| m.id.as_str()).collect();
+        for expected in [
+            "house-model",
+            "fixture-fast",
+            "fixture-smart",
+            "legacy-only",
+        ] {
+            assert!(
+                discovered.contains(&expected),
+                "expected {expected} in {discovered:?}"
+            );
+        }
+        assert_eq!(descriptor.models.len(), 4, "duplicates collapse by id");
+        assert_eq!(
+            descriptor
+                .metadata
+                .get("acp_current_model")
+                .map(String::as_str),
+            Some("fixture-fast"),
+        );
     }
 
     #[tokio::test]

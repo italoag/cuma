@@ -158,6 +158,12 @@ not a crate.
   boundary the design keeps: the TUI is a subscriber of the orchestrator's
   event bus, not an Elm model owning the runtime. The components are
   documented to work with a plain ratatui event loop.
+- **`tui-markdown` 0.3.7 — adopted, pinned.** Renders the agent's markdown
+  output in the chat conversation into themed `Text` via a `StyleSheet`
+  over the Charm palette. `default-features = false` keeps the syntect
+  highlighting tree out; fenced blocks still render styled. Pinned with `=`
+  because 0.3.8+ moves to itertools 0.15, which the registry proxy blocks.
+  MSRV 1.88; renders `ratatui-core` `Text`, compatible with ratatui 0.30.
 
 ## Skills: integrity
 
