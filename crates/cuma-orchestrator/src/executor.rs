@@ -215,6 +215,35 @@ impl Orchestrator {
         adapter.authenticate(method_id).await
     }
 
+    /// The argv that runs a terminal sign-in method — `sh -c <invocation>`,
+    /// wrapped in the agent's sandbox when `agents.<id>.auth_in_sandbox` asks.
+    ///
+    /// Inside the sandbox the credential lands where the confined agent reads
+    /// it: an agent that falls back to a file under `state` when the OS
+    /// keychain is out of reach (Copilot CLI stores plaintext in
+    /// `~/.copilot/config.json`) authenticates for every later launch. When
+    /// the flag is unset or the adapter has no sandbox, the invocation runs
+    /// on the host as it stands.
+    pub fn sign_in_command(&self, id: &AgentId, invocation: &str) -> Vec<String> {
+        let shell = vec!["sh".to_owned(), "-c".to_owned(), invocation.to_owned()];
+        let in_sandbox = self
+            .config
+            .agents
+            .get(id.as_str())
+            .is_some_and(|agent| agent.auth_in_sandbox);
+        if !in_sandbox {
+            return shell;
+        }
+        match self
+            .adapters
+            .get(id)
+            .and_then(|adapter| adapter.sandbox_prefix(&self.workspace))
+        {
+            Some(prefix) => prefix.into_iter().chain(shell).collect(),
+            None => shell,
+        }
+    }
+
     /// Give agents the instructions of enabled skills relevant to their task.
     #[must_use]
     pub fn with_skill_guidance(mut self, skills: Arc<dyn cuma_core::ports::SkillGuidance>) -> Self {

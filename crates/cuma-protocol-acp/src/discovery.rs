@@ -127,7 +127,8 @@ impl AcpConfigDiscovery {
                 .with_descriptor(descriptor)
                 .with_mcp_servers(self.mcp_servers.clone())
                 .with_kept_env(self.kept_env.clone())
-                .with_permission_policy(policy);
+                .with_permission_policy(policy)
+                .with_auth_in_sandbox(agent_config.auth_in_sandbox);
             let adapter = match self.agent_launchers.get(id).or(self.launcher.as_ref()) {
                 Some(launcher) => adapter.with_launcher(Arc::clone(launcher)),
                 None => adapter,

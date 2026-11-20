@@ -11,7 +11,9 @@
 //! the spec forbids driving it through `authenticate` — while an `agent`
 //! method is a request the adapter sends over a connection deliberately made
 //! *outside* the sandbox, because that is where the agent's credential store
-//! (the macOS Keychain, say) lives.
+//! (the macOS Keychain, say) lives. A terminal method runs on the host too,
+//! unless `agents.<id>.auth_in_sandbox` asks for the sandboxed form — the
+//! credential then lands where the confined agent reads it back.
 
 use cuma_core::error::{MetaAgentError, Result};
 use cuma_core::{AgentId, AuthMethodInfo, AuthMethodKind};
@@ -108,7 +110,10 @@ async fn sign_in(orchestrator: &Orchestrator, id: &AgentId, only: Option<&str>) 
     for method in &selected {
         let outcome = match method.kind {
             AuthMethodKind::Terminal => match method.invocation.as_deref() {
-                Some(invocation) => run_on_terminal(invocation).await,
+                Some(invocation) => {
+                    let argv = orchestrator.sign_in_command(id, invocation);
+                    run_on_terminal(&argv).await
+                }
                 None => Err("the method names no invocation".to_owned()),
             },
             AuthMethodKind::Agent => orchestrator
@@ -153,25 +158,26 @@ async fn reprobe(orchestrator: &Orchestrator, id: &AgentId) -> Result<String> {
 
 /// Run the login invocation on the user's terminal, stdio inherited.
 ///
-/// The command is the one the agent itself named at negotiation, launched
-/// through `sh -c` — never parsed by us — and never inside the sandbox: a
-/// credential written inside a jail is a credential the agent cannot read
-/// back out.
-async fn run_on_terminal(invocation: &str) -> std::result::Result<(), String> {
-    eprintln!("$ {invocation}");
-    let status = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(invocation)
+/// `argv` is the agent's own sign-in command under `sh -c` — never parsed by
+/// us — wrapped in the agent's sandbox prefix when `auth_in_sandbox` asks,
+/// so the credential lands where the confined agent reads it back.
+async fn run_on_terminal(argv: &[String]) -> std::result::Result<(), String> {
+    eprintln!("$ {}", argv.join(" "));
+    let Some((program, args)) = argv.split_first() else {
+        return Err("the sign-in command is empty".to_owned());
+    };
+    let status = tokio::process::Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
         .await
-        .map_err(|err| format!("could not run `{invocation}`: {err}"))?;
+        .map_err(|err| format!("could not run `{}`: {err}", argv.join(" ")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("`{invocation}` exited with {status}"))
+        Err(format!("`{}` exited with {status}", argv.join(" ")))
     }
 }
 
@@ -259,12 +265,21 @@ async fn print_status(orchestrator: &Orchestrator, warnings: &[String], json: bo
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use cuma_config::Config;
+    use cuma_core::ports::AgentAdapter;
     use cuma_core::{AgentDescriptor, AgentProtocol, HealthState};
     use cuma_testkit::MockAgent;
 
     async fn harness(descriptor: AgentDescriptor) -> Orchestrator {
+        harness_with(Config::default(), descriptor).await
+    }
+
+    async fn harness_with(
+        config: cuma_config::Config,
+        descriptor: AgentDescriptor,
+    ) -> Orchestrator {
         let mut orchestrator = Orchestrator::new(
-            cuma_config::Config::default(),
+            config,
             Arc::new(cuma_planner::HeuristicPlanner::new()),
             std::env::temp_dir(),
         );
@@ -276,6 +291,36 @@ mod tests {
             .await
             .expect("a mock agent registers");
         orchestrator
+    }
+
+    /// An adapter that launches under a sandbox prefix — the shape
+    /// `auth_in_sandbox` wraps sign-in invocations in.
+    struct Sandboxed {
+        inner: MockAgent,
+        prefix: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentAdapter for Sandboxed {
+        fn agent_id(&self) -> &AgentId {
+            self.inner.agent_id()
+        }
+
+        async fn describe(&self) -> Result<AgentDescriptor> {
+            self.inner.describe().await
+        }
+
+        async fn execute(
+            &self,
+            request: cuma_core::ports::ExecutionRequest,
+            updates: tokio::sync::mpsc::Sender<cuma_core::ports::ExecutionUpdate>,
+        ) -> Result<cuma_core::task::ExecutionOutcome> {
+            self.inner.execute(request, updates).await
+        }
+
+        fn sandbox_prefix(&self, _workspace: &std::path::Path) -> Option<Vec<String>> {
+            Some(self.prefix.clone())
+        }
     }
 
     fn agent(id: &str) -> AgentDescriptor {
@@ -376,5 +421,60 @@ mod tests {
         assert!(summary.contains("healthy"), "{summary}");
         let after = orchestrator.agents().get(&id).await.unwrap();
         assert!(after.health.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_invocation_runs_on_the_host_by_default() {
+        let id = AgentId::new("copilot");
+        let orchestrator = harness(agent("copilot")).await;
+
+        let argv = orchestrator.sign_in_command(&id, "copilot login");
+        assert_eq!(argv, vec!["sh", "-c", "copilot login"]);
+    }
+
+    #[tokio::test]
+    async fn auth_in_sandbox_wraps_the_invocation_in_the_agents_prefix() {
+        let id = AgentId::new("copilot");
+        let mut config = Config::default();
+        config.agents.insert(
+            "copilot".to_owned(),
+            cuma_config::AgentConfig {
+                auth_in_sandbox: true,
+                ..Default::default()
+            },
+        );
+        let mut orchestrator = Orchestrator::new(
+            config,
+            Arc::new(cuma_planner::HeuristicPlanner::new()),
+            std::env::temp_dir(),
+        );
+        orchestrator
+            .add_agent(Arc::new(Sandboxed {
+                inner: MockAgent::always("copilot", cuma_testkit::Behaviour::ok("done"))
+                    .with_descriptor(agent("copilot")),
+                prefix: vec!["ai-jail".to_owned(), "--".to_owned()],
+            }))
+            .await
+            .expect("a mock agent registers");
+
+        let argv = orchestrator.sign_in_command(&id, "copilot login");
+        assert_eq!(argv, vec!["ai-jail", "--", "sh", "-c", "copilot login"]);
+    }
+
+    #[tokio::test]
+    async fn auth_in_sandbox_without_a_sandbox_falls_back_to_the_host() {
+        let id = AgentId::new("copilot");
+        let mut config = Config::default();
+        config.agents.insert(
+            "copilot".to_owned(),
+            cuma_config::AgentConfig {
+                auth_in_sandbox: true,
+                ..Default::default()
+            },
+        );
+        let orchestrator = harness_with(config, agent("copilot")).await;
+
+        let argv = orchestrator.sign_in_command(&id, "copilot login");
+        assert_eq!(argv, vec!["sh", "-c", "copilot login"]);
     }
 }

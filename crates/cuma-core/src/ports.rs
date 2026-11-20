@@ -128,6 +128,17 @@ pub trait AgentAdapter: Send + Sync {
             message: "this adapter does not support driven authentication".to_owned(),
         })
     }
+
+    /// The confinement prefix this adapter launches the agent under, when it
+    /// uses one — the argv ahead of the agent's own command.
+    ///
+    /// `None` for adapters with no sandbox: their sign-in methods run on the
+    /// host as they stand. A sign-in method run under the prefix writes its
+    /// credential where the confined agent reads it — the point of
+    /// `agents.<id>.auth_in_sandbox`.
+    fn sandbox_prefix(&self, _workspace: &std::path::Path) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Discovers agents from some source: config, an ACP registry, A2A Agent Cards.

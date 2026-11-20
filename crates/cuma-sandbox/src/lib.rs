@@ -121,6 +121,10 @@ pub struct LaunchRequest {
     /// The agent's binary name — `devin`, `opencode`. Runtimes with
     /// built-in harness presets (ai-jail) apply theirs when it matches.
     pub harness: Option<String>,
+    /// The agent may bind to and connect with the host's loopback —
+    /// `agents.<id>.loopback`. Runtimes without a filtered loopback
+    /// ignore it.
+    pub loopback: bool,
 }
 
 impl LaunchRequest {
@@ -134,6 +138,7 @@ impl LaunchRequest {
             state: Vec::new(),
             allowed_hosts: Vec::new(),
             harness: None,
+            loopback: false,
         }
     }
 

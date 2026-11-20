@@ -64,6 +64,8 @@ const WRITABLE_IN_HOME: &[&str] = &[
     ".codex",
     ".aider",
     ".kiro",
+    ".copilot",
+    ".junie",
     ".grok",
     ".agents",
     ".config",
@@ -290,6 +292,9 @@ pub struct AgentSandbox {
     forwarded_env: Vec<String>,
     writable: Vec<PathBuf>,
     required: bool,
+    /// Loopback services the agent may bind and reach — OAuth callbacks,
+    /// local backends. Open: it can reach every host loopback service.
+    loopback: bool,
 }
 
 /// What confinement an agent gets, for `cuma doctor` and warnings.
@@ -344,6 +349,15 @@ impl AgentSandbox {
         self
     }
 
+    /// Let the agent bind listeners on and connect to the host's loopback —
+    /// OAuth callback servers, local backends its own helpers expose.
+    /// Open: loopback reaches every host service bound to it.
+    #[must_use]
+    pub fn with_loopback(mut self, loopback: bool) -> Self {
+        self.loopback = loopback;
+        self
+    }
+
     /// Confinement by a given runtime, whether or not it is installed — for
     /// tests, and for callers that have already chosen.
     pub fn with_runtime(config: &SecurityConfig, runtime: Option<AgentRuntime>) -> Self {
@@ -358,6 +372,7 @@ impl AgentSandbox {
                 .map(|p| cuma_config::expand_home(p))
                 .collect(),
             required: config.require_agent_sandbox,
+            loopback: false,
         }
     }
 
@@ -471,6 +486,8 @@ struct Profile {
     strip_env: Vec<String>,
     /// Variables to forward explicitly (ai-jail, which starts from nothing).
     forward_env: Vec<String>,
+    /// The agent may bind to and connect with the host's loopback.
+    loopback: bool,
 }
 
 impl Profile {
@@ -566,6 +583,7 @@ impl Profile {
             network: true,
             strip_env,
             forward_env: keep,
+            loopback: sandbox.loopback,
         }
     }
 
@@ -609,6 +627,14 @@ impl Profile {
         // above. Only meaningful where seatbelt runs.
         if cfg!(target_os = "macos") && self.network {
             prefix.push("--macos-trustd".to_owned());
+        }
+        // An agent whose sign-in flow binds a loopback callback, or whose
+        // helpers serve it on loopback, needs both directions. Opt-in per
+        // agent: connect reaches every host service bound to loopback, not
+        // just the agent's own.
+        if self.loopback {
+            prefix.push("--allow-loopback-listen".to_owned());
+            prefix.push("--allow-loopback-connect".to_owned());
         }
         for name in &self.forward_env {
             prefix.extend(["--env".to_owned(), name.clone()]);
@@ -1235,6 +1261,7 @@ mod tests {
             network: true,
             strip_env: vec!["SECRET".into()],
             forward_env: Vec::new(),
+            loopback: false,
         };
         let text = profile.seatbelt_profile();
         let deny_writes = text.find("(deny file-write*)").unwrap();
@@ -1310,5 +1337,25 @@ mod tests {
             !off.refuses_agents(),
             "turning the sandbox off is an explicit choice"
         );
+    }
+
+    #[test]
+    fn loopback_is_opt_in_and_only_ai_jail_emits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(dir.path()).unwrap();
+        let open = sandbox(AgentRuntime::AiJail, SecurityConfig::default())
+            .with_loopback(true)
+            .launch_prefix(&workspace, &[], &[], None)
+            .unwrap();
+        assert!(open.contains(&"--allow-loopback-listen".to_owned()));
+        assert!(open.contains(&"--allow-loopback-connect".to_owned()));
+
+        let closed = prefix(AgentRuntime::AiJail, &workspace);
+        assert!(!closed.iter().any(|a| a.starts_with("--allow-loopback")));
+        let bwrap = sandbox(AgentRuntime::Bubblewrap, SecurityConfig::default())
+            .with_loopback(true)
+            .launch_prefix(&workspace, &[], &[], None)
+            .unwrap();
+        assert!(!bwrap.iter().any(|a| a.contains("loopback")));
     }
 }

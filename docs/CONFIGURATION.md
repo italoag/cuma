@@ -56,6 +56,16 @@ sandbox = "vm"                     # overrides security.agent_sandbox for this a
 state = ["~/.codex"]               # directories it keeps its login in; writable in its sandbox
 env = ["OPENAI_API_KEY"]           # variables it needs, by name — never values
 permission_policy = "always-allow" # overrides security.agent_permission_policy for this agent
+auth_in_sandbox = false            # run sign-in inside this agent's sandbox — terminal login
+                                  # methods AND the in-band session/authenticate retry. For
+                                  # agents whose credential store falls back to a file under
+                                  # `state` when the OS keychain is unreachable (e.g. Copilot CLI);
+                                  # for keychain-bound agents leaving it off is what keeps a
+                                  # sign-in attempt from crashing inside the jail
+loopback = false                   # let this agent bind and reach the host's loopback — OAuth
+                                  # callback listeners and local backends. OPEN: it can reach
+                                  # every host service bound to loopback, not just its own
+                                  # (ai-jail only; other runtimes share or lack loopback anyway)
 
 [agents.architect]
 protocol = "a2a"

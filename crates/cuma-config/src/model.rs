@@ -338,6 +338,28 @@ pub struct AgentConfig {
     /// How this agent's permission requests are answered, overriding
     /// `security.agent_permission_policy`.
     pub permission_policy: Option<AgentPermissionPolicy>,
+    /// Run this agent's terminal sign-in methods inside its sandbox rather
+    /// than on the host.
+    ///
+    /// For agents whose credential store is a file under `state` the result
+    /// is the same either way; it matters for agents that would write to a
+    /// store the sandbox hides — the OS keychain — and fall back to a file
+    /// it can see when that store is unreachable. Copilot CLI stores a
+    /// plaintext token in `~/.copilot/config.json` when the keychain fails,
+    /// which is exactly where the confined agent reads it back.
+    ///
+    /// The same reachability gates the in-band `session/authenticate`
+    /// retry: when the store is not reachable inside the sandbox the
+    /// handshake could never produce usable credentials, and a sign-in
+    /// flow that touches it — a hidden OS keychain — may crash the agent.
+    pub auth_in_sandbox: bool,
+    /// Let this agent talk to services on the host's loopback — OAuth
+    /// callback listeners and local backends its own helpers expose.
+    ///
+    /// Open: a jailed agent that can connect to loopback can reach every
+    /// host service bound to it, not just its own. ai-jail enforces it;
+    /// other runtimes share or lack loopback regardless.
+    pub loopback: bool,
 }
 
 impl Default for AgentConfig {
@@ -355,6 +377,8 @@ impl Default for AgentConfig {
             state: Vec::new(),
             env: Vec::new(),
             permission_policy: None,
+            auth_in_sandbox: false,
+            loopback: false,
         }
     }
 }

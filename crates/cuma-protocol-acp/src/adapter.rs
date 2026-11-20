@@ -78,6 +78,12 @@ pub struct AcpAdapter {
     launcher: Option<Arc<dyn AgentLauncher>>,
     /// Environment variables the agent needs beyond a sandbox's baseline.
     kept_env: Vec<String>,
+    /// Credentials written inside the sandbox are what the agent later
+    /// reads — `agents.<id>.auth_in_sandbox`. When false the in-band
+    /// `session/authenticate` handshake is skipped: it could never produce
+    /// usable credentials, and a sign-in flow that touches a store the
+    /// sandbox hides may crash the agent outright.
+    auth_in_sandbox: bool,
 }
 
 /// Starts agents confined to the directory they work in.
@@ -172,6 +178,7 @@ impl AcpAdapter {
             mcp_servers: Vec::new(),
             launcher: None,
             kept_env: Vec::new(),
+            auth_in_sandbox: false,
         }
     }
 
@@ -311,6 +318,14 @@ impl AcpAdapter {
     #[must_use]
     pub fn with_permission_policy(mut self, policy: PermissionPolicy) -> Self {
         self.permission_policy = policy;
+        self
+    }
+
+    /// Whether the agent's credential store is reachable inside its own
+    /// sandbox — gates the in-band `session/authenticate` handshake.
+    #[must_use]
+    pub fn with_auth_in_sandbox(mut self, auth_in_sandbox: bool) -> Self {
+        self.auth_in_sandbox = auth_in_sandbox;
         self
     }
 
@@ -783,6 +798,7 @@ impl AgentAdapter for AcpAdapter {
 
         let risk = request.task.spec.risk;
         let policy = self.permission_policy;
+        let auth_in_sandbox = self.auth_in_sandbox;
         let prompt_text = request.prompt.clone();
         let workspace = request.workspace.clone();
         let agent_id = self.id.clone();
@@ -862,8 +878,15 @@ impl AgentAdapter for AcpAdapter {
                     Err(err) if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED => {
                         // The agent asked for its own login handshake: run
                         // every agent-managed method it advertised, then ask
-                        // once more. A second refusal propagates as-is.
-                        authenticate_with_advertised_methods(&connection, &init.auth_methods).await;
+                        // once more — but only where the credentials it
+                        // writes are the ones later launches read back; an
+                        // agent whose store the sandbox hides could never
+                        // finish it, and the attempt may kill it outright.
+                        // A second refusal propagates as-is.
+                        if auth_in_sandbox {
+                            authenticate_with_advertised_methods(&connection, &init.auth_methods)
+                                .await;
+                        }
                         connection.send_request(new_session).block_task().await?
                     }
                     session => session?,
@@ -972,6 +995,11 @@ impl AgentAdapter for AcpAdapter {
         AcpAdapter::authenticate(self, method_id).await
     }
 
+    fn sandbox_prefix(&self, workspace: &Path) -> Option<Vec<String>> {
+        let (launcher, parts) = (self.launcher.as_ref()?, self.command_parts()?);
+        Some(launcher.prefix(workspace, &parts.keep, &parts.readable))
+    }
+
     async fn refresh(&self) -> Result<AgentDescriptor> {
         self.refresh_capabilities().await
     }
@@ -989,6 +1017,7 @@ impl AcpAdapter {
         let (command, launch) = self.open_launch(&here, LaunchPurpose::Negotiate).await?;
         let agent = self.spawn_handle(&command)?;
         let agent_id = self.id.clone();
+        let auth_in_sandbox = self.auth_in_sandbox;
         let mcp_servers: Vec<McpServer> = self
             .mcp_servers
             .iter()
@@ -1019,8 +1048,13 @@ impl AcpAdapter {
                     .await;
                 let session = match session {
                     Err(err) if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED => {
-                        authenticate_with_advertised_methods(&connection, &response.auth_methods)
+                        if auth_in_sandbox {
+                            authenticate_with_advertised_methods(
+                                &connection,
+                                &response.auth_methods,
+                            )
                             .await;
+                        }
                         connection
                             .send_request(UntypedMessage::new("session/new", new_session)?)
                             .block_task()
@@ -1184,6 +1218,25 @@ mod tests {
                 "@agentclientprotocol/claude-agent-acp@latest"
             ]
         );
+    }
+
+    #[test]
+    fn the_sandbox_prefix_is_what_a_sign_in_runs_under() {
+        let adapter = AcpAdapter::new("copilot", "copilot --acp").with_launch_prefix(vec![
+            "ai-jail".into(),
+            "--exec".into(),
+            "--".into(),
+        ]);
+        assert_eq!(
+            adapter.sandbox_prefix(Path::new("/work")).unwrap(),
+            vec!["ai-jail", "--exec", "--"]
+        );
+    }
+
+    #[test]
+    fn an_unsandboxed_agent_offers_no_sign_in_prefix() {
+        let adapter = AcpAdapter::new("copilot", "copilot --acp");
+        assert!(adapter.sandbox_prefix(Path::new("/work")).is_none());
     }
 
     #[test]
@@ -1717,7 +1770,7 @@ mod tests {
         let Some(command) = auth_agent() else {
             return;
         };
-        let adapter = AcpAdapter::new("authy", command);
+        let adapter = AcpAdapter::new("authy", command).with_auth_in_sandbox(true);
 
         let descriptor = adapter.refresh_capabilities().await.unwrap();
 
@@ -1736,11 +1789,34 @@ mod tests {
         let Some(command) = auth_agent() else {
             return;
         };
-        let adapter = AcpAdapter::new("authy", command);
+        let adapter = AcpAdapter::new("authy", command).with_auth_in_sandbox(true);
         let (tx, _rx) = mpsc::channel(16);
 
         let outcome = adapter.execute(request(), tx).await.unwrap();
         assert!(outcome.success, "{:?}", outcome.failure_reason);
+    }
+
+    #[tokio::test]
+    async fn the_handshake_is_skipped_where_credentials_would_not_survive() {
+        let Some(command) = auth_agent() else {
+            return;
+        };
+        // The default: the agent's credential store is not reachable inside
+        // its sandbox, so firing `authenticate` there could never help.
+        let adapter = AcpAdapter::new("authy", command);
+
+        let err = adapter.refresh_capabilities().await.unwrap_err();
+        assert!(
+            matches!(err, MetaAgentError::Authentication { .. }),
+            "session/new was refused without the handshake: {err:?}"
+        );
+
+        let (tx, _rx) = mpsc::channel(16);
+        let err = adapter.execute(request(), tx).await.unwrap_err();
+        assert!(
+            matches!(err, MetaAgentError::Authentication { .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

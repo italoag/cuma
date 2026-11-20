@@ -51,6 +51,7 @@ impl NativeProvider {
         self.sandbox
             .clone()
             .with_state(request.state.iter().cloned())
+            .with_loopback(request.loopback)
             .launch_prefix(
                 &request.workspace,
                 &request.keep_env,

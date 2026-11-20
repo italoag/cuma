@@ -672,6 +672,8 @@ struct ProviderLauncher {
     allowed_hosts: Vec<String>,
     /// The binary its command starts, for runtimes with harness presets.
     harness: Option<String>,
+    /// Whether it may bind and reach the host's loopback.
+    loopback: bool,
 }
 
 impl ProviderLauncher {
@@ -691,6 +693,7 @@ impl ProviderLauncher {
                 .collect(),
             env,
             allowed_hosts: security.network_allowlist.clone(),
+            loopback: agent.loopback,
             harness: agent.command.as_deref().and_then(|command| {
                 command
                     .split_whitespace()
@@ -718,6 +721,7 @@ impl ProviderLauncher {
             state: self.state.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
             harness: self.harness.clone(),
+            loopback: self.loopback,
         }
     }
 }
