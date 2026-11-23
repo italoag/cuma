@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["fuzz", "legacy"]
 members = [
     "crates/cuma-core",
     "crates/cuma-config",
@@ -68,7 +69,6 @@ toml = "1.1"
 
 # --- errors / logging ---
 thiserror = "2"
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
@@ -76,31 +76,42 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
-petgraph = "0.8"
-rand = "0.9"
-dirs = "6"
+rand = "0.10"
+dirs = "7"
 shell-words = "1"
 ed25519-dalek = "3.0"
 sha2 = "0.11"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 base64 = "0.23"
 which = "8"
+# Select/MultiSelect/Confirm/Input for `cuma setup`; editor/password off.
+dialoguer = { version = "0.12", default-features = false }
 # `tempdir` is deprecated; `tempfile` is its maintained successor.
 tempfile = "3.27"
+arbitrary = { version = "1.5", features = ["derive"] }
 
 # --- protocol SDKs (validated against crates.io index, see DEPENDENCY_ANALYSIS.md) ---
-agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage"] }
-rmcp = "3.1"
+agent-client-protocol = { version = "5.2", features = ["process", "stdio", "unstable_end_turn_token_usage"] }
+rmcp = "3.9"
 
 # --- storage ---
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 
 # --- http (A2A adapter and server) ---
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "charset", "http2"] }
+# `rustls` pulls rustls-platform-verifier — native roots, no OpenSSL. The old
+# `rustls-native-certs` feature was folded into it in 0.13.2.
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "charset", "http2"] }
 
 # --- tui ---
 ratatui = "0.30"
+# Markdown rendering for the chat conversation; syntect highlighting stays off
+# (default-features = false) to keep the tree light — blocks still render styled.
+# Pinned at 0.3.7: 0.3.8+ pulls itertools 0.15, which the registry proxy blocks.
+tui-markdown = { version = "=0.3.7", default-features = false }
+# Charm/Bubble Tea look: shared theme tokens and Bubbles-style components.
+ratatui-bubbletea-theme = "0.2"
+ratatui-bubbletea-components = "0.2"
 # `event-stream` gives crossterm an async EventStream. Declared here rather
 # than relying on ratatui's re-export so the feature is actually enabled;
 # cargo unifies it with the copy ratatui-crossterm pulls in.

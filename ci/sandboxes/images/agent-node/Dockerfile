@@ -4,7 +4,7 @@
 # agents expect. Agents themselves are not baked in — `npx -y <agent>` fetches
 # the version the configuration names — and neither is any credential: those
 # are forwarded by name at launch.
-ARG BASE=public.ecr.aws/docker/library/node:22-bookworm-slim
+ARG BASE=mirror.gcr.io/library/node:22-bookworm-slim
 FROM ${BASE}
 
 RUN apt-get update \

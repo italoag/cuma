@@ -17,10 +17,10 @@ ACP, A2A and MCP.
 - Rust 2024 edition, MSRV 1.88
 - Cargo workspace, 21 crates
 - `tokio`, `serde`, `thiserror`, `tracing`, `clap`
-- `agent-client-protocol` 2.0 — the official ACP SDK
-- `rmcp` 3.1 — the official MCP SDK
+- `agent-client-protocol` 5.2 — the official ACP SDK
+- `rmcp` 3.9 — the official MCP SDK
 - `rusqlite` 0.40 (bundled), `reqwest` 0.13 (rustls)
-- `ratatui` 0.30, `axum` 0.8 (A2A server)
+- `ratatui` 0.30 + `ratatui-bubbletea-{theme,components}` 0.2 (TUI), `axum` 0.8 (A2A server)
 - `ed25519-dalek` 3 + `sha2` 0.11 (skill integrity)
 - optional: `opentelemetry` 0.33 behind `cuma-cli --features otel`; `criterion` 0.8 benches
 
@@ -28,7 +28,7 @@ ACP, A2A and MCP.
 
 ```bash
 cargo build --workspace
-cargo test --workspace              # 840 tests
+cargo test --workspace              # 877 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 

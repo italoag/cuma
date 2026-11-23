@@ -6,7 +6,10 @@ Lowest first. Later layers override earlier ones **field by field**:
 
 1. Built-in defaults
 2. `~/.config/cuma/config.toml` — macOS included; `$XDG_CONFIG_HOME/cuma/config.toml`
-   when that is set, `%APPDATA%\cuma\config.toml` on Windows
+   when that is set, `%APPDATA%\cuma\config.toml` on Windows. Earlier versions
+   read `~/Library/Application Support/cuma/config.toml` on macOS: a file left
+   there is still read when the new one does not exist, with a warning, and
+   `cuma doctor` names it. Move it.
 3. `./.cuma/config.toml`
 4. `CUMA_*` environment variables
 5. CLI flags
@@ -52,6 +55,17 @@ models = []                        # assumed when the agent enumerates none
 sandbox = "vm"                     # overrides security.agent_sandbox for this agent
 state = ["~/.codex"]               # directories it keeps its login in; writable in its sandbox
 env = ["OPENAI_API_KEY"]           # variables it needs, by name — never values
+permission_policy = "always-allow" # overrides security.agent_permission_policy for this agent
+auth_in_sandbox = false            # run sign-in inside this agent's sandbox — terminal login
+                                  # methods AND the in-band session/authenticate retry. For
+                                  # agents whose credential store falls back to a file under
+                                  # `state` when the OS keychain is unreachable (e.g. Copilot CLI);
+                                  # for keychain-bound agents leaving it off is what keeps a
+                                  # sign-in attempt from crashing inside the jail
+loopback = false                   # let this agent bind and reach the host's loopback — OAuth
+                                  # callback listeners and local backends. OPEN: it can reach
+                                  # every host service bound to loopback, not just its own
+                                  # (ai-jail only; other runtimes share or lack loopback anyway)
 
 [agents.architect]
 protocol = "a2a"
@@ -104,6 +118,10 @@ agent_sandbox = "auto"             # auto | ai-jail | bubblewrap | sandbox-exec 
                                    # | the name of a [sandboxes.<name>] section
 trusted_workspaces = []            # ACP session dirs whose own .cuma/config.toml applies; ~ expanded
 a2a_server_token_refs = []         # env vars holding bearer tokens A2A callers must present
+agent_permission_policy = "allow-low-risk"
+                                   # allow-low-risk | always-allow | always-deny —
+                                   # how agent permission requests are answered unattended;
+                                   # always-allow is only appropriate inside a sandbox
 
 [limits]
 max_parallel_tasks = 4

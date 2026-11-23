@@ -12,6 +12,10 @@ mod app;
 mod state;
 mod view;
 
-pub use app::{Action, SkillSource, Sources, handle_key, run, run_with};
-pub use state::{AppState, InputMode, MemoryRow, Screen, SkillRow, TaskRow};
-pub use view::{execution_lines, plan_lines, status_line};
+pub use app::{
+    Action, AgentAuthSource, LogSource, SkillSource, Sources, handle_key, run, run_with,
+};
+pub use state::{AppState, InputMode, MemoryRow, ModelRow, Screen, SkillRow, TaskRow};
+pub use view::{
+    execution_lines, help_line, model_detail_lines, model_lines, plan_lines, status_line,
+};

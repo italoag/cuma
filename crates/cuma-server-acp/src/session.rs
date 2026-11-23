@@ -17,7 +17,7 @@
 //! *conversation*, not a plan in flight: a prompt interrupted by a restart is
 //! not resumed, and the client is shown only the turns that finished.
 
-use agent_client_protocol::schema::v1::SessionId;
+use agent_client_protocol::v1::schema::SessionId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

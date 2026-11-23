@@ -531,4 +531,49 @@ mod tests {
         let predicted = predicted_writes("Edit src/a.rs then edit src/a.rs again");
         assert_eq!(predicted.len(), 1);
     }
+
+    #[test]
+    fn arbitrary_ownership_claims_preserve_all_or_nothing_conflict_semantics() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x0A1E_5111);
+        let mut buf = [0u8; 256];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok(raw_a) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let Ok(raw_b) = Vec::<String>::arbitrary(&mut u) else {
+                continue;
+            };
+            let pa: Vec<PathBuf> = raw_a
+                .into_iter()
+                .take(5)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            let pb: Vec<PathBuf> = raw_b
+                .into_iter()
+                .take(5)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+
+            let ledger = OwnershipLedger::new();
+            let t1 = task("t1");
+            let t2 = task("t2");
+            assert!(ledger.claim(&t1, &pa).is_ok());
+            let would = ledger.would_conflict(&t2, &pb);
+            let claimed = ledger.claim(&t2, &pb);
+            assert_eq!(would.is_some(), claimed.is_err());
+            if claimed.is_err() {
+                assert!(ledger.held_by(&t2).is_empty());
+            }
+            ledger.release(&t1);
+            assert!(ledger.held_by(&t1).is_empty());
+        }
+    }
 }

@@ -183,6 +183,39 @@ pub enum AgentAuth {
     None,
 }
 
+/// How one advertised authentication method runs.
+///
+/// Mirrors the shapes ACP `initialize.authMethods` carries, kept
+/// protocol-neutral so any adapter may describe its equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethodKind {
+    /// The user runs a command in a terminal; the harness must not drive it.
+    Terminal,
+    /// The harness drives the agent's `authenticate` request with the id.
+    Agent,
+    /// A shape this build does not know — shown to the user, never attempted.
+    Other,
+}
+
+/// One way an agent says it can be signed in.
+///
+/// Persisted in `AgentDescriptor::metadata` (as JSON under
+/// `acp_auth_methods`), so an interface can present the sign-in journey
+/// without holding a live connection to the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthMethodInfo {
+    /// The method's id, as the agent named it.
+    pub id: String,
+    /// How the flow runs.
+    pub kind: AuthMethodKind,
+    /// Human-readable description, when the agent gave one.
+    pub description: Option<String>,
+    /// For terminal methods: the invocation the agent named
+    /// (`copilot login`), run on the user's real terminal.
+    pub invocation: Option<String>,
+}
+
 /// One model reachable through one agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDescriptor {
@@ -311,6 +344,18 @@ impl AgentDescriptor {
     /// Find a model by id.
     pub fn model(&self, id: &ModelId) -> Option<&ModelDescriptor> {
         self.models.iter().find(|m| &m.id == id)
+    }
+
+    /// The sign-in methods the agent advertised at negotiation.
+    ///
+    /// Adapters persist them as JSON in `metadata` so an interface can
+    /// present the journey without holding a live connection. A malformed
+    /// record is an empty list, not an error — auth data is advisory.
+    pub fn auth_methods(&self) -> Vec<AuthMethodInfo> {
+        self.metadata
+            .get("acp_auth_methods")
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
     }
 }
 

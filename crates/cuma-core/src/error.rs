@@ -24,7 +24,10 @@ pub enum ErrorClass {
     RateLimit,
     /// Budget or plan exhausted. Retrying the same target is pointless.
     QuotaExceeded,
-    /// Credentials rejected. No amount of retrying helps; surface to the user.
+    /// Credentials rejected. Retrying the same target cannot help — a bad
+    /// credential does not become good on a second try — but credentials are
+    /// scoped to the agent that presented them, so a different agent may well
+    /// be fine. Reroute, never retry.
     AuthenticationFailure,
     /// The agent process died. Reroute.
     AgentCrash,
@@ -69,6 +72,7 @@ impl ErrorClass {
             self,
             Self::RateLimit
                 | Self::QuotaExceeded
+                | Self::AuthenticationFailure
                 | Self::AgentCrash
                 | Self::Timeout
                 | Self::ProtocolError
@@ -272,10 +276,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_failures_are_neither_retried_nor_rerouted() {
+    fn auth_failures_reroute_but_never_retry_the_same_agent() {
         let class = ErrorClass::AuthenticationFailure;
-        assert!(!class.is_retryable_on_same_target());
-        assert!(!class.is_reroutable());
+        assert!(
+            !class.is_retryable_on_same_target(),
+            "a rejected credential does not become valid on a second try"
+        );
+        assert!(
+            class.is_reroutable(),
+            "credentials are agent-scoped: another agent may hold good ones"
+        );
     }
 
     #[test]
@@ -290,6 +300,7 @@ mod tests {
         let class = ErrorClass::RateLimit;
         assert!(class.is_retryable_on_same_target());
         assert!(class.is_reroutable());
+        assert!(!class.requires_replan());
     }
 
     #[test]

@@ -8,13 +8,72 @@
 //! are the tested core; the ratatui widgets below are a thin dressing over
 //! them, so a layout change cannot silently change what is displayed.
 
-use crate::state::{AppState, InputMode, Screen};
-use cuma_core::TaskStatus;
+use crate::state::{AppState, InputMode, ModelRow, Screen};
+use cuma_core::{AuthMethodKind, TaskStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Paragraph, Row, Tabs, Wrap};
+use ratatui_bubbletea_components::{
+    Progress, SpinnerFrames, TextInput, TextInputState, ThemedTable,
+};
+use ratatui_bubbletea_theme::Theme;
+use tui_markdown::{Options, StyleSheet};
+
+/// The interface's single source of colours, borders and symbols.
+///
+/// Every widget draws from this Charm palette rather than picking its own
+/// `Color`, which is what gives the app the Bubble Tea look: pink accent,
+/// rounded borders, muted hints.
+fn theme() -> Theme {
+    Theme::default()
+}
+
+/// The current spinner frame — the only animated glyph in the interface.
+fn spinner_frame(state: &AppState) -> &'static str {
+    let frames = SpinnerFrames::DOTS.frames();
+    frames[state.spinner.frame_index() % frames.len()]
+}
+
+/// Maps markdown constructs onto the Charm palette so the agent's output in
+/// the chat picks up the same colours as the rest of the interface instead of
+/// the renderer's default cyan look.
+#[derive(Clone, Copy)]
+struct ChatStyleSheet(Theme);
+
+impl StyleSheet for ChatStyleSheet {
+    fn heading(&self, level: u8) -> Style {
+        let base = if level == 1 {
+            self.0.title
+        } else {
+            self.0.accent
+        };
+        base.add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::new()
+            .fg(self.0.palette.accent)
+            .bg(self.0.palette.selected_background)
+    }
+
+    fn link(&self) -> Style {
+        self.0.accent.add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        self.0.muted.add_modifier(Modifier::ITALIC)
+    }
+
+    fn heading_meta(&self) -> Style {
+        self.0.muted
+    }
+
+    fn metadata_block(&self) -> Style {
+        self.0.muted
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Plain-text projections — the tested core
@@ -23,11 +82,15 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
 /// Render the status line shown above every screen.
 pub fn status_line(state: &AppState) -> String {
     let connection = if state.running {
-        "running"
+        "running".to_owned()
+    } else if state.is_connecting() {
+        let total = state.agents.iter().filter(|a| a.enabled).count();
+        let ready = total.saturating_sub(state.connecting_count());
+        format!("connecting ({ready}/{total})")
     } else if state.finished.is_some() {
-        "finished"
+        "finished".to_owned()
     } else {
-        "idle"
+        "idle".to_owned()
     };
 
     format!(
@@ -69,30 +132,49 @@ pub fn execution_lines(state: &AppState) -> Vec<String> {
     lines
 }
 
+/// The bindings behind the help footer, in display order.
+fn help_bindings(state: &AppState) -> &'static [(&'static str, &'static str)] {
+    match state.input_mode {
+        InputMode::Editing => &[("Enter", "submit"), ("Esc", "cancel")],
+        InputMode::Navigating if state.screen == Screen::Models => &[
+            ("Tab/Shift-Tab", "screens"),
+            ("i", "new goal"),
+            ("↑↓", "select"),
+            ("a", "sign in"),
+            ("r", "re-probe"),
+            ("q", "quit"),
+        ],
+        InputMode::Navigating => &[
+            ("Tab/Shift-Tab", "screens"),
+            ("1-9", "jump"),
+            ("i", "new goal"),
+            ("↑↓", "scroll"),
+            ("q", "quit"),
+        ],
+    }
+}
+
 /// The key hints shown at the bottom, which depend on the input mode.
 pub fn help_line(state: &AppState) -> String {
-    match state.input_mode {
-        InputMode::Editing => "Enter submit  ·  Esc cancel".to_owned(),
-        InputMode::Navigating => {
-            "Tab/Shift-Tab screens  ·  1-9 jump  ·  i new goal  ·  ↑↓ scroll  ·  q quit".to_owned()
-        }
-    }
+    help_bindings(state)
+        .iter()
+        .map(|(key, description)| format!("{key} {description}"))
+        .collect::<Vec<_>>()
+        .join("  ·  ")
 }
 
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
 
-/// Colour for a task's status marker.
-fn status_style(status: TaskStatus) -> Style {
+/// Style for a task's status marker.
+fn status_style(theme: &Theme, status: TaskStatus) -> Style {
     match status {
-        TaskStatus::Completed => Style::default().fg(Color::Green),
-        TaskStatus::Running => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        TaskStatus::Failed => Style::default().fg(Color::Red),
-        TaskStatus::Skipped | TaskStatus::Cancelled => Style::default().fg(Color::DarkGray),
-        TaskStatus::Pending | TaskStatus::Ready => Style::default().fg(Color::Gray),
+        TaskStatus::Completed => theme.success,
+        TaskStatus::Running => theme.accent,
+        TaskStatus::Failed => theme.error,
+        TaskStatus::Skipped | TaskStatus::Cancelled => theme.muted,
+        TaskStatus::Pending | TaskStatus::Ready => theme.text,
     }
 }
 
@@ -117,17 +199,15 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let titles: Vec<Line<'_>> = Screen::ALL
         .iter()
         .enumerate()
         .map(|(index, screen)| {
             Line::from(vec![
-                Span::styled(
-                    format!("{}", index + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(":"),
-                Span::raw(screen.title()),
+                theme.muted(format!("{}", index + 1)),
+                theme.span(":"),
+                theme.span(screen.title()),
             ])
         })
         .collect();
@@ -140,35 +220,36 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Tabs::new(titles)
             .select(selected)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.title)
             .divider(" "),
         area,
     );
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let colour = match (state.running, state.finished) {
-        (true, _) => Color::Cyan,
-        (false, Some(true)) => Color::Green,
-        (false, Some(false)) => Color::Red,
-        (false, None) => Color::Gray,
+    let theme = theme();
+    let style = if state.running {
+        theme.accent
+    } else if state.is_connecting() {
+        theme.warning
+    } else {
+        match state.finished {
+            Some(true) => theme.success,
+            Some(false) => theme.error,
+            None => theme.muted,
+        }
     };
 
-    let mut spans = vec![Span::styled(
-        status_line(state),
-        Style::default().fg(colour),
-    )];
+    let mut spans = Vec::new();
+    if state.running || state.is_connecting() {
+        spans.push(theme.accent(spinner_frame(state)));
+        spans.push(theme.span(" "));
+    }
+    spans.push(Span::styled(status_line(state), style));
 
     if let Some(notice) = &state.notice {
-        spans.push(Span::raw("  |  "));
-        spans.push(Span::styled(
-            notice.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
+        spans.push(theme.muted("  |  "));
+        spans.push(theme.warning(notice.clone()));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -189,6 +270,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn draw_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -197,42 +279,27 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     // Left: the goal and the agent's streamed output.
     let mut lines: Vec<Line<'_>> = Vec::new();
     if !state.goal.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "You",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(format!("> {}", state.goal)));
+        lines.push(theme.title("You"));
+        lines.push(Line::from(vec![
+            theme.accent("> "),
+            theme.span(state.goal.clone()),
+        ]));
         lines.push(Line::from(""));
     }
 
     if !state.transcript.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Agent",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for line in state.transcript.lines() {
-            lines.push(Line::from(line.to_owned()));
-        }
+        lines.push(theme.title("Agent"));
+        let options = Options::new(ChatStyleSheet(theme));
+        lines.extend(tui_markdown::from_str_with_options(&state.transcript, &options).lines);
     }
 
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Press i to enter a goal.",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(theme.muted("Press i to enter a goal.")));
     }
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Conversation "),
-            )
+            .block(theme.titled_block(" Conversation "))
             .wrap(Wrap { trim: false })
             .scroll((state.scroll, 0)),
         columns[0],
@@ -249,23 +316,20 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .iter()
         .map(|task| {
             Line::from(vec![
-                Span::styled(task.marker().to_owned(), status_style(task.status)),
-                Span::raw(" "),
-                Span::raw(task.description.clone()),
+                Span::styled(task.marker().to_owned(), status_style(&theme, task.status)),
+                theme.span(" "),
+                theme.span(task.description.clone()),
             ])
         })
         .collect();
 
     frame.render_widget(
         Paragraph::new(if plan.is_empty() {
-            vec![Line::from(Span::styled(
-                "No plan yet.",
-                Style::default().fg(Color::DarkGray),
-            ))]
+            vec![Line::from(theme.muted("No plan yet."))]
         } else {
             plan
         })
-        .block(Block::default().borders(Borders::ALL).title(" Plan "))
+        .block(theme.titled_block(" Plan "))
         .wrap(Wrap { trim: true }),
         rows[0],
     );
@@ -274,23 +338,20 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     frame.render_widget(
         Paragraph::new(execution)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Current execution "),
-            )
+            .block(theme.titled_block(" Current execution "))
             .wrap(Wrap { trim: true }),
         rows[1],
     );
 }
 
 fn draw_tasks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let rows: Vec<Row<'_>> = state
         .tasks
         .iter()
         .map(|task| {
             Row::new(vec![
-                Span::styled(task.marker().to_owned(), status_style(task.status)),
+                Span::styled(task.marker().to_owned(), status_style(&theme, task.status)),
                 Span::raw(format!("{:?}", task.status)),
                 Span::raw(
                     task.agent
@@ -307,45 +368,50 @@ fn draw_tasks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         })
         .collect();
 
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Length(10),
-                Constraint::Length(16),
-                Constraint::Length(16),
-                Constraint::Min(20),
-            ],
-        )
-        .header(
-            Row::new(vec!["", "Status", "Agent", "Model", "Task"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(Block::default().borders(Borders::ALL).title(" Tasks ")),
-        area,
-    );
+    let table = ThemedTable::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(16),
+            Constraint::Min(20),
+        ],
+    )
+    .header(Row::new(vec!["", "Status", "Agent", "Model", "Task"]))
+    .title(" Tasks ");
+
+    frame.render_widget(&table, area);
 }
 
 fn draw_agents(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let rows: Vec<Row<'_>> = state
         .agents
         .iter()
         .map(|agent| {
-            let health = state
-                .agent_health
-                .get(&agent.id)
-                .cloned()
-                .unwrap_or_else(|| format!("{:?}", agent.health.state));
-
-            let colour = if agent.is_routable() {
-                Color::Green
+            let (health, style) = if state.is_agent_connecting(agent) {
+                (
+                    format!("{} Connecting…", spinner_frame(state)),
+                    theme.warning,
+                )
             } else {
-                Color::Red
+                let health = state
+                    .agent_health
+                    .get(&agent.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", agent.health.state));
+
+                let style = if agent.is_routable() {
+                    theme.success
+                } else {
+                    theme.error
+                };
+                (health, style)
             };
 
             Row::new(vec![
-                Span::styled(agent.id.to_string(), Style::default().fg(colour)),
+                Span::styled(agent.id.to_string(), style),
                 Span::raw(format!("{:?}", agent.protocol)),
                 Span::raw(health),
                 Span::raw(agent.models.len().to_string()),
@@ -354,80 +420,198 @@ fn draw_agents(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         })
         .collect();
 
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(20),
-                Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Length(8),
-                Constraint::Min(6),
-            ],
-        )
-        .header(
-            Row::new(vec![
-                "Agent",
-                "Protocol",
-                "Health",
-                "Models",
-                "Capabilities",
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(Block::default().borders(Borders::ALL).title(" Agents ")),
-        area,
-    );
+    let table = ThemedTable::new(
+        rows,
+        [
+            Constraint::Length(20),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(8),
+            Constraint::Min(6),
+        ],
+    )
+    .header(Row::new(vec![
+        "Agent",
+        "Protocol",
+        "Health",
+        "Models",
+        "Capabilities",
+    ]))
+    .title(" Agents ");
+
+    frame.render_widget(&table, area);
+}
+
+/// A price as the table shows it: never a number we do not actually know.
+fn render_price(price: cuma_core::Known<f64>) -> String {
+    price
+        .value()
+        .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
+}
+
+/// Lines for the Models screen's navigable list.
+///
+/// Agent sections and their models are one flat list the cursor walks; pure,
+/// so it can be tested without a terminal.
+pub fn model_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
+    if state.agents.is_empty() {
+        return vec![
+            Line::from("No agents are registered."),
+            Line::from(""),
+            Line::from(theme.muted("Configure one under [agents.*] in .cuma/config.toml.")),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    for (index, row) in state.model_rows().iter().enumerate() {
+        let selected = index == state.model_cursor;
+        let cursor = if selected {
+            theme.selected
+        } else {
+            Style::default()
+        };
+        match *row {
+            ModelRow::Agent(agent_index) => {
+                let agent = &state.agents[agent_index];
+                let (marker, health_style, health) = if state.is_agent_connecting(agent) {
+                    ("◌", theme.warning, "Connecting…".to_owned())
+                } else {
+                    let (marker, health_style) = if agent.is_routable() {
+                        ("●", theme.success)
+                    } else {
+                        ("✗", theme.error)
+                    };
+                    let health = state
+                        .agent_health
+                        .get(&agent.id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{:?}", agent.health.state));
+                    (marker, health_style, health)
+                };
+                let auth = if agent.auth_methods().is_empty() {
+                    String::new()
+                } else {
+                    "sign-in advertised".to_owned()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} {:<18}", agent.id), cursor),
+                    Span::styled(format!("{health:<13}"), health_style),
+                    Span::raw(format!("{:>3} models  ", agent.models.len())),
+                    theme.muted(auth),
+                ]));
+            }
+            ModelRow::Model(agent_index, model_index) => {
+                let model = &state.agents[agent_index].models[model_index];
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {:<26}", model.id), cursor),
+                    theme.muted(format!(
+                        "{:>6}  {:>6}  {}",
+                        model
+                            .context_window
+                            .value()
+                            .map_or_else(|| "-".to_owned(), |w| format!("{}K", w / 1000)),
+                        render_price(model.cost.input_per_mtok),
+                        render_price(model.cost.output_per_mtok),
+                    )),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// Lines for the selected agent's detail pane: what failed, and how to sign
+/// it back in. Pure, so it can be tested without a terminal.
+pub fn model_detail_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
+    let Some(agent) = state.selected_model_agent() else {
+        return Vec::new();
+    };
+
+    let health_label = if state.is_agent_connecting(agent) {
+        "Connecting…".to_owned()
+    } else {
+        format!("{:?}", agent.health.state)
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {} ", agent.id), theme.title),
+            theme.muted(format!("({:?})", agent.protocol)),
+        ]),
+        Line::from(format!(
+            " health: {health_label}   capabilities: {}",
+            agent.capabilities.len()
+        )),
+    ];
+
+    if state.is_agent_connecting(agent) {
+        lines.push(Line::from(
+            theme.muted(" negotiating capabilities and models in the background…"),
+        ));
+    }
+
+    if let Some(error) = &agent.health.last_error {
+        lines.push(Line::from(theme.error(format!(" error: {error}"))));
+    }
+
+    let methods = agent.auth_methods();
+    if methods.is_empty() {
+        if !agent.is_routable() {
+            lines.push(Line::from(theme.muted(
+                " the agent advertises no sign-in method — its credentials come \
+                 from its own environment or config (agents.<id>.env)",
+            )));
+        }
+    } else {
+        lines.push(Line::from(theme.accent(" sign-in:")));
+        for method in &methods {
+            let kind = match method.kind {
+                AuthMethodKind::Terminal => "terminal",
+                AuthMethodKind::Agent => "agent",
+                AuthMethodKind::Other => "method",
+            };
+            let detail = method
+                .invocation
+                .as_deref()
+                .or(method.description.as_deref())
+                .unwrap_or("");
+            lines.push(Line::from(format!(
+                "   {kind:<9} {:<22} {detail}",
+                method.id
+            )));
+        }
+    }
+
+    lines.push(Line::from(theme.muted(
+        " a sign in · r re-probe — sign-in runs on your terminal, outside the sandbox",
+    )));
+    lines
 }
 
 fn draw_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let render_price = |price: cuma_core::Known<f64>| {
-        price
-            .value()
-            .map_or_else(|| "-".to_owned(), |p| format!("{p:.2}"))
-    };
-
-    let rows: Vec<Row<'_>> = state
-        .agents
-        .iter()
-        .flat_map(|agent| agent.models.iter())
-        .map(|model| {
-            Row::new(vec![
-                Span::raw(model.id.to_string()),
-                Span::raw(model.agent_id.to_string()),
-                Span::raw(
-                    model
-                        .context_window
-                        .value()
-                        .map_or_else(|| "-".to_owned(), |w| format!("{}K", w / 1000)),
-                ),
-                Span::raw(render_price(model.cost.input_per_mtok)),
-                Span::raw(render_price(model.cost.output_per_mtok)),
-            ])
-        })
-        .collect();
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(10)])
+        .split(area);
 
     frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(24),
-                Constraint::Length(18),
-                Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Min(14),
-            ],
-        )
-        .header(
-            Row::new(vec!["Model", "Agent", "Context", "In $/Mtok", "Out $/Mtok"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(Block::default().borders(Borders::ALL).title(" Models ")),
-        area,
+        Paragraph::new(model_lines(state))
+            .block(theme().titled_block(" Models "))
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll, 0)),
+        panes[0],
+    );
+    frame.render_widget(
+        Paragraph::new(model_detail_lines(state))
+            .block(theme().titled_block(" Agent "))
+            .wrap(Wrap { trim: false }),
+        panes[1],
     );
 }
 
 fn draw_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let mut lines = vec![
         Line::from(format!("Tokens in:     {}", state.tokens.input)),
         Line::from(format!("Tokens out:    {}", state.tokens.output)),
@@ -444,39 +628,39 @@ fn draw_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     if !state.tokens.reported {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        lines.push(Line::from(theme.warning(
             "Some token counts were estimated, not reported by the agent.",
-            Style::default().fg(Color::Yellow),
         )));
     }
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Usage "))
+            .block(theme.titled_block(" Usage "))
             .scroll((state.scroll, 0)),
         area,
     );
 }
 
 fn draw_logs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let lines: Vec<Line<'_>> = state
         .logs
         .iter()
         .map(|line| {
-            let colour = if line.contains("failed") || line.contains("refused") {
-                Color::Red
+            let style = if line.contains("failed") || line.contains("refused") {
+                theme.error
             } else if line.contains("retry") || line.contains("falling back") {
-                Color::Yellow
+                theme.warning
             } else {
-                Color::Gray
+                theme.muted
             };
-            Line::from(Span::styled(line.clone(), Style::default().fg(colour)))
+            Line::from(Span::styled(line.clone(), style))
         })
         .collect();
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Logs "))
+            .block(theme.titled_block(" Logs "))
             .wrap(Wrap { trim: true })
             .scroll((state.scroll, 0)),
         area,
@@ -484,6 +668,7 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn draw_configuration(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     let lines: Vec<Line<'_>> = state
         .last_explanation
         .as_deref()
@@ -494,11 +679,7 @@ fn draw_configuration(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Last routing decision "),
-            )
+            .block(theme.titled_block(" Last routing decision "))
             .wrap(Wrap { trim: false })
             .scroll((state.scroll, 0)),
         area,
@@ -507,19 +688,18 @@ fn draw_configuration(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 /// Lines for the Skills screen. Pure, so it can be tested without a terminal.
 pub fn skill_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
     let Some(skills) = &state.skills else {
-        return vec![Line::from(Span::styled(
-            "No skill manager is attached to this interface.",
-            Style::default().fg(Color::DarkGray),
-        ))];
+        return vec![Line::from(
+            theme.muted("No skill manager is attached to this interface."),
+        )];
     };
     if skills.is_empty() {
         return vec![
             Line::from("No skills are installed."),
             Line::from(""),
-            Line::from(Span::styled(
+            Line::from(theme.muted(
                 "Find some with: cuma skills search <query>, then cuma skills install <id>",
-                Style::default().fg(Color::DarkGray),
             )),
         ];
     }
@@ -528,33 +708,26 @@ pub fn skill_lines(state: &AppState) -> Vec<Line<'static>> {
     for (index, skill) in skills.iter().enumerate() {
         let selected = index == state.skill_cursor;
         let marker = if skill.enabled { "[x]" } else { "[ ]" };
-        let trust_colour = match skill.trust.as_str() {
-            "Trusted" => Color::Green,
-            "Verified" => Color::Cyan,
-            "Community" => Color::Yellow,
-            _ => Color::Red,
+        let trust_style = match skill.trust.as_str() {
+            "Trusted" => theme.success,
+            "Verified" => theme.accent,
+            "Community" => theme.warning,
+            _ => theme.error,
         };
         let mut style = Style::default();
         if selected {
-            style = style.add_modifier(Modifier::REVERSED);
+            style = theme.selected;
         }
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} {:<24}", skill.id), style),
-            Span::styled(
-                format!(" {:<10}", skill.trust),
-                Style::default().fg(trust_colour),
-            ),
+            Span::styled(format!(" {:<10}", skill.trust), trust_style),
             Span::raw(format!(" {:<12}", skill.registry)),
-            Span::styled(
-                skill.capabilities.join(", "),
-                Style::default().fg(Color::DarkGray),
-            ),
+            theme.muted(skill.capabilities.join(", ")),
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    lines.push(Line::from(theme.muted(
         "↑/↓ select   space enable/disable — an enabled skill's instructions accompany relevant tasks",
-        Style::default().fg(Color::DarkGray),
     )));
     lines
 }
@@ -562,7 +735,7 @@ pub fn skill_lines(state: &AppState) -> Vec<Line<'static>> {
 fn draw_skills(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(skill_lines(state))
-            .block(Block::default().borders(Borders::ALL).title(" Skills "))
+            .block(theme().titled_block(" Skills "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -570,12 +743,10 @@ fn draw_skills(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 /// Lines for the Memory screen. Pure, so it can be tested without a terminal.
 pub fn memory_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = theme();
     if !state.memory_attached {
         return vec![
-            Line::from(Span::styled(
-                "Long-term memory is off.",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(theme.muted("Long-term memory is off.")),
             Line::from(""),
             Line::from("Enable it with [memory] enabled = true in .cuma/config.toml."),
         ];
@@ -583,10 +754,11 @@ pub fn memory_lines(state: &AppState) -> Vec<Line<'static>> {
 
     let mut lines = Vec::new();
     match (&state.memory_query, state.memory_searching) {
-        (_, true) => lines.push(Line::from(Span::styled(
-            "searching…",
-            Style::default().fg(Color::Cyan),
-        ))),
+        (_, true) => lines.push(Line::from(vec![
+            theme.accent(spinner_frame(state)),
+            theme.span(" "),
+            theme.accent("searching…"),
+        ])),
         (Some(query), false) => lines.push(Line::from(format!(
             "{} result{} for {query:?}",
             state.memories.len(),
@@ -598,11 +770,8 @@ pub fn memory_lines(state: &AppState) -> Vec<Line<'static>> {
 
     for memory in &state.memories {
         lines.push(Line::from(vec![
-            Span::styled(format!("{} ", memory.id), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("({})", memory.kind),
-                Style::default().fg(Color::DarkGray),
-            ),
+            theme.accent(format!("{} ", memory.id)),
+            theme.muted(format!("({})", memory.kind)),
         ]));
         // Memory is written by agents and people; it is shown, never acted on.
         for text in memory.content.lines().take(6) {
@@ -616,7 +785,7 @@ pub fn memory_lines(state: &AppState) -> Vec<Line<'static>> {
 fn draw_memory(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(memory_lines(state))
-            .block(Block::default().borders(Borders::ALL).title(" Memory "))
+            .block(theme().titled_block(" Memory "))
             .wrap(Wrap { trim: false })
             .scroll((state.scroll, 0)),
         area,
@@ -624,36 +793,47 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let (title, content, style) = match state.input_mode {
-        InputMode::Editing => (
-            " Goal (Enter to run, Esc to cancel) ",
-            format!("> {}_", state.input),
-            Style::default().fg(Color::Yellow),
-        ),
-        InputMode::Navigating => (
-            " Goal ",
-            if state.running {
-                "running…".to_owned()
-            } else {
-                "press i to enter a goal".to_owned()
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
+    let theme = theme();
+    let editing = state.input_mode == InputMode::Editing;
+
+    let title = if editing {
+        " Goal (Enter to run, Esc to cancel) "
+    } else {
+        " Goal "
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(content, style)))
-            .block(Block::default().borders(Borders::ALL).title(title)),
-        area,
-    );
+    // The border brightens while the box owns the keystrokes.
+    let block = theme.block_with_focus(editing).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if editing {
+        let input = TextInput::from_state(TextInputState::with_value(state.input.clone()))
+            .placeholder("type a goal…")
+            .focused(true);
+        frame.render_widget(&input, inner);
+    } else if state.running {
+        let total = state.tasks.len();
+        let done = state.completed_count();
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            done as f64 / total as f64
+        };
+        let progress = Progress::from_ratio(ratio).label(format!("{done}/{total} tasks"));
+        frame.render_widget(&progress, inner);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(theme.muted("press i to enter a goal"))),
+            inner,
+        );
+    }
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let theme = theme();
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            help_line(state),
-            Style::default().fg(Color::DarkGray),
-        ))),
+        Paragraph::new(theme.help_line(help_bindings(state).iter().copied())),
         area,
     );
 }
@@ -718,6 +898,90 @@ mod tests {
         assert!(rendered.contains("1 result for \"auth\""));
         assert!(rendered.contains("notes/auth.md"));
         assert!(rendered.contains("tokens live in src/auth.rs"));
+    }
+
+    #[test]
+    fn the_models_screen_shows_the_agents_error_and_its_sign_in_methods() {
+        use cuma_core::HealthState;
+
+        let mut agent =
+            cuma_core::AgentDescriptor::new("copilot", "copilot", cuma_core::AgentProtocol::Acp);
+        agent.health.state = HealthState::Unavailable;
+        agent.health.last_error = Some(
+            "agent copilot requires authentication: sign in by running `copilot login`".to_owned(),
+        );
+        agent.metadata.insert(
+            "acp_auth_methods".to_owned(),
+            r#"[{"id":"copilot-login","kind":"terminal","description":"GitHub Copilot sign-in","invocation":"copilot login"}]"#.to_owned(),
+        );
+
+        let mut state = AppState::new();
+        state.set_agents(vec![agent]);
+
+        let list = text(&model_lines(&state));
+        assert!(list.contains("copilot"));
+        assert!(list.contains("Unavailable"));
+        assert!(list.contains("sign-in advertised"));
+
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("requires authentication"));
+        assert!(detail.contains("copilot-login"));
+        assert!(detail.contains("terminal"));
+        assert!(detail.contains("copilot login"));
+    }
+
+    #[test]
+    fn the_models_detail_names_the_environment_path_when_no_method_is_advertised() {
+        use cuma_core::HealthState;
+
+        let mut agent =
+            cuma_core::AgentDescriptor::new("kiro", "kiro", cuma_core::AgentProtocol::Acp);
+        agent.health.state = HealthState::Unavailable;
+        agent.health.last_error = Some("negotiation failed".to_owned());
+
+        let mut state = AppState::new();
+        state.set_agents(vec![agent]);
+
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("negotiation failed"));
+        assert!(detail.contains("no sign-in method"));
+        assert!(detail.contains("agents.<id>.env"));
+    }
+
+    #[test]
+    fn connecting_agents_show_pending_indicators_in_status_and_models() {
+        use cuma_core::HealthState;
+
+        let mut codex =
+            cuma_core::AgentDescriptor::new("codex", "codex", cuma_core::AgentProtocol::Acp);
+        codex.health.state = HealthState::Unknown;
+
+        let mut state = AppState::new();
+        state.set_agents(vec![codex.clone()]);
+
+        assert!(status_line(&state).contains("connecting (0/1)"));
+        let models = text(&model_lines(&state));
+        assert!(models.contains('◌'), "{models}");
+        assert!(models.contains("Connecting…"), "{models}");
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("Connecting…"), "{detail}");
+        assert!(detail.contains("background"), "{detail}");
+
+        let mut claude =
+            cuma_core::AgentDescriptor::new("claude", "claude", cuma_core::AgentProtocol::Acp);
+        claude.health.state = HealthState::Healthy;
+        state.set_agents(vec![codex, claude.clone()]);
+        assert!(status_line(&state).contains("connecting (1/2)"));
+
+        let mut codex_ready =
+            cuma_core::AgentDescriptor::new("codex", "codex", cuma_core::AgentProtocol::Acp);
+        codex_ready.health.state = HealthState::Healthy;
+        state.set_agents(vec![codex_ready, claude]);
+
+        assert!(status_line(&state).contains("idle"));
+        let ready_models = text(&model_lines(&state));
+        assert!(ready_models.contains('●'), "{ready_models}");
+        assert!(ready_models.contains("Healthy"), "{ready_models}");
     }
 
     use crate::state::TaskRow;
@@ -863,6 +1127,35 @@ mod tests {
         let rendered = render(&state);
         assert!(rendered.contains("implement OAuth"));
         assert!(rendered.contains("inspect repository"));
+    }
+
+    #[test]
+    fn the_agent_transcript_renders_markdown_with_theme_styles() {
+        let mut state = AppState::new();
+        state.transcript = "## Result\n\nplain **bold** and `code`".into();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        let bold_cells = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::BOLD))
+            .count();
+        assert!(bold_cells > 0, "markdown bold reached the buffer unstyled");
+
+        let accent = theme().palette.accent;
+        let code_cells = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == accent)
+            .count();
+        assert!(
+            code_cells > 0,
+            "markdown code spans did not pick up the theme accent"
+        );
     }
 
     #[test]

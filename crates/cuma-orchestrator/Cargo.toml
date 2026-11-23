@@ -14,7 +14,6 @@ cuma-config.workspace = true
 cuma-registry.workspace = true
 cuma-router.workspace = true
 cuma-resilience.workspace = true
-cuma-planner.workspace = true
 cuma-usage.workspace = true
 cuma-workspace.workspace = true
 async-trait.workspace = true
@@ -28,6 +27,7 @@ serde.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+cuma-planner.workspace = true
 cuma-testkit.workspace = true
 cuma-workspace.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

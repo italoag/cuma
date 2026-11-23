@@ -335,6 +335,31 @@ pub struct AgentConfig {
     pub state: Vec<String>,
     /// Variables the agent needs, by name, forwarded into its sandbox.
     pub env: Vec<String>,
+    /// How this agent's permission requests are answered, overriding
+    /// `security.agent_permission_policy`.
+    pub permission_policy: Option<AgentPermissionPolicy>,
+    /// Run this agent's terminal sign-in methods inside its sandbox rather
+    /// than on the host.
+    ///
+    /// For agents whose credential store is a file under `state` the result
+    /// is the same either way; it matters for agents that would write to a
+    /// store the sandbox hides — the OS keychain — and fall back to a file
+    /// it can see when that store is unreachable. Copilot CLI stores a
+    /// plaintext token in `~/.copilot/config.json` when the keychain fails,
+    /// which is exactly where the confined agent reads it back.
+    ///
+    /// The same reachability gates the in-band `session/authenticate`
+    /// retry: when the store is not reachable inside the sandbox the
+    /// handshake could never produce usable credentials, and a sign-in
+    /// flow that touches it — a hidden OS keychain — may crash the agent.
+    pub auth_in_sandbox: bool,
+    /// Let this agent talk to services on the host's loopback — OAuth
+    /// callback listeners and local backends its own helpers expose.
+    ///
+    /// Open: a jailed agent that can connect to loopback can reach every
+    /// host service bound to it, not just its own. ai-jail enforces it;
+    /// other runtimes share or lack loopback regardless.
+    pub loopback: bool,
 }
 
 impl Default for AgentConfig {
@@ -351,6 +376,9 @@ impl Default for AgentConfig {
             sandbox: None,
             state: Vec::new(),
             env: Vec::new(),
+            permission_policy: None,
+            auth_in_sandbox: false,
+            loopback: false,
         }
     }
 }
@@ -588,6 +616,28 @@ pub struct SecurityConfig {
     /// one is accepted, so a token can be rotated. Empty: no authentication,
     /// which is only allowed on a loopback address.
     pub a2a_server_token_refs: Vec<String>,
+    /// How agent permission requests are answered when nobody is watching.
+    /// An unattended run cannot prompt a human, so policy decides from the
+    /// task's risk instead. `agents.<id>.permission_policy` overrides it per
+    /// agent.
+    pub agent_permission_policy: AgentPermissionPolicy,
+}
+
+/// How an agent's permission requests are answered.
+///
+/// The default approves only read-only and low-risk work: `always-allow` is
+/// only appropriate for agents running inside a sandbox, which is why it is
+/// not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPermissionPolicy {
+    /// Approve everything the agent asks.
+    AlwaysAllow,
+    /// Approve read-only and low-risk work; refuse the rest.
+    #[default]
+    AllowLowRisk,
+    /// Refuse everything the agent asks.
+    AlwaysDeny,
 }
 
 impl Default for SecurityConfig {
@@ -607,6 +657,7 @@ impl Default for SecurityConfig {
             agent_sandbox: crate::sandbox::AUTO.to_owned(),
             trusted_workspaces: Vec::new(),
             a2a_server_token_refs: Vec::new(),
+            agent_permission_policy: AgentPermissionPolicy::AllowLowRisk,
         }
     }
 }
@@ -868,5 +919,36 @@ mod tests {
         assert_eq!(descriptor.models.len(), 1, "applied twice, listed once");
         assert_eq!(descriptor.models[0].id.as_str(), "gpt-x");
         assert_eq!(descriptor.metadata["team"], "platform");
+    }
+
+    #[test]
+    fn arbitrary_finite_weights_normalize_to_unit_sum_or_default() {
+        use arbitrary::{Arbitrary, Unstructured};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xC0AF_1601);
+        let mut buf = [0u8; 64];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            let mut u = Unstructured::new(&buf);
+            let Ok((q, c, l, r, x)) = <(u16, u16, u16, u16, u16)>::arbitrary(&mut u) else {
+                continue;
+            };
+            let w = RouterWeights {
+                quality: f64::from(q),
+                cost: f64::from(c),
+                latency: f64::from(l),
+                reliability: f64::from(r),
+                context: f64::from(x),
+            };
+            if w.sum() <= 0.0 {
+                assert!(w.validate().is_err());
+                assert!((w.normalized().sum() - 1.0).abs() < 1e-9);
+            } else {
+                assert!(w.validate().is_ok());
+                assert!((w.normalized().sum() - 1.0).abs() < 1e-9);
+            }
+        }
     }
 }

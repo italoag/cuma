@@ -43,7 +43,17 @@ os.execvp(argv[0], argv)
 
 #[tokio::test]
 async fn the_firecracker_relay_hides_the_boot_and_carries_a_whole_turn() {
-    if which::which("python3").is_err() {
+    // `which` alone is not enough: a shim for a missing runtime (mise,
+    // asdf) resolves on PATH yet exits nonzero on any invocation.
+    let working = which::which("python3").is_ok_and(|bin| {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    if !working {
         eprintln!("python3 is not installed; skipping the Firecracker relay test");
         return;
     }

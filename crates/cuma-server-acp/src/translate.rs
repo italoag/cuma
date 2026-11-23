@@ -3,7 +3,7 @@
 //! Both directions live here so the mapping is in one place: an ACP prompt
 //! becomes a goal, and orchestrator events become ACP session notifications.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, ContentBlock, ContentChunk, McpCapabilities, PromptCapabilities,
     PromptRequest, SessionUpdate, StopReason, TextContent,
 };
@@ -126,7 +126,7 @@ pub fn stop_reason_for(outcome: &cuma_core::error::Result<SessionResult>) -> Sto
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use agent_client_protocol::schema::v1::SessionId;
+    use agent_client_protocol::v1::schema::SessionId;
     use cuma_core::{AgentId, ErrorClass, MetaAgentError, ModelId, TaskId, TokenUsage};
 
     fn prompt(blocks: Vec<ContentBlock>) -> PromptRequest {

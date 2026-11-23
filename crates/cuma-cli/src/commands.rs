@@ -237,51 +237,6 @@ fn builtin(config: &Config, name: &str) -> Option<Arc<dyn cuma_sandbox::SandboxP
     })
 }
 
-/// One note per sandbox agents run in, naming them, for `cuma doctor`.
-/// Sandboxes that fall short are left out: their warning is a problem.
-fn agent_sandbox_notes(config: &Config) -> Vec<String> {
-    let registry = harness::sandbox_registry(config);
-    if !registry.enabled() {
-        return vec!["agents: unconfined (sandbox disabled)".to_owned()];
-    }
-    let mut groups: std::collections::BTreeMap<
-        String,
-        (Arc<dyn cuma_sandbox::SandboxProvider>, Vec<&str>),
-    > = std::collections::BTreeMap::new();
-    for (id, agent) in &config.agents {
-        if !agent.enabled || !agent.protocol.eq_ignore_ascii_case("acp") {
-            continue;
-        }
-        if let Some(provider) = registry.for_agent(id) {
-            groups
-                .entry(provider.name().to_owned())
-                .or_insert_with(|| (provider, Vec::new()))
-                .1
-                .push(id);
-        }
-    }
-    if groups.is_empty()
-        && let Some(provider) = registry.default_provider()
-    {
-        groups.insert(provider.name().to_owned(), (provider, Vec::new()));
-    }
-    groups
-        .into_values()
-        .filter(|(provider, _)| {
-            provider
-                .shortfall(&config.security.network_allowlist)
-                .is_none()
-        })
-        .map(|(provider, agents)| {
-            if agents.is_empty() {
-                provider.describe()
-            } else {
-                format!("{} [{}]", provider.describe(), agents.join(", "))
-            }
-        })
-        .collect()
-}
-
 /// MCP subcommands.
 #[derive(Subcommand)]
 pub enum McpAction {
@@ -345,9 +300,9 @@ pub async fn run_goal(
     }
 
     if orchestrator.agents().is_empty().await {
-        return Err(MetaAgentError::Configuration(harness::no_agents_reason(
-            &config,
-        )));
+        return Err(MetaAgentError::Configuration(
+            harness::no_agents_reason(&config).await,
+        ));
     }
 
     if dry_run {
@@ -541,11 +496,17 @@ async fn explain_plan(
 }
 
 /// Launch the TUI.
-pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
+///
+/// `logs` is the tap `main` installed as the tracing writer: the interface
+/// drains it onto the Logs screen, and whatever is left when it exits still
+/// goes to stderr.
+pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogTap>) -> Result<()> {
     let (orchestrator, warnings) =
-        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
+        harness::build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
     for warning in &warnings {
-        eprintln!("warning: {warning}");
+        // Log rather than `eprintln!`: the TUI may own stdout/stderr as soon as
+        // `run_with` starts, and `LogTap` drains tracing onto the Logs screen.
+        tracing::warn!("{warning}");
     }
 
     let skills = if config.skills.enabled {
@@ -560,7 +521,49 @@ pub async fn chat(config: Config, workspace: PathBuf) -> Result<()> {
         .enabled
         .then(|| harness::memory_store(&config, &workspace));
 
-    cuma_tui::run_with(orchestrator, cuma_tui::Sources { skills, memory }).await
+    let orchestrator = Arc::new(orchestrator);
+    let bg_orchestrator = Arc::clone(&orchestrator);
+    let bg_config = config.clone();
+    let bg_workspace = workspace.clone();
+    let bg_probe = tokio::spawn(async move {
+        let memory_check = async {
+            if bg_config.memory.enabled {
+                let store = harness::memory_store(&bg_config, &bg_workspace);
+                if !store.is_available().await {
+                    tracing::warn!("{}", harness::MEMORY_UNREACHABLE);
+                }
+            }
+        };
+        let (probe_warnings, ()) = tokio::join!(bg_orchestrator.probe_all_agents(), memory_check);
+        for warning in probe_warnings {
+            tracing::warn!("{warning}");
+        }
+    });
+
+    let outcome = cuma_tui::run_with(
+        Arc::clone(&orchestrator),
+        cuma_tui::Sources {
+            skills,
+            memory,
+            logs: logs
+                .as_ref()
+                .map(|tap| Arc::new(tap.clone()) as Arc<dyn cuma_tui::LogSource>),
+            auth: Some(Arc::new(crate::auth::CliAuth::new(orchestrator))),
+        },
+    )
+    .await;
+
+    bg_probe.abort();
+
+    // The terminal is restored by now, so lines the loop had not drained yet
+    // — including whatever an error path logged — still reach stderr.
+    if let Some(tap) = logs {
+        for line in cuma_tui::LogSource::drain(&tap) {
+            eprintln!("{line}");
+        }
+    }
+
+    outcome
 }
 
 /// The skill manager, as the TUI's Skills screen sees it.
@@ -610,7 +613,7 @@ pub async fn serve(
 ) -> Result<()> {
     let database = harness::database_path(&config, &workspace);
     let (orchestrator, warnings) =
-        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
+        harness::build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
 
     // Warnings go to stderr: stdout carries the protocol.
     for warning in &warnings {
@@ -620,7 +623,7 @@ pub async fn serve(
     if orchestrator.agents().is_empty().await {
         return Err(MetaAgentError::Configuration(format!(
             "refusing to serve with nothing to route to — {}",
-            harness::no_agents_reason(&config)
+            harness::no_agents_reason(&config).await
         )));
     }
 
@@ -643,6 +646,12 @@ pub async fn serve(
                 orchestrator,
                 workspace_builder(config, workspace, overrides.clone()),
             );
+            let bg_orchestrator = workspaces.default_orchestrator();
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
             cuma_server_acp::serve_stdio_workspaces(
                 workspaces,
                 cuma_server_acp::SessionRegistry::persistent(sessions_dir),
@@ -680,12 +689,17 @@ pub async fn serve(
                 );
             }
 
-            let mut server = cuma_protocol_a2a::A2aServer::new(
-                Arc::new(orchestrator),
-                &format!("http://{address}"),
-            )
-            .await
-            .with_bearer_tokens(tokens);
+            let orchestrator = Arc::new(orchestrator);
+            let bg_orchestrator = Arc::clone(&orchestrator);
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
+            let mut server =
+                cuma_protocol_a2a::A2aServer::new(orchestrator, &format!("http://{address}"))
+                    .await
+                    .with_bearer_tokens(tokens);
             if let Some(store) = store {
                 server = server.with_store(store);
             }
@@ -696,7 +710,14 @@ pub async fn serve(
                 "serving CUMA's tools over MCP on stdio ({} agents behind them)",
                 orchestrator.agents().len().await
             );
-            let tools = crate::mcp_tools::OrchestratorTools::new(std::sync::Arc::new(orchestrator));
+            let orchestrator = Arc::new(orchestrator);
+            let bg_orchestrator = Arc::clone(&orchestrator);
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
+            let tools = crate::mcp_tools::OrchestratorTools::new(orchestrator);
             cuma_protocol_mcp::ToolServer::new("cuma", std::sync::Arc::new(tools))
                 .with_instructions(
                     "CUMA routes software-engineering goals across coding agents. \
@@ -737,7 +758,7 @@ fn workspace_builder(
                 return Err(MetaAgentError::Configuration(format!(
                     "{}: {}",
                     workspace.display(),
-                    harness::no_agents_reason(&config)
+                    harness::no_agents_reason(&config).await
                 )));
             }
             Ok(orchestrator)
@@ -1405,185 +1426,6 @@ pub async fn usage(config: Config, workspace: PathBuf, by_model: bool, json: boo
     Ok(())
 }
 
-/// Check the installation.
-pub async fn doctor(
-    config: Config,
-    workspace: PathBuf,
-    sources: Vec<cuma_config::ConfigSource>,
-    json: bool,
-) -> Result<()> {
-    let mut problems: Vec<String> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-
-    // --- configuration ----------------------------------------------------
-    for source in &sources {
-        notes.push(match source {
-            cuma_config::ConfigSource::Default => "config: built-in defaults".to_owned(),
-            cuma_config::ConfigSource::File(path) => format!("config: {}", path.display()),
-            cuma_config::ConfigSource::Environment => "config: CUMA_* environment".to_owned(),
-        });
-    }
-
-    // --- agents -----------------------------------------------------------
-    let (orchestrator, warnings) =
-        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
-    problems.extend(warnings);
-
-    let snapshot = orchestrator.agents().snapshot().await;
-    if snapshot.is_empty() {
-        problems.push(harness::no_agents_reason(&config));
-    } else {
-        notes.push(format!(
-            "agents: {} registered, {} routable",
-            snapshot.len(),
-            snapshot.routable().count()
-        ));
-
-        for agent in snapshot.all() {
-            if !agent.is_routable() {
-                problems.push(format!(
-                    "agent {} is not routable ({:?}){}",
-                    agent.id,
-                    agent.health.state,
-                    agent
-                        .health
-                        .last_error
-                        .as_ref()
-                        .map_or(String::new(), |e| format!(": {e}"))
-                ));
-            }
-        }
-    }
-
-    // --- database ---------------------------------------------------------
-    let database = harness::database_path(&config, &workspace);
-    match cuma_persistence::RuntimeStore::open(&database) {
-        Ok(store) => notes.push(format!(
-            "database: {} ({} sessions recorded)",
-            database.display(),
-            store.session_count().unwrap_or(0)
-        )),
-        Err(err) => problems.push(format!("database at {}: {err}", database.display())),
-    }
-
-    // --- memory -----------------------------------------------------------
-    let memory = harness::memory_store(&config, &workspace);
-    if config.memory.enabled {
-        if memory.is_available().await {
-            notes.push(format!("memory: {} is reachable", config.memory.backend));
-        } else {
-            problems.push(format!(
-                "memory is enabled but {} is not reachable",
-                config.memory.backend
-            ));
-        }
-    } else {
-        notes.push("memory: disabled".to_owned());
-    }
-
-    // --- workspace safety -------------------------------------------------
-    if orchestrator.is_git_repository().await {
-        notes.push(format!(
-            "workspace: git repository{}",
-            if config.security.checkpoint_before_write {
-                ", checkpointing before writes"
-            } else {
-                ", NOT checkpointing (security.checkpoint_before_write is off)"
-            }
-        ));
-    } else {
-        problems.push(
-            "workspace is not a git repository; agents' changes will not be recoverable".to_owned(),
-        );
-    }
-
-    // --- sandbox and RTK --------------------------------------------------
-    let sandbox = orchestrator.sandbox_status();
-    if sandbox.is_active() || matches!(sandbox, cuma_workspace::SandboxStatus::Disabled) {
-        notes.push(sandbox.describe());
-    } else {
-        // Requested but unavailable is exactly the case an operator must not
-        // discover by having something escape.
-        problems.push(sandbox.describe());
-    }
-
-    // Each sandbox agents run in, with the agents in it. A shortfall already
-    // reached `problems` through the build warnings.
-    notes.extend(agent_sandbox_notes(&config));
-
-    let rtk = orchestrator.rtk_status();
-    if rtk.is_fatal() || matches!(rtk, cuma_workspace::RtkStatus::Unverified { .. }) {
-        problems.push(rtk.describe());
-    } else {
-        notes.push(rtk.describe());
-    }
-    if rtk.is_active() {
-        let measured = cuma_workspace::Rtk::detect(&config.rtk).measured_gain(Some(&workspace));
-        match measured {
-            Some(gain) if gain.total_commands > 0 => notes.push(format!(
-                "RTK measured in this project: {} commands, {} tokens saved ({:.0}% on average)",
-                gain.total_commands, gain.total_saved, gain.avg_savings_pct
-            )),
-            _ => notes.push("RTK has not filtered anything in this project yet".to_owned()),
-        }
-        // CUMA wraps the commands it runs itself; agents run their own shell
-        // commands, which only RTK's per-agent hooks can reach.
-        notes.push(
-            "RTK hooks: agents filter their own shell output only once hooked — \
-             `rtk init -g` for Claude Code, `rtk init -g --agent <name>` for others"
-                .to_owned(),
-        );
-    }
-
-    // --- security ---------------------------------------------------------
-    notes.push(format!(
-        "security: destructive operations {}",
-        if config.security.allow_destructive_operations {
-            "ALLOWED"
-        } else {
-            "denied"
-        }
-    ));
-
-    if config.security.allow_destructive_operations {
-        problems.push(
-            "security.allow_destructive_operations is on; agents may run destructive commands"
-                .to_owned(),
-        );
-    }
-
-    // --- report -----------------------------------------------------------
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "healthy": problems.is_empty(),
-                "notes": notes,
-                "problems": problems,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        for note in &notes {
-            println!("  ok   {note}");
-        }
-        for problem in &problems {
-            println!("  WARN {problem}");
-        }
-        println!();
-        println!(
-            "{}",
-            if problems.is_empty() {
-                "Everything checks out."
-            } else {
-                "Some things need attention (see WARN above)."
-            }
-        );
-    }
-
-    Ok(())
-}
-
 /// MCP subcommands.
 pub async fn mcp(config: Config, action: McpAction, json: bool) -> Result<()> {
     use cuma_core::ports::ToolProvider;
@@ -1700,7 +1542,7 @@ pub async fn mcp(config: Config, action: McpAction, json: bool) -> Result<()> {
 }
 
 /// Where the ACP registry is cached between runs.
-fn registry_cache(workspace: &std::path::Path) -> PathBuf {
+pub(crate) fn registry_cache(workspace: &std::path::Path) -> PathBuf {
     workspace
         .join(".cuma")
         .join("cache")

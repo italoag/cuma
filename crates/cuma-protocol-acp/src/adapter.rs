@@ -2,21 +2,23 @@
 
 use crate::capabilities::capabilities_from_initialize;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
+    AuthCapabilities, AuthMethod, AuthenticateRequest, ClientCapabilities, ContentBlock,
+    InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent, Usage,
     UsageUpdate,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent, UntypedMessage};
 use async_trait::async_trait;
 use cuma_core::error::{MetaAgentError, Result};
 use cuma_core::ports::{
     AgentAdapter, ExecutionRequest, ExecutionUpdate, LaunchPurpose, SandboxLaunch,
 };
 use cuma_core::{
-    AgentDescriptor, AgentId, AgentProtocol, AttemptId, ErrorClass, ExecutionOutcome, Risk,
-    TokenUsage,
+    AgentDescriptor, AgentId, AgentProtocol, AttemptId, AuthMethodInfo, AuthMethodKind, ErrorClass,
+    ExecutionOutcome, ModelDescriptor, Risk, TokenUsage,
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -49,6 +51,16 @@ impl PermissionPolicy {
     }
 }
 
+impl From<cuma_config::AgentPermissionPolicy> for PermissionPolicy {
+    fn from(policy: cuma_config::AgentPermissionPolicy) -> Self {
+        match policy {
+            cuma_config::AgentPermissionPolicy::AlwaysAllow => Self::AlwaysAllow,
+            cuma_config::AgentPermissionPolicy::AllowLowRisk => Self::AllowLowRisk,
+            cuma_config::AgentPermissionPolicy::AlwaysDeny => Self::AlwaysDeny,
+        }
+    }
+}
+
 /// Drives one ACP agent.
 ///
 /// A fresh process is spawned per execution rather than held open across
@@ -66,6 +78,12 @@ pub struct AcpAdapter {
     launcher: Option<Arc<dyn AgentLauncher>>,
     /// Environment variables the agent needs beyond a sandbox's baseline.
     kept_env: Vec<String>,
+    /// Credentials written inside the sandbox are what the agent later
+    /// reads — `agents.<id>.auth_in_sandbox`. When false the in-band
+    /// `session/authenticate` handshake is skipped: it could never produce
+    /// usable credentials, and a sign-in flow that touches a store the
+    /// sandbox hides may crash the agent outright.
+    auth_in_sandbox: bool,
 }
 
 /// Starts agents confined to the directory they work in.
@@ -160,6 +178,7 @@ impl AcpAdapter {
             mcp_servers: Vec::new(),
             launcher: None,
             kept_env: Vec::new(),
+            auth_in_sandbox: false,
         }
     }
 
@@ -254,7 +273,11 @@ impl AcpAdapter {
                 if path.is_absolute() {
                     Some(path.to_path_buf())
                 } else if index == 0 && !elsewhere {
-                    which::which(word).ok()
+                    // Canonicalized: `which` answers shims and symlinks whose
+                    // targets the sandbox must see, not the link itself.
+                    which::which(word)
+                        .ok()
+                        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
                 } else {
                     None
                 }
@@ -295,6 +318,14 @@ impl AcpAdapter {
     #[must_use]
     pub fn with_permission_policy(mut self, policy: PermissionPolicy) -> Self {
         self.permission_policy = policy;
+        self
+    }
+
+    /// Whether the agent's credential store is reachable inside its own
+    /// sandbox — gates the in-band `session/authenticate` handshake.
+    #[must_use]
+    pub fn with_auth_in_sandbox(mut self, auth_in_sandbox: bool) -> Self {
+        self.auth_in_sandbox = auth_in_sandbox;
         self
     }
 
@@ -459,6 +490,259 @@ fn reported_cost(report: &UsageUpdate) -> Option<f64> {
         .then_some(cost.amount)
 }
 
+/// Why a launch's finish failed, as part of a task's failure.
+fn uncollected(err: &MetaAgentError) -> String {
+    format!("the agent's work could not be brought back from its sandbox: {err}")
+}
+
+/// Which kind of failure an ACP wire error represents.
+///
+/// The wire distinguishes three very different situations that used to be
+/// flattened into `ProtocolError`: an agent whose own credentials are missing,
+/// an actual protocol violation, and an agent that answered correctly but
+/// reported trouble on its side (an unavailable registry, a service outage).
+/// The last kind is classified from the agent's own text by the resilience
+/// layer, so it is surfaced as [`MetaAgentError::Other`] — `Unknown` —
+/// rather than prejudged as a protocol fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnFailure {
+    /// `AUTH_REQUIRED`: this agent's credentials are missing or rejected.
+    /// The next agent may hold different ones — reroutable, never retryable.
+    Authentication,
+    /// A real JSON-RPC violation: the wire itself was spoken incorrectly.
+    Protocol,
+    /// The agent answered correctly but reported a problem of its own.
+    AgentSide,
+}
+
+/// Classify a wire error without losing the distinction the agent sent us.
+fn failure_kind(err: &agent_client_protocol::Error) -> TurnFailure {
+    use agent_client_protocol::ErrorCode;
+    if err.code == ErrorCode::AUTH_REQUIRED {
+        return TurnFailure::Authentication;
+    }
+    if err.code == ErrorCode::PARSE_ERROR
+        || err.code == ErrorCode::INVALID_REQUEST
+        || err.code == ErrorCode::METHOD_NOT_FOUND
+        || err.code == ErrorCode::INVALID_PARAMS
+    {
+        return TurnFailure::Protocol;
+    }
+    TurnFailure::AgentSide
+}
+
+impl TurnFailure {
+    /// Build the harness error for this failure, tagging it with the agent.
+    fn into_meta(self, agent_id: &str, detail: String) -> MetaAgentError {
+        match self {
+            Self::Authentication => MetaAgentError::Authentication {
+                target: agent_id.to_owned(),
+                message: detail,
+            },
+            Self::Protocol => MetaAgentError::protocol_msg("acp", detail),
+            Self::AgentSide => MetaAgentError::Other(detail),
+        }
+    }
+}
+
+/// Collect the models an agent advertised in its `session/new` reply.
+///
+/// ACP moved model advertisement more than once: agents on the newer schema
+/// send a `configOptions` select whose `category` is `model`, while agents
+/// still on the older shape send a `models.availableModels` list the typed
+/// schema no longer carries. Both are read from the raw reply — some agents
+/// send the two together, so entries dedupe by id.
+fn models_from_session_new(raw: &serde_json::Value, agent_id: &AgentId) -> Vec<ModelDescriptor> {
+    let mut found: std::collections::BTreeMap<String, ModelDescriptor> =
+        std::collections::BTreeMap::new();
+    let mut take = |entry: &serde_json::Value| {
+        let id = entry
+            .get("value")
+            .or_else(|| entry.get("modelId"))
+            .or_else(|| entry.get("id"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(id) = id
+            && !found.contains_key(id)
+        {
+            let name = entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(id);
+            found.insert(
+                id.to_owned(),
+                ModelDescriptor::minimal(agent_id.clone(), id, name),
+            );
+        }
+    };
+
+    if let Some(options) = raw.get("configOptions").and_then(|v| v.as_array()) {
+        for option in options {
+            let is_model_selector = option.get("category").and_then(|c| c.as_str())
+                == Some("model")
+                || option.get("id").and_then(|i| i.as_str()) == Some("model");
+            if !is_model_selector {
+                continue;
+            }
+            if let Some(choices) = option.get("options").and_then(|v| v.as_array()) {
+                for choice in choices {
+                    // A select's options arrive flat, or grouped one level
+                    // deep under a `group`/`name` pair.
+                    match choice.get("options").and_then(|v| v.as_array()) {
+                        Some(grouped) => grouped.iter().for_each(&mut take),
+                        None => take(choice),
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(available) = raw
+        .pointer("/models/availableModels")
+        .and_then(|v| v.as_array())
+    {
+        available.iter().for_each(&mut take);
+    }
+
+    found.into_values().collect()
+}
+
+/// The model an agent said it would run, when it said.
+fn current_model_id(raw: &serde_json::Value) -> Option<String> {
+    raw.pointer("/models/currentModelId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            raw.get("configOptions")?.as_array()?.iter().find_map(|o| {
+                let is_model_selector = o.get("category").and_then(|c| c.as_str()) == Some("model")
+                    || o.get("id").and_then(|i| i.as_str()) == Some("model");
+                if !is_model_selector {
+                    return None;
+                }
+                o.get("currentValue")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+}
+
+/// What CUMA can do for the agent, declared at `initialize`.
+///
+/// `auth.terminal` is honest: `cuma auth` reproduces the configured
+/// invocation on the user's real terminal — outside the sandbox, where the
+/// agent's own credential store lives.
+fn initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true)))
+}
+
+/// Run `authenticate` once for every agent-managed method the agent
+/// advertised.
+///
+/// `terminal` methods are skipped on purpose: per the spec the user runs them
+/// in a terminal and the client must not send them to `authenticate`. A
+/// declined method is only logged — the retried `session/new` decides whether
+/// the handshake was actually needed and whether it worked.
+async fn authenticate_with_advertised_methods(
+    connection: &ConnectionTo<Agent>,
+    methods: &[AuthMethod],
+) {
+    for method in methods {
+        let AuthMethod::Agent(agent) = method else {
+            continue;
+        };
+        match connection
+            .send_request(AuthenticateRequest::new(agent.id.clone()))
+            .block_task()
+            .await
+        {
+            Ok(_) => tracing::debug!(method = %agent.id.0, "agent accepted authenticate"),
+            Err(err) => {
+                tracing::debug!(method = %agent.id.0, error = %err, "agent declined authenticate")
+            }
+        }
+    }
+}
+
+/// The agent's advertised sign-in methods, as the interface presents them.
+///
+/// An unofficial `_meta.terminal-auth` block names the exact login invocation
+/// and outranks the generic shape — it is the agent speaking most precisely
+/// about its own sign-in. Per the spec a `terminal` method means the
+/// configured agent invocation plus the method's `args`.
+fn auth_method_infos(methods: &[AuthMethod], command: &str) -> Vec<AuthMethodInfo> {
+    methods
+        .iter()
+        .map(|method| {
+            let info = |kind: AuthMethodKind, invocation: Option<String>| AuthMethodInfo {
+                id: method.id().0.to_string(),
+                kind,
+                description: method.description().map(str::to_owned),
+                invocation,
+            };
+            if let Some(invocation) = method.meta().and_then(terminal_auth_invocation) {
+                return info(AuthMethodKind::Terminal, Some(invocation));
+            }
+            match method {
+                // Per the spec a `terminal` method is run by the user in a
+                // terminal — the client must not send it to `authenticate`.
+                AuthMethod::Terminal(terminal) => {
+                    let program = command.split_whitespace().next().unwrap_or(command);
+                    let args = terminal.args.join(" ");
+                    let invocation = if args.is_empty() {
+                        program.to_owned()
+                    } else {
+                        format!("{program} {args}")
+                    };
+                    info(AuthMethodKind::Terminal, Some(invocation))
+                }
+                AuthMethod::Agent(_) => info(AuthMethodKind::Agent, None),
+                _ => info(AuthMethodKind::Other, None),
+            }
+        })
+        .collect()
+}
+
+/// The sign-in instruction an agent advertised, turned into user guidance.
+///
+/// Per the spec a `terminal` method is run by the user in a terminal — the
+/// client must not send it to `session/authenticate`. Some agents carry the
+/// same idea in an unofficial `_meta.terminal-auth` block instead (copilot
+/// does), and agent-managed methods get their description quoted verbatim.
+fn auth_hint(methods: &[AuthMethod], command: &str) -> String {
+    for info in auth_method_infos(methods, command) {
+        if info.kind == AuthMethodKind::Terminal
+            && let Some(invocation) = info.invocation
+        {
+            return format!(": sign in by running `{invocation}` in a terminal");
+        }
+    }
+    methods
+        .first()
+        .and_then(|m| m.description().map(|d| format!(": {d}")))
+        .unwrap_or_default()
+}
+
+/// An invocation from an unofficial `_meta.terminal-auth` block, when sent.
+fn terminal_auth_invocation(meta: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let terminal = meta.get("terminal-auth")?;
+    let cmd = terminal.get("command").and_then(|c| c.as_str())?;
+    let args = terminal
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    Some(if args.is_empty() {
+        cmd.to_owned()
+    } else {
+        format!("{cmd} {args}")
+    })
+}
+
 /// Map an ACP stop reason onto success or a classified failure.
 fn interpret_stop_reason(reason: StopReason) -> std::result::Result<(), (ErrorClass, String)> {
     match reason {
@@ -514,6 +798,7 @@ impl AgentAdapter for AcpAdapter {
 
         let risk = request.task.spec.risk;
         let policy = self.permission_policy;
+        let auth_in_sandbox = self.auth_in_sandbox;
         let prompt_text = request.prompt.clone();
         let workspace = request.workspace.clone();
         let agent_id = self.id.clone();
@@ -532,7 +817,7 @@ impl AgentAdapter for AcpAdapter {
         let updates_for_handler = updates.clone();
 
         let turn = agent_client_protocol::Client
-            .builder()
+            .v1()
             .name("cuma")
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
@@ -579,15 +864,33 @@ impl AgentAdapter for AcpAdapter {
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                let init = connection
+                    .send_request(initialize_request())
                     .block_task()
                     .await?;
 
-                let session = connection
-                    .send_request(NewSessionRequest::new(workspace).mcp_servers(mcp_servers))
+                let new_session = NewSessionRequest::new(workspace).mcp_servers(mcp_servers);
+                let session = match connection
+                    .send_request(new_session.clone())
                     .block_task()
-                    .await?;
+                    .await
+                {
+                    Err(err) if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED => {
+                        // The agent asked for its own login handshake: run
+                        // every agent-managed method it advertised, then ask
+                        // once more — but only where the credentials it
+                        // writes are the ones later launches read back; an
+                        // agent whose store the sandbox hides could never
+                        // finish it, and the attempt may kill it outright.
+                        // A second refusal propagates as-is.
+                        if auth_in_sandbox {
+                            authenticate_with_advertised_methods(&connection, &init.auth_methods)
+                                .await;
+                        }
+                        connection.send_request(new_session).block_task().await?
+                    }
+                    session => session?,
+                };
 
                 let response = connection
                     .send_request(PromptRequest::new(
@@ -600,11 +903,14 @@ impl AgentAdapter for AcpAdapter {
                 Ok((response.stop_reason, response.usage))
             })
             .await
+            // The wire distinguishes an agent that lacks credentials from
+            // one that broke the protocol; keep that distinction so the
+            // resilience layer reacts to what actually failed.
             .map_err(|err| {
-                // An ACP-level error is a transport or protocol failure. The
-                // orchestrator re-classifies from the message when this comes
-                // back as a generic protocol error.
-                MetaAgentError::protocol_msg("acp", format!("agent {agent_id} failed: {err}"))
+                (
+                    failure_kind(&err),
+                    format!("agent {agent_id} failed: {err}"),
+                )
             });
 
         // The sandbox must not outlive the turn, and the agent's work comes
@@ -616,11 +922,15 @@ impl AgentAdapter for AcpAdapter {
         };
         let (stop_reason, turn_usage) = match turn {
             Ok(turn) => turn,
-            Err(err) => {
-                if let Err(collect) = collected {
-                    tracing::warn!(agent = %self.id, error = %collect, "closing the sandbox failed too");
-                }
-                return Err(err);
+            // Both failures are reported: work that could not come back — a
+            // conflict kept under .cuma/sandbox-results, say — must not hide
+            // behind the turn's own failure.
+            Err((kind, detail)) => {
+                let detail = match collected {
+                    Ok(()) => detail,
+                    Err(collect) => format!("{detail}; {}", uncollected(&collect)),
+                };
+                return Err(kind.into_meta(self.id.as_str(), detail));
             }
         };
 
@@ -639,15 +949,18 @@ impl AgentAdapter for AcpAdapter {
         let (success, failure_class, failure_reason) =
             match (interpret_stop_reason(stop_reason), collected) {
                 (Ok(()), Ok(())) => (true, None, None),
-                (Err((class, reason)), _) => (false, Some(class), Some(reason)),
+                (Err((class, reason)), Ok(())) => (false, Some(class), Some(reason)),
+                (Err((class, reason)), Err(err)) => (
+                    false,
+                    Some(class),
+                    Some(format!("{reason}; {}", uncollected(&err))),
+                ),
                 // The agent finished, but its work did not reach the
                 // workspace: the task did not happen.
                 (Ok(()), Err(err)) => (
                     false,
                     Some(ErrorClass::TaskFailure),
-                    Some(format!(
-                        "the agent's work could not be brought back from its sandbox: {err}"
-                    )),
+                    Some(uncollected(&err)),
                 ),
             };
 
@@ -677,6 +990,19 @@ impl AgentAdapter for AcpAdapter {
         }
         Ok(())
     }
+
+    async fn authenticate(&self, method_id: &str) -> Result<()> {
+        AcpAdapter::authenticate(self, method_id).await
+    }
+
+    fn sandbox_prefix(&self, workspace: &Path) -> Option<Vec<String>> {
+        let (launcher, parts) = (self.launcher.as_ref()?, self.command_parts()?);
+        Some(launcher.prefix(workspace, &parts.keep, &parts.readable))
+    }
+
+    async fn refresh(&self) -> Result<AgentDescriptor> {
+        self.refresh_capabilities().await
+    }
 }
 
 impl AcpAdapter {
@@ -691,15 +1017,53 @@ impl AcpAdapter {
         let (command, launch) = self.open_launch(&here, LaunchPurpose::Negotiate).await?;
         let agent = self.spawn_handle(&command)?;
         let agent_id = self.id.clone();
+        let auth_in_sandbox = self.auth_in_sandbox;
+        let mcp_servers: Vec<McpServer> = self
+            .mcp_servers
+            .iter()
+            .map(SharedMcpServer::to_acp)
+            .collect();
 
-        let response = agent_client_protocol::Client
-            .builder()
+        let exchange = agent_client_protocol::Client
+            .v1()
             .name("cuma")
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                let response = connection
+                    .send_request(initialize_request())
                     .block_task()
-                    .await
+                    .await?;
+
+                // `session/new` is where an agent advertises its models. The
+                // typed schema no longer carries the legacy `models` field
+                // that some agents still send, so the call goes out untyped
+                // and both shapes are read from the raw reply. The failure
+                // is kept rather than propagated: an agent that cannot open
+                // a session here may simply need authentication, and that is
+                // decided by the caller, not by losing the `initialize`
+                // result with it.
+                let new_session = NewSessionRequest::new(here.clone()).mcp_servers(mcp_servers);
+                let session = connection
+                    .send_request(UntypedMessage::new("session/new", new_session.clone())?)
+                    .block_task()
+                    .await;
+                let session = match session {
+                    Err(err) if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED => {
+                        if auth_in_sandbox {
+                            authenticate_with_advertised_methods(
+                                &connection,
+                                &response.auth_methods,
+                            )
+                            .await;
+                        }
+                        connection
+                            .send_request(UntypedMessage::new("session/new", new_session)?)
+                            .block_task()
+                            .await
+                    }
+                    session => session,
+                };
+
+                Ok((response, session))
             })
             .await;
         if let Some(launch) = launch
@@ -707,7 +1071,7 @@ impl AcpAdapter {
         {
             tracing::warn!(agent = %self.id, error = %err, "closing the negotiation sandbox failed");
         }
-        let response = response.map_err(|err| {
+        let (response, session) = exchange.map_err(|err| {
             MetaAgentError::protocol_msg(
                 "acp",
                 format!("agent {agent_id}: initialize failed: {err}"),
@@ -739,7 +1103,85 @@ impl AcpAdapter {
             .metadata
             .insert("acp_command".to_owned(), self.command.clone());
 
+        // Persisted even when the session probe below fails — how the agent
+        // signs in is exactly what an unavailable agent's row must explain.
+        if let Ok(methods) =
+            serde_json::to_string(&auth_method_infos(&response.auth_methods, &self.command))
+        {
+            descriptor
+                .metadata
+                .insert("acp_auth_methods".to_owned(), methods);
+        }
+
+        match session {
+            Ok(raw) => {
+                for model in models_from_session_new(&raw, &self.id) {
+                    if !descriptor.models.iter().any(|m| m.id == model.id) {
+                        descriptor.models.push(model);
+                    }
+                }
+                if let Some(current) = current_model_id(&raw) {
+                    descriptor
+                        .metadata
+                        .insert("acp_current_model".to_owned(), current);
+                }
+            }
+            Err(err) if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED => {
+                // This agent cannot open a session without credentials —
+                // execution would fail the same way, so the caller marks it
+                // unavailable with the sign-in step the agent itself named.
+                return Err(MetaAgentError::Authentication {
+                    target: self.id.to_string(),
+                    message: format!(
+                        "agent {agent_id} requires authentication{}",
+                        auth_hint(&response.auth_methods, &self.command)
+                    ),
+                });
+            }
+            Err(err) => {
+                // Any other session failure does not condemn the agent:
+                // `initialize` succeeded and `execute` opens its own session
+                // anyway. Models stay unknown rather than fabricated.
+                tracing::warn!(
+                    agent = %self.id,
+                    error = %err,
+                    "model discovery session failed; models stay undiscovered"
+                );
+            }
+        }
+
         Ok(descriptor.clone())
+    }
+
+    /// Ask the agent to run an advertised agent-managed sign-in method.
+    ///
+    /// The connection is made without the sandbox on purpose: the method is
+    /// where credentials are created, and a sandbox that cannot see the
+    /// platform's credential store (the macOS Keychain, say) would write them
+    /// somewhere the agent cannot later read.
+    async fn authenticate(&self, method_id: &str) -> Result<()> {
+        let id = agent_client_protocol::v1::schema::AuthMethodId::new(method_id);
+        let agent = self.spawn_handle(&self.command)?;
+        let agent_id = self.id.clone();
+        agent_client_protocol::Client
+            .v1()
+            .name("cuma")
+            .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(initialize_request())
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(AuthenticateRequest::new(id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| MetaAgentError::Authentication {
+                target: agent_id.to_string(),
+                message: format!("authentication `{method_id}` failed: {err}"),
+            })
     }
 }
 
@@ -747,7 +1189,7 @@ impl AcpAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use agent_client_protocol::schema::v1::Cost;
+    use agent_client_protocol::v1::schema::Cost;
 
     #[test]
     fn a_sandboxed_agent_is_launched_under_its_prefix_with_quoting_intact() {
@@ -776,6 +1218,25 @@ mod tests {
                 "@agentclientprotocol/claude-agent-acp@latest"
             ]
         );
+    }
+
+    #[test]
+    fn the_sandbox_prefix_is_what_a_sign_in_runs_under() {
+        let adapter = AcpAdapter::new("copilot", "copilot --acp").with_launch_prefix(vec![
+            "ai-jail".into(),
+            "--exec".into(),
+            "--".into(),
+        ]);
+        assert_eq!(
+            adapter.sandbox_prefix(Path::new("/work")).unwrap(),
+            vec!["ai-jail", "--exec", "--"]
+        );
+    }
+
+    #[test]
+    fn an_unsandboxed_agent_offers_no_sign_in_prefix() {
+        let adapter = AcpAdapter::new("copilot", "copilot --acp");
+        assert!(adapter.sandbox_prefix(Path::new("/work")).is_none());
     }
 
     #[test]
@@ -997,6 +1458,155 @@ mod tests {
         assert_eq!(adapter.agent_id(), &AgentId::new("codex"));
     }
 
+    // --- session/new model discovery and wire-error classification ---------
+
+    #[test]
+    fn an_auth_required_wire_error_is_authentication_not_a_protocol_fault() {
+        use agent_client_protocol::{Error, ErrorCode};
+        let err = Error::new(ErrorCode::AUTH_REQUIRED, "Authentication required");
+
+        assert_eq!(failure_kind(&err), TurnFailure::Authentication);
+        let meta = failure_kind(&err).into_meta("copilot", err.message.clone());
+        assert_eq!(meta.class(), ErrorClass::AuthenticationFailure);
+        assert!(
+            meta.class().is_reroutable(),
+            "the next agent may hold different credentials"
+        );
+        assert!(!meta.class().is_retryable_on_same_target());
+    }
+
+    #[test]
+    fn a_json_rpc_violation_is_the_only_failure_called_protocol() {
+        use agent_client_protocol::{Error, ErrorCode};
+        for code in [
+            ErrorCode::PARSE_ERROR,
+            ErrorCode::INVALID_REQUEST,
+            ErrorCode::METHOD_NOT_FOUND,
+            ErrorCode::INVALID_PARAMS,
+        ] {
+            let err = Error::new(code, "wire fault");
+            assert_eq!(
+                failure_kind(&err),
+                TurnFailure::Protocol,
+                "{} is a wire violation",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_the_agent_reported_is_not_prejudged_as_protocol() {
+        use agent_client_protocol::{Error, ErrorCode};
+        // Kiro's registry outage arrives exactly like this.
+        let err = Error::new(
+            ErrorCode::INTERNAL_ERROR,
+            "Kiro could not load the available models",
+        );
+        assert_eq!(failure_kind(&err), TurnFailure::AgentSide);
+        let meta = failure_kind(&err).into_meta("kiro", err.message.clone());
+        assert_eq!(
+            meta.class(),
+            ErrorClass::Unknown,
+            "the resilience classifier decides from the text"
+        );
+    }
+
+    #[test]
+    fn models_sent_in_either_shape_are_collected_once() {
+        let raw = serde_json::json!({
+            "sessionId": "s1",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "alpha",
+                "options": [
+                    {"value": "alpha", "name": "Alpha"},
+                    {"name": "GPT group", "options": [
+                        {"value": "beta", "name": "Beta"},
+                    ]},
+                ],
+            }, {
+                "id": "mode",
+                "category": "mode",
+                "type": "select",
+                "options": [{"value": "normal"}],
+            }],
+            "models": {
+                "currentModelId": "alpha",
+                "availableModels": [
+                    {"modelId": "gamma", "name": "Gamma"},
+                    {"modelId": "alpha", "name": "Alpha"},
+                ],
+            },
+        });
+
+        let models = models_from_session_new(&raw, &AgentId::new("agent"));
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["alpha", "beta", "gamma"], "deduped and sorted");
+        assert!(
+            models.iter().all(|m| m.agent_id == AgentId::new("agent")),
+            "every model knows its agent"
+        );
+        assert_eq!(current_model_id(&raw).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn the_current_model_is_read_from_whichever_shape_the_agent_sent() {
+        // configOptions only — what junie sends.
+        let raw = serde_json::json!({
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "junie-1",
+                "options": [{"value": "junie-1"}],
+            }],
+        });
+        assert_eq!(current_model_id(&raw).as_deref(), Some("junie-1"));
+
+        let none = serde_json::json!({"sessionId": "s1"});
+        assert_eq!(current_model_id(&none), None);
+    }
+
+    #[test]
+    fn a_terminal_auth_marker_quotes_the_exact_invocation() {
+        let method: AuthMethod = serde_json::from_value(serde_json::json!({
+            "id": "copilot-login",
+            "name": "Log in",
+            "_meta": {"terminal-auth": {"command": "copilot", "args": ["login"]}},
+        }))
+        .unwrap();
+        assert_eq!(
+            auth_hint(&[method], "copilot --acp"),
+            ": sign in by running `copilot login` in a terminal"
+        );
+    }
+
+    #[test]
+    fn a_terminal_method_is_explained_not_automated() {
+        let method = AuthMethod::Terminal(
+            agent_client_protocol::v1::schema::AuthMethodTerminal::new("t", "Terminal login")
+                .args(vec!["login".into()]),
+        );
+        assert_eq!(
+            auth_hint(&[method], "copilot --acp"),
+            ": sign in by running `copilot login` in a terminal"
+        );
+    }
+
+    #[test]
+    fn an_agent_method_quotes_the_agents_own_description() {
+        let method = AuthMethod::Agent(
+            agent_client_protocol::v1::schema::AuthMethodAgent::new("jetbrains", "JetBrains")
+                .description("Sign in with your JetBrains account"),
+        );
+        assert_eq!(
+            auth_hint(&[method], "junie"),
+            ": Sign in with your JetBrains account"
+        );
+    }
+
     // --- sandbox launches -------------------------------------------------
 
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -1007,6 +1617,8 @@ mod tests {
         opened: std::sync::Mutex<Vec<LaunchPurpose>>,
         finished: AtomicUsize,
         aborted: AtomicUsize,
+        /// Finishing fails, as a merge with a conflict does.
+        conflicts: std::sync::atomic::AtomicBool,
     }
 
     struct Ended(Arc<Lifecycle>);
@@ -1015,6 +1627,11 @@ mod tests {
     impl cuma_core::ports::SandboxSession for Ended {
         async fn finish(&self) -> Result<()> {
             self.0.finished.fetch_add(1, SeqCst);
+            if self.0.conflicts.load(SeqCst) {
+                return Err(MetaAgentError::Other(
+                    "changed in both places: a.txt; kept in .cuma/sandbox-results/s1".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -1048,12 +1665,36 @@ mod tests {
     }
 
     /// The minimal ACP agent fixture, or `None` without python3.
+    /// `python3` must not only exist but start: a shim for a missing runtime
+    /// (mise, asdf) resolves in `which` yet exits nonzero on any invocation.
+    fn working_python3() -> bool {
+        which::which("python3").is_ok_and(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     fn minimal_agent() -> Option<String> {
-        which::which("python3").ok()?;
+        if !working_python3() {
+            return None;
+        }
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/minimal_agent.py"
         );
+        Some(shell_words::join(["python3", script]))
+    }
+
+    /// An agent that refuses `session/new` until `authenticate` is called.
+    fn auth_agent() -> Option<String> {
+        if !working_python3() {
+            return None;
+        }
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/auth_agent.py");
         Some(shell_words::join(["python3", script]))
     }
 
@@ -1101,6 +1742,81 @@ mod tests {
         assert_eq!(lifecycle.finished.load(SeqCst), 1);
         tokio::task::yield_now().await;
         assert_eq!(lifecycle.aborted.load(SeqCst), 0, "finished, not aborted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_whose_work_cannot_be_collected_reports_both() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.conflicts.store(true, SeqCst);
+        // An agent that dies before it says anything.
+        let adapter = AcpAdapter::new("crashing", "false")
+            .with_launcher(Arc::new(Recording(Arc::clone(&lifecycle))));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = adapter
+            .execute(request(), tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent crashing failed"), "{err}");
+        assert!(
+            err.contains("could not be brought back") && err.contains("sandbox-results/s1"),
+            "{err}"
+        );
+        assert_eq!(lifecycle.finished.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_agent_asking_for_authentication_gets_the_handshake_first() {
+        let Some(command) = auth_agent() else {
+            return;
+        };
+        let adapter = AcpAdapter::new("authy", command).with_auth_in_sandbox(true);
+
+        let descriptor = adapter.refresh_capabilities().await.unwrap();
+
+        assert_eq!(
+            descriptor.name, "authy",
+            "negotiation completed: session/new retried after authenticate"
+        );
+        assert!(matches!(
+            descriptor.auth,
+            cuma_core::AgentAuth::AgentManaged
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_turn_authenticates_the_agent_before_prompting_it() {
+        let Some(command) = auth_agent() else {
+            return;
+        };
+        let adapter = AcpAdapter::new("authy", command).with_auth_in_sandbox(true);
+        let (tx, _rx) = mpsc::channel(16);
+
+        let outcome = adapter.execute(request(), tx).await.unwrap();
+        assert!(outcome.success, "{:?}", outcome.failure_reason);
+    }
+
+    #[tokio::test]
+    async fn the_handshake_is_skipped_where_credentials_would_not_survive() {
+        let Some(command) = auth_agent() else {
+            return;
+        };
+        // The default: the agent's credential store is not reachable inside
+        // its sandbox, so firing `authenticate` there could never help.
+        let adapter = AcpAdapter::new("authy", command);
+
+        let err = adapter.refresh_capabilities().await.unwrap_err();
+        assert!(
+            matches!(err, MetaAgentError::Authentication { .. }),
+            "session/new was refused without the handshake: {err:?}"
+        );
+
+        let (tx, _rx) = mpsc::channel(16);
+        let err = adapter.execute(request(), tx).await.unwrap_err();
+        assert!(
+            matches!(err, MetaAgentError::Authentication { .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

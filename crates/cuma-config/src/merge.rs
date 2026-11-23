@@ -184,6 +184,11 @@ impl Config {
             self.security.a2a_server_token_refs,
             other.security.a2a_server_token_refs
         );
+        merge_field!(
+            self.security.agent_permission_policy,
+            other.security.agent_permission_policy,
+            d.security.agent_permission_policy
+        );
 
         // --- limits -------------------------------------------------------
         merge_field!(

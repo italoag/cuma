@@ -18,7 +18,7 @@ use cuma_core::error::{MetaAgentError, Result};
 use cuma_core::ports::ToolProvider;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -75,11 +75,12 @@ impl ToolServer {
 }
 
 impl ServerHandler for ToolServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info =
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-                Implementation::new(self.name.clone(), env!("CARGO_PKG_VERSION")),
-            );
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                self.name.clone(),
+                env!("CARGO_PKG_VERSION"),
+            ));
         if let Some(instructions) = &self.instructions {
             info = info.with_instructions(instructions.clone());
         }

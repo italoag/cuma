@@ -6,10 +6,10 @@ use cuma_core::ports::AgentAdapter;
 use cuma_orchestrator::Orchestrator;
 use cuma_planner::HeuristicPlanner;
 use cuma_protocol_a2a::A2aDiscovery;
-use cuma_protocol_acp::AcpConfigDiscovery;
+use cuma_protocol_acp::{AcpAdapter, AcpConfigDiscovery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The command-line flags that override configuration, kept so they can be
 /// applied again to the configuration of another workspace.
@@ -155,6 +155,22 @@ type OutputLayer = Box<dyn tracing_subscriber::Layer<Filtered> + Send + Sync>;
 /// `--json` switches to structured output, which is what CI and other agents
 /// want; a human at a terminal gets the readable formatter.
 pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
+    let log_buffer = LogBuffer::default();
+    let writer_buffer = log_buffer.clone();
+    let mut telemetry = init_tracing_to(config, verbosity, json, move || writer_buffer.clone());
+    telemetry.log_buffer = log_buffer;
+    telemetry
+}
+
+/// Set up logging, with formatted events written to `writer`.
+///
+/// `init_tracing` is this with stderr. The TUI passes a [`LogTap`]: nothing
+/// may write to the terminal while the interface owns it, so its log lines
+/// are drained onto the Logs screen instead.
+pub fn init_tracing_to<W>(config: &Config, verbosity: u8, json: bool, writer: W) -> Telemetry
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -168,12 +184,9 @@ pub fn init_tracing(config: &Config, verbosity: u8, json: bool) -> Telemetry {
         .unwrap_or_else(|_| EnvFilter::new(format!("cuma={level},warn")));
 
     // Logs go to stderr so that `--json` output on stdout stays parseable when
-    // both are enabled.
+    // both are enabled; `writer` decides where they actually land.
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
-    let mut layers = vec![log_layer(
-        json || config.telemetry.json_logs,
-        std::io::stderr,
-    )];
+    let mut layers = vec![log_layer(json || config.telemetry.json_logs, writer)];
     #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
     let mut telemetry = Telemetry::default();
     let mut deferred_warning = None;
@@ -239,9 +252,172 @@ where
     }
 }
 
+/// A stderr sink that can hold lines back while a live report owns the
+/// screen, then replay them.
+///
+/// `cuma doctor` redraws its report in place; a log line landing mid-frame
+/// would corrupt the cursor tracking. While held, writes queue in memory;
+/// [`LogBuffer::release`] writes the queue to stderr and returns the sink to
+/// passthrough.
+#[derive(Clone, Default)]
+pub struct LogBuffer {
+    held: Arc<std::sync::atomic::AtomicBool>,
+    queued: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl LogBuffer {
+    /// Start queueing writes.
+    pub fn hold(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop queueing and replay everything held back.
+    pub fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
+        let queued = self
+            .queued
+            .lock()
+            .map(|mut queued| std::mem::take(&mut *queued))
+            .unwrap_or_default();
+        if !queued.is_empty() {
+            use std::io::Write as _;
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(&queued);
+            let _ = err.flush();
+        }
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.held.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(mut queued) = self.queued.lock()
+        {
+            queued.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        std::io::stderr().lock().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.held.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        std::io::stderr().lock().flush()
+    }
+}
+
+/// Log lines captured for the TUI's Logs screen.
+///
+/// While the interface owns the terminal nothing may write to it — a stray
+/// line tears the frame — so `chat` installs this as the tracing writer and
+/// the event loop drains it into the view model. It is also the
+/// [`cuma_tui::LogSource`] that loop polls.
+#[derive(Clone, Default)]
+pub struct LogTap {
+    inner: Arc<Mutex<TapInner>>,
+}
+
+#[derive(Default)]
+struct TapInner {
+    /// Finished lines, oldest first.
+    lines: Vec<String>,
+    /// Bytes of a line still being written.
+    pending: Vec<u8>,
+}
+
+/// The tap never grows without bound: the Logs screen keeps 500 lines, and a
+/// wedged interface must not turn a log flood into a memory leak.
+const MAX_TAP_LINES: usize = 1_000;
+
+impl LogTap {
+    /// Buffer `bytes`, emitting each `\n`-terminated line.
+    fn push(&self, bytes: &[u8]) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.pending.extend_from_slice(bytes);
+        while let Some(end) = inner.pending.iter().position(|byte| *byte == b'\n') {
+            let line = inner.pending.drain(..=end).collect::<Vec<_>>();
+            let text = strip_ansi(String::from_utf8_lossy(&line).trim_end());
+            if !text.is_empty() {
+                inner.lines.push(text);
+            }
+        }
+        let overflow = inner.lines.len().saturating_sub(MAX_TAP_LINES);
+        if overflow > 0 {
+            inner.lines.drain(..overflow);
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogTap {
+    type Writer = TapWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TapWriter { tap: self.clone() }
+    }
+}
+
+/// The `io::Write` the fmt layer gets: bytes are queued, never sent to a
+/// terminal. `write` always succeeds — a logging failure must not become a
+/// crash inside the interface.
+pub struct TapWriter {
+    tap: LogTap,
+}
+
+impl std::io::Write for TapWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.tap.push(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl cuma_tui::LogSource for LogTap {
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lines,
+        )
+    }
+}
+
+/// Remove ANSI escape sequences — the formatter emits SGR colors — so a line
+/// reads as plain text on the Logs screen.
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            plain.push(ch);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+        // CSI: parameter and intermediate bytes, then a final byte 0x40..=0x7e.
+        for next in chars.by_ref() {
+            if ('\u{40}'..='\u{7e}').contains(&next) {
+                break;
+            }
+        }
+    }
+    plain
+}
 /// Keeps trace export alive for the process, and flushes it on the way out.
 #[derive(Default)]
 pub struct Telemetry {
+    /// The sink log lines write through; `cuma doctor` holds it while its
+    /// board owns the screen.
+    pub log_buffer: LogBuffer,
     #[cfg(feature = "otel")]
     provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
@@ -392,8 +568,10 @@ pub fn check_a2a_exposure(
 ///
 /// "Configure an agent" is wrong advice when agents are configured and were
 /// refused because `security.require_agent_sandbox` cannot be met.
-pub fn no_agents_reason(config: &Config) -> String {
+pub async fn no_agents_reason(config: &Config) -> String {
     let sandboxes = sandbox_registry(config);
+    // Judged as `build_orchestrator` judged them: plugins are asked first.
+    probe_plugins(config, &sandboxes, &mut Vec::new()).await;
     no_agents_reason_under(config, &refusals(config, |id| sandboxes.for_agent(id)))
 }
 
@@ -403,6 +581,33 @@ fn local_agents(config: &Config) -> impl Iterator<Item = (&String, &cuma_config:
         .agents
         .iter()
         .filter(|(_, agent)| agent.enabled && agent.protocol.eq_ignore_ascii_case("acp"))
+}
+
+/// The warning recorded when memory is enabled but unreachable.
+///
+/// `cuma doctor`'s memory check reports the same fact itself; the constant
+/// lets it claim the warning's exact text so the report never lists it twice.
+pub(crate) const MEMORY_UNREACHABLE: &str =
+    "long-term memory is enabled but its backend is not reachable; running without recall";
+
+/// Probe each plugin sandbox a local agent uses. A plugin says what it
+/// enforces only when asked, so it is asked before it is judged — else an
+/// allowlist it does enforce would refuse it unheard.
+pub(crate) async fn probe_plugins(
+    config: &Config,
+    sandboxes: &cuma_sandbox::Registry,
+    warnings: &mut Vec<String>,
+) {
+    let mut probed = BTreeSet::new();
+    for (id, _) in local_agents(config) {
+        if let Some(provider) = sandboxes.for_agent(id)
+            && provider.kind() == "plugin"
+            && probed.insert(provider.name().to_owned())
+            && let Err(err) = provider.probe().await
+        {
+            warnings.push(format!("sandbox {}: {err}", provider.name()));
+        }
+    }
 }
 
 /// The local agents `security.require_agent_sandbox` refuses, each with what
@@ -465,6 +670,10 @@ struct ProviderLauncher {
     /// `env` and `security.agent_env`.
     env: Vec<String>,
     allowed_hosts: Vec<String>,
+    /// The binary its command starts, for runtimes with harness presets.
+    harness: Option<String>,
+    /// Whether it may bind and reach the host's loopback.
+    loopback: bool,
 }
 
 impl ProviderLauncher {
@@ -484,6 +693,14 @@ impl ProviderLauncher {
                 .collect(),
             env,
             allowed_hosts: security.network_allowlist.clone(),
+            loopback: agent.loopback,
+            harness: agent.command.as_deref().and_then(|command| {
+                command
+                    .split_whitespace()
+                    .next()
+                    .and_then(|program| Path::new(program).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            }),
         }
     }
 
@@ -503,6 +720,8 @@ impl ProviderLauncher {
             readable: readable.to_vec(),
             state: self.state.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
+            harness: self.harness.clone(),
+            loopback: self.loopback,
         }
     }
 }
@@ -519,10 +738,12 @@ impl cuma_protocol_acp::AgentLauncher for ProviderLauncher {
     }
 
     fn runs_elsewhere(&self) -> bool {
-        !matches!(
-            self.provider.capabilities().isolation,
-            cuma_sandbox::Isolation::Process
-        )
+        // Native sandboxes run here, confined or (with no runtime) not.
+        self.provider.kind() != "native"
+            && !matches!(
+                self.provider.capabilities().isolation,
+                cuma_sandbox::Isolation::Process
+            )
     }
 
     async fn open(
@@ -599,13 +820,14 @@ pub fn memory_store(config: &Config, workspace: &Path) -> Arc<dyn cuma_core::por
     Arc::new(cuma_memory::AiMemoryMcp::new(tools).in_workspace(workspace))
 }
 
-/// Build a fully wired orchestrator: agents discovered, memory attached,
-/// history restored.
+/// Build an orchestrator immediately without launching agent probes or
+/// checking remote endpoints/memory availability.
 ///
-/// Discovery failures are reported and survived. A harness that refuses to
-/// start because one configured agent is unreachable would be unusable on any
-/// machine with a partial setup, which is most of them.
-pub async fn build_orchestrator(
+/// ACP and A2A adapters are registered from their static configuration in
+/// [`cuma_core::HealthState::Unknown`] so the UI or protocol server starts
+/// immediately, while live negotiation runs asynchronously via
+/// [`Orchestrator::probe_all_agents`] or coalesces on demand before routing.
+pub async fn build_orchestrator_lazy(
     config: Config,
     workspace: PathBuf,
 ) -> Result<(Orchestrator, Vec<String>)> {
@@ -636,9 +858,11 @@ pub async fn build_orchestrator(
     }
     // Each agent runs under its own sandbox, else the default one.
     let sandboxes = sandbox_registry(&config);
+    probe_plugins(&config, &sandboxes, &mut warnings).await;
     let mut acp = AcpConfigDiscovery::new(config.clone())
         .with_mcp_servers(shared)
-        .with_kept_env(shared_mcp_secret_names(&config));
+        .with_kept_env(shared_mcp_secret_names(&config))
+        .with_permission_policy(config.security.agent_permission_policy.into());
     let mut reported = BTreeSet::new();
     for (id, agent) in local_agents(&config) {
         let Some(provider) = sandboxes.for_agent(id) else {
@@ -665,42 +889,24 @@ pub async fn build_orchestrator(
             names.join(", ")
         ));
     }
-    let acp_adapters: Vec<_> = acp
+    let acp_adapters: Vec<Arc<AcpAdapter>> = acp
         .adapters()
         .into_iter()
         .filter(|adapter| !refused.contains_key(adapter.agent_id().as_str()))
+        .map(Arc::new)
         .collect();
     for adapter in acp_adapters {
-        // Negotiate capabilities where possible; register with configured
-        // capabilities where not.
-        let failure = adapter
-            .refresh_capabilities()
-            .await
-            .err()
-            .map(|err| format!("ACP negotiation failed ({err})"));
-        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
+        register_lazy(&mut orchestrator, adapter, &mut warnings).await;
     }
 
     // --- A2A agents -------------------------------------------------------
     let a2a = A2aDiscovery::new(config.clone());
     for adapter in a2a.adapters() {
-        let failure = adapter
-            .refresh_from_card()
-            .await
-            .err()
-            .map(|err| format!("could not fetch the Agent Card ({err})"));
-        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
+        register_lazy(&mut orchestrator, Arc::new(adapter), &mut warnings).await;
     }
 
     // --- memory -----------------------------------------------------------
     let memory = memory_store(&config, &workspace);
-    if config.memory.enabled && !memory.is_available().await {
-        warnings.push(
-            "long-term memory is enabled but its backend is not reachable; \
-             running without recall"
-                .to_owned(),
-        );
-    }
     let mut orchestrator = orchestrator.with_memory(memory);
 
     // --- skills -----------------------------------------------------------
@@ -736,32 +942,38 @@ pub async fn build_orchestrator(
     Ok((orchestrator, warnings))
 }
 
-/// Register `adapter`, as unavailable when discovering it failed.
+/// Build a fully wired orchestrator: agents discovered, memory attached,
+/// history restored.
 ///
-/// An agent that could not be interrogated stays visible — `cuma agents list`
-/// and `cuma doctor` show it, and why — but is not routed to: what failed was
-/// the same launch or request every task sent to it would make.
-async fn register(
+/// Discovery failures are reported and survived. A harness that refuses to
+/// start because one configured agent is unreachable would be unusable on any
+/// machine with a partial setup, which is most of them.
+pub async fn build_orchestrator(
+    config: Config,
+    workspace: PathBuf,
+) -> Result<(Orchestrator, Vec<String>)> {
+    let (orchestrator, mut warnings) =
+        build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
+    let memory = memory_store(&config, &workspace);
+    let check_memory = async { config.memory.enabled && !memory.is_available().await };
+    let (agent_warnings, memory_unreachable) =
+        tokio::join!(orchestrator.probe_all_agents(), check_memory);
+    warnings.extend(agent_warnings);
+    if memory_unreachable {
+        warnings.push(MEMORY_UNREACHABLE.to_owned());
+    }
+    Ok((orchestrator, warnings))
+}
+
+/// Register `adapter` lazily without interrogating its live backend yet.
+async fn register_lazy(
     orchestrator: &mut Orchestrator,
     adapter: Arc<dyn AgentAdapter>,
-    failure: Option<String>,
     warnings: &mut Vec<String>,
 ) {
     let id = adapter.agent_id().clone();
-    if let Err(err) = orchestrator.add_agent(adapter).await {
+    if let Err(err) = orchestrator.add_agent_lazy(adapter).await {
         warnings.push(format!("{id}: could not register ({err})"));
-        return;
-    }
-    if let Some(reason) = failure {
-        orchestrator
-            .agents()
-            .set_health(
-                &id,
-                cuma_core::HealthState::Unavailable,
-                Some(reason.clone()),
-            )
-            .await;
-        warnings.push(format!("{id}: {reason}"));
     }
 }
 
@@ -807,6 +1019,60 @@ mod tests {
         assert!(!logged.contains("dropped"), "{logged}");
     }
 
+    #[test]
+    fn records_written_to_a_log_tap_drain_as_plain_lines() {
+        let tap = LogTap::default();
+        let subscriber = subscriber(
+            tracing_subscriber::EnvFilter::new("cuma=info"),
+            vec![log_layer(false, tap.clone())],
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "cuma_router", "first captured line");
+            tracing::warn!(target: "cuma_orchestrator", "second captured line");
+        });
+
+        let drained = cuma_tui::LogSource::drain(&tap);
+        assert_eq!(drained.len(), 2, "{drained:?}");
+        assert!(drained[0].contains("first captured line"), "{drained:?}");
+        assert!(drained[1].contains("second captured line"), "{drained:?}");
+        assert!(
+            drained.iter().all(|line| !line.contains('\u{1b}')),
+            "ansi escapes must not reach the screen: {drained:?}"
+        );
+        assert!(cuma_tui::LogSource::drain(&tap).is_empty());
+    }
+
+    #[test]
+    fn a_line_split_across_writes_is_completed_before_it_drains() {
+        use std::io::Write as _;
+
+        let tap = LogTap::default();
+        let mut writer = <LogTap as tracing_subscriber::fmt::MakeWriter>::make_writer(&tap);
+
+        writer.write_all(b"one\ntwo").unwrap();
+        assert_eq!(cuma_tui::LogSource::drain(&tap), vec!["one".to_owned()]);
+
+        writer.write_all(b" halves\n").unwrap();
+        assert_eq!(
+            cuma_tui::LogSource::drain(&tap),
+            vec!["two halves".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_tap_drops_the_oldest_lines_past_its_cap() {
+        let tap = LogTap::default();
+        for index in 0..MAX_TAP_LINES + 10 {
+            tap.push(format!("{index}\n").as_bytes());
+        }
+
+        let drained = cuma_tui::LogSource::drain(&tap);
+        assert_eq!(drained.len(), MAX_TAP_LINES);
+        assert_eq!(drained[0], "10");
+        assert_eq!(drained[MAX_TAP_LINES - 1], (MAX_TAP_LINES + 9).to_string());
+    }
+
     #[tokio::test]
     async fn an_agent_that_cannot_negotiate_is_unavailable_and_keeps_what_was_configured() {
         let workspace = tempfile::tempdir().unwrap();
@@ -844,6 +1110,47 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("broken:")),
             "{warnings:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_orchestrator_lazy_returns_before_probing_agents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config::from_toml(
+            r#"
+            [agents.deferred]
+            protocol = "acp"
+            command = "false"
+            capabilities = ["documentation"]
+            models = ["house-model"]
+            "#,
+        )
+        .unwrap();
+        config.security.sandbox = false;
+
+        let (orchestrator, warnings) =
+            build_orchestrator_lazy(config, workspace.path().to_path_buf())
+                .await
+                .unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let agent = orchestrator
+            .agents()
+            .get(&cuma_core::AgentId::new("deferred"))
+            .await
+            .unwrap();
+        assert_eq!(agent.health.state, cuma_core::HealthState::Unknown);
+        assert!(agent.health.last_error.is_none());
+        assert!(agent.is_routable());
+        assert_eq!(agent.models.len(), 1);
+
+        let probe_warnings = orchestrator.probe_all_agents().await;
+        assert!(probe_warnings.iter().any(|w| w.starts_with("deferred:")));
+        let settled = orchestrator
+            .agents()
+            .get(&cuma_core::AgentId::new("deferred"))
+            .await
+            .unwrap();
+        assert_eq!(settled.health.state, cuma_core::HealthState::Unavailable);
     }
 
     #[test]
@@ -958,6 +1265,88 @@ mod tests {
             "{}",
             refused["open"]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plugin_is_probed_before_an_allowlist_refuses_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A plugin that enforces the allowlist, and says so when probed.
+        let plugin = dir.path().join("cuma-sandbox-filtering");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = probe ] && \
+             echo '{\"isolation\":\"microvm\",\"workspace\":\"mounted\",\"network_allowlist\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config::from_toml(&format!(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "plugin"
+            program = "{}"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            "#,
+            plugin.display()
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let sandboxes = sandbox_registry(&config);
+        // Unprobed, it cannot be said to enforce anything.
+        assert!(refusals(&config, |id| sandboxes.for_agent(id)).contains_key("filtered"));
+
+        let mut warnings = Vec::new();
+        probe_plugins(&config, &sandboxes, &mut warnings).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let refused = refusals(&config, |id| sandboxes.for_agent(id));
+        assert!(refused.is_empty(), "{refused:?}");
+
+        // Explaining why no agent is available judges it the same way.
+        let reason = no_agents_reason(&config).await;
+        assert!(!reason.contains("fall short"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_explanation_probes_a_plugin_before_blaming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("cuma-sandbox-filtering");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = probe ] && \
+             echo '{\"isolation\":\"microvm\",\"workspace\":\"mounted\",\"network_allowlist\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config::from_toml(&format!(
+            r#"
+            [security]
+            require_agent_sandbox = true
+            network_allowlist = ["api.anthropic.com"]
+            [sandboxes.vm]
+            kind = "plugin"
+            program = "{}"
+            [agents.filtered]
+            command = "a"
+            sandbox = "vm"
+            "#,
+            plugin.display()
+        ))
+        .unwrap();
+
+        let reason = no_agents_reason(&config).await;
+
+        // The agent was not refused for its sandbox: it failed some other way.
+        assert!(!reason.contains("fall short"), "{reason}");
+        assert!(reason.contains("could not be registered"), "{reason}");
     }
 
     #[test]

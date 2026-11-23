@@ -1,0 +1,5 @@
+# Written by CUMA: its own machine state, which does not belong in version
+# control. config.toml and skills/ are yours to commit or not.
+runtime.db*
+acp-sessions/
+cache/

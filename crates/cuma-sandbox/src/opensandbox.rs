@@ -2,8 +2,9 @@
 //! `execd` daemon in every sandbox.
 //!
 //! A sandbox is created from `image` (`POST /v1/sandboxes`,
-//! `OPEN-SANDBOX-API-KEY`) with a keep-alive entrypoint, the workspace as a
-//! host-path volume when `mount_workspace` is set, and the network allowlist
+//! `OPEN-SANDBOX-API-KEY`) with a keep-alive entrypoint, host-path volumes
+//! when `mount_workspace` is set (the workspace and the agent's state
+//! writable, its command's directories read-only), and the network allowlist
 //! as its egress policy. `execd` is reached through the sandbox's endpoint
 //! for its port, with the headers that endpoint names.
 //!
@@ -36,6 +37,9 @@ pub const TUNNEL: &str = include_str!("../assets/cuma-tunnel.mjs");
 const TUNNEL_PATH: &str = "/tmp/cuma-tunnel.mjs";
 /// `execd`'s port inside every sandbox.
 const EXECD_PORT: u16 = 44772;
+/// Where state under the host's home is mounted: the images CUMA's pipeline
+/// builds, like most, run as root.
+const GUEST_HOME: &str = "/root";
 
 /// `kind = "opensandbox"`.
 pub struct OpenSandboxProvider {
@@ -431,18 +435,28 @@ impl OpenSandboxProvider {
             "metadata": { "managed-by": "cuma", "cuma-sandbox": self.name },
         });
         if s.mount_workspace {
-            let workspace = crate::canonical(&request.workspace);
-            let mut volumes = vec![json!({
-                "name": "workspace",
-                "host": { "path": workspace },
-                "mountPath": workspace,
-            })];
-            if let Some(common) = cuma_workspace::confine::git_common_dir(&request.workspace) {
-                let common = common.display().to_string();
-                volumes.push(
-                    json!({ "name": "git", "host": { "path": common }, "mountPath": common }),
-                );
-            }
+            // As in every mounted sandbox: the workspace, a worktree's
+            // repository and the agent's state writable, the directories of
+            // the paths its command names read-only (host volumes are
+            // directories).
+            let writable = crate::writable_mounts(request, GUEST_HOME)
+                .into_iter()
+                .map(|(host, guest)| (host, guest, false));
+            let readable = crate::guest_readable_dirs(request)
+                .into_iter()
+                .map(|dir| (dir.clone(), dir, true));
+            let volumes: Vec<Value> = writable
+                .chain(readable)
+                .enumerate()
+                .map(|(i, (host, guest, read_only))| {
+                    json!({
+                        "name": format!("cuma-{i}"),
+                        "host": { "path": host },
+                        "mountPath": guest,
+                        "readOnly": read_only,
+                    })
+                })
+                .collect();
             body["volumes"] = json!(volumes);
         }
         if !request.allowed_hosts.is_empty() {
@@ -749,7 +763,7 @@ where
         errors: _,
     } = io;
     let (client, endpoint) = (lifecycle.client.clone(), tunnel.clone());
-    let feeding = tokio::spawn(async move {
+    let mut feeding = tokio::spawn(async move {
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (c1, e1, s1) = (client.clone(), endpoint.clone(), Arc::clone(&sequence));
         bridge::pump(
@@ -764,8 +778,24 @@ where
     });
 
     let mut text = String::new();
+    let mut fed = false;
     let outcome = loop {
-        let chunk = match stream.chunk().await {
+        // Input that cannot be delivered ends the relay: the agent would
+        // wait for it forever.
+        let next = tokio::select! {
+            next = stream.chunk() => next,
+            joined = &mut feeding, if !fed => {
+                fed = true;
+                match joined {
+                    Ok(Err(err)) => break Err(failure(
+                        &session.sandbox_id,
+                        format!("sending the agent its input: {err}"),
+                    )),
+                    _ => continue,
+                }
+            }
+        };
+        let chunk = match next {
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
                 break Err(failure(
@@ -911,6 +941,56 @@ mod tests {
             json!({ "defaultAction": "deny", "egress": [{ "action": "allow", "target": "api.anthropic.com" }] })
         );
         assert_eq!(provider.capabilities().workspace, WorkspaceAccess::Mounted);
+    }
+
+    #[test]
+    fn a_mounted_workspace_brings_the_state_and_the_command_paths() {
+        let (ws, state, tools) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let script = tools.path().join("agent.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let provider = OpenSandboxProvider::new(
+            "osb",
+            OpenSandboxSandbox {
+                server_url: "http://localhost:8080".into(),
+                image: "node:22".into(),
+                mount_workspace: true,
+                ..OpenSandboxSandbox::default()
+            },
+            None,
+        );
+        let mut request = LaunchRequest::bare(ws.path(), LaunchPurpose::Execute);
+        request.state = vec![state.path().to_path_buf()];
+        request.readable = vec![script];
+        let body = provider.create_body(&request);
+        let volumes = body["volumes"].as_array().unwrap();
+        let mounted = |path: &Path| {
+            let path = crate::canonical(path);
+            volumes
+                .iter()
+                .find(|v| v["host"]["path"] == path.as_str())
+                .unwrap_or_else(|| panic!("{path} is not mounted: {volumes:?}"))
+        };
+        assert_eq!(mounted(ws.path())["readOnly"], false);
+        assert_eq!(mounted(state.path())["readOnly"], false);
+        assert_eq!(
+            mounted(tools.path())["readOnly"],
+            true,
+            "the script's directory"
+        );
+        for volume in volumes {
+            let name = volume["name"].as_str().unwrap();
+            assert!(
+                name.len() <= 63
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1093,6 +1173,78 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    /// A tunnel that is healthy and holds its output open, but refuses every
+    /// byte of input.
+    async fn refusing_tunnel() -> u16 {
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/stdout",
+                get(|| async {
+                    let open = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b": open\n\n"))
+                    });
+                    Body::from_stream(futures::StreamExt::chain(open, futures::stream::pending()))
+                }),
+            )
+            .route(
+                "/stdin",
+                post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    #[tokio::test]
+    async fn an_input_that_cannot_be_delivered_ends_the_relay() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            root: root.path().to_path_buf(),
+            tunnel_port: refusing_tunnel().await,
+            deleted: Arc::default(),
+            exits: Arc::default(),
+            background: Arc::default(),
+        };
+        let url = serve(fake.clone()).await;
+        let session = Session {
+            server: format!("{url}/v1"),
+            api_key_ref: None,
+            sandbox_id: "osb1".into(),
+            execd: Endpoint {
+                url: url.clone(),
+                headers: BTreeMap::from([("X-EXECD-ACCESS-TOKEN".to_owned(), "t".to_owned())]),
+            },
+            tunnel_port: fake.tunnel_port,
+            cwd: None,
+            env: vec![],
+        };
+        let input: &'static [u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        // The output stays open with nothing on it: unwatched, the relay
+        // would wait on it forever.
+        let relayed = tokio::time::timeout(
+            Duration::from_secs(20),
+            relay(
+                &session,
+                &["cat".to_owned()],
+                Stdio {
+                    input,
+                    output: &mut output,
+                    errors: &mut errors,
+                },
+            ),
+        )
+        .await;
+        fake.stop_background();
+        let err = relayed
+            .expect("the relay must end when its input cannot be delivered")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sending the agent its input"), "{err}");
     }
 
     #[tokio::test]
