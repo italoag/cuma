@@ -1,0 +1,26 @@
+crates/cuma-cli/src/commands.rs
+  h_ba256230c5d53f 505,507-509,525-542,556-557,616,649-654,692-702,713-720
+crates/cuma-cli/src/harness.rs
+  h_ba256230c5d53f 823-824,826-830,898-899,905,945-946,948-969,975,1115-1155
+crates/cuma-core/src/event.rs
+  h_ba256230c5d53f 9,125-133
+crates/cuma-orchestrator/src/executor.rs
+  h_ba256230c5d53f 17,20-23,95-98,138-139,172-186,196-199,201-217,222-267,273-286,290-299,304,307-321,324-374,695,1484,1783-1913
+crates/cuma-tui/src/app.rs
+  h_ba256230c5d53f 262,303,573,577
+crates/cuma-tui/src/state.rs
+  h_ba256230c5d53f 363-377,563-582,945-995
+crates/cuma-tui/src/view.rs
+  h_ba256230c5d53f 85-89,91,93,231-240,244,393-397,399-410,477-478,480-490,532-536,543,548-553,951-986
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "50170fcaacb418c88aa3da0a42b6cc20286a9a61",
+  "prompts": {},
+  "humans": {
+    "h_ba256230c5d53f": {
+      "author": "Italo A. G. <182202+italoag@users.noreply.github.com>"
+    }
+  }
+}
