@@ -6,6 +6,7 @@
 //! TUI from being wired into the runtime, and what lets a future web or IDE
 //! front end attach without touching the core.
 
+use crate::agent::HealthState;
 use crate::ids::{AgentId, AttemptId, ModelId, SessionId, SkillId, TaskId};
 use crate::task::{TaskStatus, TokenUsage};
 use serde::{Deserialize, Serialize};
@@ -120,6 +121,15 @@ pub enum EventKind {
         agent: AgentId,
         /// The new state.
         state: String,
+    },
+    /// An agent's background connection or health probe finished.
+    AgentStatusChanged {
+        /// The agent whose status changed.
+        agent: AgentId,
+        /// The new health state.
+        state: HealthState,
+        /// Why the agent is unavailable, when the probe failed.
+        error: Option<String>,
     },
     /// Context was handed from one agent to another.
     HandoffPerformed {

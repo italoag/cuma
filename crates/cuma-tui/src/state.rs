@@ -360,6 +360,21 @@ impl AppState {
                 self.log(format!("{agent} circuit breaker is {state}"));
             }
 
+            EventKind::AgentStatusChanged {
+                agent,
+                state,
+                error,
+            } => {
+                if let Some(existing) = self.agents.iter_mut().find(|a| &a.id == agent) {
+                    existing.health.state = *state;
+                    existing.health.last_error.clone_from(error);
+                }
+                match error {
+                    Some(reason) => self.log(format!("{agent} unavailable: {reason}")),
+                    None => self.log(format!("{agent} connected ({state:?})")),
+                }
+            }
+
             EventKind::HandoffPerformed { from, to } => {
                 self.log(format!("handed off from {from} to {to}"));
             }
@@ -543,6 +558,26 @@ impl AppState {
         self.agents = agents;
         let last = self.model_rows().len().saturating_sub(1);
         self.model_cursor = self.model_cursor.min(last);
+    }
+
+    /// Whether `agent` is enabled and still awaiting its initial background probe.
+    pub fn is_agent_connecting(&self, agent: &cuma_core::AgentDescriptor) -> bool {
+        agent.enabled
+            && !self.agent_health.contains_key(&agent.id)
+            && agent.health.state == cuma_core::HealthState::Unknown
+    }
+
+    /// How many enabled agents are still negotiating their initial connection.
+    pub fn connecting_count(&self) -> usize {
+        self.agents
+            .iter()
+            .filter(|agent| self.is_agent_connecting(agent))
+            .count()
+    }
+
+    /// Whether any enabled agent is still connecting in the background.
+    pub fn is_connecting(&self) -> bool {
+        self.connecting_count() > 0
     }
 
     /// The Models screen's selectable lines, agent section by agent section.
@@ -906,5 +941,56 @@ mod tests {
         assert!(!state.running);
         assert_eq!(state.finished, Some(true));
         assert!(state.current_agent.is_none());
+    }
+
+    #[test]
+    fn agent_status_changes_update_connecting_state_and_log() {
+        let mut state = AppState::new();
+        let mut pending =
+            cuma_core::AgentDescriptor::new("codex", "codex", cuma_core::AgentProtocol::Acp);
+        pending.health.state = cuma_core::HealthState::Unknown;
+        state.set_agents(vec![pending]);
+
+        assert!(state.is_connecting());
+        assert_eq!(state.connecting_count(), 1);
+
+        apply(
+            &mut state,
+            EventKind::AgentStatusChanged {
+                agent: AgentId::new("codex"),
+                state: cuma_core::HealthState::Healthy,
+                error: None,
+            },
+        );
+        assert!(!state.is_connecting());
+        assert_eq!(state.connecting_count(), 0);
+        assert_eq!(
+            state.agents[0].health.state,
+            cuma_core::HealthState::Healthy
+        );
+        assert!(state.logs.iter().any(|l| l.contains("codex connected")));
+
+        apply(
+            &mut state,
+            EventKind::AgentStatusChanged {
+                agent: AgentId::new("codex"),
+                state: cuma_core::HealthState::Unavailable,
+                error: Some("offline".into()),
+            },
+        );
+        assert_eq!(
+            state.agents[0].health.state,
+            cuma_core::HealthState::Unavailable
+        );
+        assert_eq!(
+            state.agents[0].health.last_error.as_deref(),
+            Some("offline")
+        );
+        assert!(
+            state
+                .logs
+                .iter()
+                .any(|l| l.contains("codex unavailable: offline"))
+        );
     }
 }

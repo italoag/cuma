@@ -502,9 +502,11 @@ async fn explain_plan(
 /// goes to stderr.
 pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogTap>) -> Result<()> {
     let (orchestrator, warnings) =
-        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
+        harness::build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
     for warning in &warnings {
-        eprintln!("warning: {warning}");
+        // Log rather than `eprintln!`: the TUI may own stdout/stderr as soon as
+        // `run_with` starts, and `LogTap` drains tracing onto the Logs screen.
+        tracing::warn!("{warning}");
     }
 
     let skills = if config.skills.enabled {
@@ -520,6 +522,24 @@ pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogT
         .then(|| harness::memory_store(&config, &workspace));
 
     let orchestrator = Arc::new(orchestrator);
+    let bg_orchestrator = Arc::clone(&orchestrator);
+    let bg_config = config.clone();
+    let bg_workspace = workspace.clone();
+    let bg_probe = tokio::spawn(async move {
+        let memory_check = async {
+            if bg_config.memory.enabled {
+                let store = harness::memory_store(&bg_config, &bg_workspace);
+                if !store.is_available().await {
+                    tracing::warn!("{}", harness::MEMORY_UNREACHABLE);
+                }
+            }
+        };
+        let (probe_warnings, ()) = tokio::join!(bg_orchestrator.probe_all_agents(), memory_check);
+        for warning in probe_warnings {
+            tracing::warn!("{warning}");
+        }
+    });
+
     let outcome = cuma_tui::run_with(
         Arc::clone(&orchestrator),
         cuma_tui::Sources {
@@ -532,6 +552,8 @@ pub async fn chat(config: Config, workspace: PathBuf, logs: Option<harness::LogT
         },
     )
     .await;
+
+    bg_probe.abort();
 
     // The terminal is restored by now, so lines the loop had not drained yet
     // — including whatever an error path logged — still reach stderr.
@@ -591,7 +613,7 @@ pub async fn serve(
 ) -> Result<()> {
     let database = harness::database_path(&config, &workspace);
     let (orchestrator, warnings) =
-        harness::build_orchestrator(config.clone(), workspace.clone()).await?;
+        harness::build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
 
     // Warnings go to stderr: stdout carries the protocol.
     for warning in &warnings {
@@ -624,6 +646,12 @@ pub async fn serve(
                 orchestrator,
                 workspace_builder(config, workspace, overrides.clone()),
             );
+            let bg_orchestrator = workspaces.default_orchestrator();
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
             cuma_server_acp::serve_stdio_workspaces(
                 workspaces,
                 cuma_server_acp::SessionRegistry::persistent(sessions_dir),
@@ -661,12 +689,17 @@ pub async fn serve(
                 );
             }
 
-            let mut server = cuma_protocol_a2a::A2aServer::new(
-                Arc::new(orchestrator),
-                &format!("http://{address}"),
-            )
-            .await
-            .with_bearer_tokens(tokens);
+            let orchestrator = Arc::new(orchestrator);
+            let bg_orchestrator = Arc::clone(&orchestrator);
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
+            let mut server =
+                cuma_protocol_a2a::A2aServer::new(orchestrator, &format!("http://{address}"))
+                    .await
+                    .with_bearer_tokens(tokens);
             if let Some(store) = store {
                 server = server.with_store(store);
             }
@@ -677,7 +710,14 @@ pub async fn serve(
                 "serving CUMA's tools over MCP on stdio ({} agents behind them)",
                 orchestrator.agents().len().await
             );
-            let tools = crate::mcp_tools::OrchestratorTools::new(std::sync::Arc::new(orchestrator));
+            let orchestrator = Arc::new(orchestrator);
+            let bg_orchestrator = Arc::clone(&orchestrator);
+            tokio::spawn(async move {
+                for warning in bg_orchestrator.probe_all_agents().await {
+                    tracing::warn!("{warning}");
+                }
+            });
+            let tools = crate::mcp_tools::OrchestratorTools::new(orchestrator);
             cuma_protocol_mcp::ToolServer::new("cuma", std::sync::Arc::new(tools))
                 .with_instructions(
                     "CUMA routes software-engineering goals across coding agents. \

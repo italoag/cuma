@@ -259,11 +259,10 @@ pub async fn run(orchestrator: Orchestrator) -> Result<()> {
 /// journey, say — may hold the same `Arc`.
 pub async fn run_with(orchestrator: Arc<Orchestrator>, sources: Sources) -> Result<()> {
     let mut state = AppState::new();
+    let events = orchestrator.events().subscribe();
     state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
     state.memory_attached = sources.memory.is_some();
     refresh_skills(&mut state, &sources).await;
-
-    let events = orchestrator.events().subscribe();
 
     let mut terminal = ratatui::try_init()
         .map_err(|err| MetaAgentError::Other(format!("cannot initialize the terminal: {err}")))?;
@@ -301,7 +300,7 @@ async fn event_loop(
 
         if redraw {
             // The spinner animates only while there is work to watch.
-            if state.running || state.memory_searching {
+            if state.running || state.memory_searching || state.is_connecting() {
                 state.spinner.tick();
             }
             terminal
@@ -571,10 +570,11 @@ async fn apply_and_refresh(state: &mut AppState, event: &Event, orchestrator: &O
     state.apply(event);
 
     // Health lives in the registry, not in the event, so a breaker transition
-    // is the cue to re-read it.
+    // or completed background probe is the cue to re-read it.
     if matches!(
         event.kind,
         cuma_core::EventKind::CircuitBreakerChanged { .. }
+            | cuma_core::EventKind::AgentStatusChanged { .. }
     ) {
         state.set_agents(orchestrator.agents().snapshot().await.all().to_vec());
     }

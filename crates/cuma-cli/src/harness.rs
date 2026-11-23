@@ -820,13 +820,14 @@ pub fn memory_store(config: &Config, workspace: &Path) -> Arc<dyn cuma_core::por
     Arc::new(cuma_memory::AiMemoryMcp::new(tools).in_workspace(workspace))
 }
 
-/// Build a fully wired orchestrator: agents discovered, memory attached,
-/// history restored.
+/// Build an orchestrator immediately without launching agent probes or
+/// checking remote endpoints/memory availability.
 ///
-/// Discovery failures are reported and survived. A harness that refuses to
-/// start because one configured agent is unreachable would be unusable on any
-/// machine with a partial setup, which is most of them.
-pub async fn build_orchestrator(
+/// ACP and A2A adapters are registered from their static configuration in
+/// [`cuma_core::HealthState::Unknown`] so the UI or protocol server starts
+/// immediately, while live negotiation runs asynchronously via
+/// [`Orchestrator::probe_all_agents`] or coalesces on demand before routing.
+pub async fn build_orchestrator_lazy(
     config: Config,
     workspace: PathBuf,
 ) -> Result<(Orchestrator, Vec<String>)> {
@@ -894,49 +895,18 @@ pub async fn build_orchestrator(
         .filter(|adapter| !refused.contains_key(adapter.agent_id().as_str()))
         .map(Arc::new)
         .collect();
-    // Each negotiation launches and handshakes a real agent process — the
-    // slowest phase of startup. They are independent, so they run together:
-    // wall time is the slowest agent's, not the sum of all of them.
-    let negotiations = futures::future::join_all(acp_adapters.iter().map(|adapter| {
-        let adapter = Arc::clone(adapter);
-        async move {
-            let started = std::time::Instant::now();
-            let result = adapter.refresh_capabilities().await;
-            (adapter, started, result)
-        }
-    }))
-    .await;
-    for (adapter, started, result) in negotiations {
-        // Negotiate capabilities where possible; register with configured
-        // capabilities where not.
-        let failure = result
-            .err()
-            .map(|err| format!("ACP negotiation failed ({err})"));
-        tracing::info!(
-            agent = %adapter.agent_id(),
-            ms = started.elapsed().as_millis() as u64,
-            ok = failure.is_none(),
-            "agent capability negotiation"
-        );
-        register(&mut orchestrator, adapter, failure, &mut warnings).await;
+    for adapter in acp_adapters {
+        register_lazy(&mut orchestrator, adapter, &mut warnings).await;
     }
 
     // --- A2A agents -------------------------------------------------------
     let a2a = A2aDiscovery::new(config.clone());
     for adapter in a2a.adapters() {
-        let failure = adapter
-            .refresh_from_card()
-            .await
-            .err()
-            .map(|err| format!("could not fetch the Agent Card ({err})"));
-        register(&mut orchestrator, Arc::new(adapter), failure, &mut warnings).await;
+        register_lazy(&mut orchestrator, Arc::new(adapter), &mut warnings).await;
     }
 
     // --- memory -----------------------------------------------------------
     let memory = memory_store(&config, &workspace);
-    if config.memory.enabled && !memory.is_available().await {
-        warnings.push(MEMORY_UNREACHABLE.to_owned());
-    }
     let mut orchestrator = orchestrator.with_memory(memory);
 
     // --- skills -----------------------------------------------------------
@@ -972,32 +942,38 @@ pub async fn build_orchestrator(
     Ok((orchestrator, warnings))
 }
 
-/// Register `adapter`, as unavailable when discovering it failed.
+/// Build a fully wired orchestrator: agents discovered, memory attached,
+/// history restored.
 ///
-/// An agent that could not be interrogated stays visible — `cuma agents list`
-/// and `cuma doctor` show it, and why — but is not routed to: what failed was
-/// the same launch or request every task sent to it would make.
-async fn register(
+/// Discovery failures are reported and survived. A harness that refuses to
+/// start because one configured agent is unreachable would be unusable on any
+/// machine with a partial setup, which is most of them.
+pub async fn build_orchestrator(
+    config: Config,
+    workspace: PathBuf,
+) -> Result<(Orchestrator, Vec<String>)> {
+    let (orchestrator, mut warnings) =
+        build_orchestrator_lazy(config.clone(), workspace.clone()).await?;
+    let memory = memory_store(&config, &workspace);
+    let check_memory = async { config.memory.enabled && !memory.is_available().await };
+    let (agent_warnings, memory_unreachable) =
+        tokio::join!(orchestrator.probe_all_agents(), check_memory);
+    warnings.extend(agent_warnings);
+    if memory_unreachable {
+        warnings.push(MEMORY_UNREACHABLE.to_owned());
+    }
+    Ok((orchestrator, warnings))
+}
+
+/// Register `adapter` lazily without interrogating its live backend yet.
+async fn register_lazy(
     orchestrator: &mut Orchestrator,
     adapter: Arc<dyn AgentAdapter>,
-    failure: Option<String>,
     warnings: &mut Vec<String>,
 ) {
     let id = adapter.agent_id().clone();
-    if let Err(err) = orchestrator.add_agent(adapter).await {
+    if let Err(err) = orchestrator.add_agent_lazy(adapter).await {
         warnings.push(format!("{id}: could not register ({err})"));
-        return;
-    }
-    if let Some(reason) = failure {
-        orchestrator
-            .agents()
-            .set_health(
-                &id,
-                cuma_core::HealthState::Unavailable,
-                Some(reason.clone()),
-            )
-            .await;
-        warnings.push(format!("{id}: {reason}"));
     }
 }
 
@@ -1134,6 +1110,47 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("broken:")),
             "{warnings:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_orchestrator_lazy_returns_before_probing_agents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config::from_toml(
+            r#"
+            [agents.deferred]
+            protocol = "acp"
+            command = "false"
+            capabilities = ["documentation"]
+            models = ["house-model"]
+            "#,
+        )
+        .unwrap();
+        config.security.sandbox = false;
+
+        let (orchestrator, warnings) =
+            build_orchestrator_lazy(config, workspace.path().to_path_buf())
+                .await
+                .unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let agent = orchestrator
+            .agents()
+            .get(&cuma_core::AgentId::new("deferred"))
+            .await
+            .unwrap();
+        assert_eq!(agent.health.state, cuma_core::HealthState::Unknown);
+        assert!(agent.health.last_error.is_none());
+        assert!(agent.is_routable());
+        assert_eq!(agent.models.len(), 1);
+
+        let probe_warnings = orchestrator.probe_all_agents().await;
+        assert!(probe_warnings.iter().any(|w| w.starts_with("deferred:")));
+        let settled = orchestrator
+            .agents()
+            .get(&cuma_core::AgentId::new("deferred"))
+            .await
+            .unwrap();
+        assert_eq!(settled.health.state, cuma_core::HealthState::Unavailable);
     }
 
     #[test]

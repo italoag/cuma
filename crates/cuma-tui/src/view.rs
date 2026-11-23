@@ -82,11 +82,15 @@ impl StyleSheet for ChatStyleSheet {
 /// Render the status line shown above every screen.
 pub fn status_line(state: &AppState) -> String {
     let connection = if state.running {
-        "running"
+        "running".to_owned()
+    } else if state.is_connecting() {
+        let total = state.agents.iter().filter(|a| a.enabled).count();
+        let ready = total.saturating_sub(state.connecting_count());
+        format!("connecting ({ready}/{total})")
     } else if state.finished.is_some() {
-        "finished"
+        "finished".to_owned()
     } else {
-        "idle"
+        "idle".to_owned()
     };
 
     format!(
@@ -224,15 +228,20 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let theme = theme();
-    let style = match (state.running, state.finished) {
-        (true, _) => theme.accent,
-        (false, Some(true)) => theme.success,
-        (false, Some(false)) => theme.error,
-        (false, None) => theme.muted,
+    let style = if state.running {
+        theme.accent
+    } else if state.is_connecting() {
+        theme.warning
+    } else {
+        match state.finished {
+            Some(true) => theme.success,
+            Some(false) => theme.error,
+            None => theme.muted,
+        }
     };
 
     let mut spans = Vec::new();
-    if state.running {
+    if state.running || state.is_connecting() {
         spans.push(theme.accent(spinner_frame(state)));
         spans.push(theme.span(" "));
     }
@@ -381,16 +390,24 @@ fn draw_agents(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .agents
         .iter()
         .map(|agent| {
-            let health = state
-                .agent_health
-                .get(&agent.id)
-                .cloned()
-                .unwrap_or_else(|| format!("{:?}", agent.health.state));
-
-            let style = if agent.is_routable() {
-                theme.success
+            let (health, style) = if state.is_agent_connecting(agent) {
+                (
+                    format!("{} Connecting…", spinner_frame(state)),
+                    theme.warning,
+                )
             } else {
-                theme.error
+                let health = state
+                    .agent_health
+                    .get(&agent.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", agent.health.state));
+
+                let style = if agent.is_routable() {
+                    theme.success
+                } else {
+                    theme.error
+                };
+                (health, style)
             };
 
             Row::new(vec![
@@ -457,16 +474,21 @@ pub fn model_lines(state: &AppState) -> Vec<Line<'static>> {
         match *row {
             ModelRow::Agent(agent_index) => {
                 let agent = &state.agents[agent_index];
-                let (marker, health_style) = if agent.is_routable() {
-                    ("●", theme.success)
+                let (marker, health_style, health) = if state.is_agent_connecting(agent) {
+                    ("◌", theme.warning, "Connecting…".to_owned())
                 } else {
-                    ("✗", theme.error)
+                    let (marker, health_style) = if agent.is_routable() {
+                        ("●", theme.success)
+                    } else {
+                        ("✗", theme.error)
+                    };
+                    let health = state
+                        .agent_health
+                        .get(&agent.id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{:?}", agent.health.state));
+                    (marker, health_style, health)
                 };
-                let health = state
-                    .agent_health
-                    .get(&agent.id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{:?}", agent.health.state));
                 let auth = if agent.auth_methods().is_empty() {
                     String::new()
                 } else {
@@ -507,17 +529,27 @@ pub fn model_detail_lines(state: &AppState) -> Vec<Line<'static>> {
         return Vec::new();
     };
 
+    let health_label = if state.is_agent_connecting(agent) {
+        "Connecting…".to_owned()
+    } else {
+        format!("{:?}", agent.health.state)
+    };
     let mut lines = vec![
         Line::from(vec![
             Span::styled(format!(" {} ", agent.id), theme.title),
             theme.muted(format!("({:?})", agent.protocol)),
         ]),
         Line::from(format!(
-            " health: {:?}   capabilities: {}",
-            agent.health.state,
+            " health: {health_label}   capabilities: {}",
             agent.capabilities.len()
         )),
     ];
+
+    if state.is_agent_connecting(agent) {
+        lines.push(Line::from(
+            theme.muted(" negotiating capabilities and models in the background…"),
+        ));
+    }
 
     if let Some(error) = &agent.health.last_error {
         lines.push(Line::from(theme.error(format!(" error: {error}"))));
@@ -914,6 +946,42 @@ mod tests {
         assert!(detail.contains("negotiation failed"));
         assert!(detail.contains("no sign-in method"));
         assert!(detail.contains("agents.<id>.env"));
+    }
+
+    #[test]
+    fn connecting_agents_show_pending_indicators_in_status_and_models() {
+        use cuma_core::HealthState;
+
+        let mut codex =
+            cuma_core::AgentDescriptor::new("codex", "codex", cuma_core::AgentProtocol::Acp);
+        codex.health.state = HealthState::Unknown;
+
+        let mut state = AppState::new();
+        state.set_agents(vec![codex.clone()]);
+
+        assert!(status_line(&state).contains("connecting (0/1)"));
+        let models = text(&model_lines(&state));
+        assert!(models.contains('◌'), "{models}");
+        assert!(models.contains("Connecting…"), "{models}");
+        let detail = text(&model_detail_lines(&state));
+        assert!(detail.contains("Connecting…"), "{detail}");
+        assert!(detail.contains("background"), "{detail}");
+
+        let mut claude =
+            cuma_core::AgentDescriptor::new("claude", "claude", cuma_core::AgentProtocol::Acp);
+        claude.health.state = HealthState::Healthy;
+        state.set_agents(vec![codex, claude.clone()]);
+        assert!(status_line(&state).contains("connecting (1/2)"));
+
+        let mut codex_ready =
+            cuma_core::AgentDescriptor::new("codex", "codex", cuma_core::AgentProtocol::Acp);
+        codex_ready.health.state = HealthState::Healthy;
+        state.set_agents(vec![codex_ready, claude]);
+
+        assert!(status_line(&state).contains("idle"));
+        let ready_models = text(&model_lines(&state));
+        assert!(ready_models.contains('●'), "{ready_models}");
+        assert!(ready_models.contains("Healthy"), "{ready_models}");
     }
 
     use crate::state::TaskRow;

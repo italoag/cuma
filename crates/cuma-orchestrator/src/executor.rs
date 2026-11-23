@@ -14,10 +14,13 @@ use cuma_registry::{AgentRegistry, ModelRegistry};
 use cuma_resilience::{CircuitBreakerRegistry, RetryDecision, RetryPolicy, classify_message};
 use cuma_router::{OutcomeRecord, RouteRequest, Router, RoutingHistory};
 use cuma_usage::{UsageRecord, UsageTracker};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+
+type ProbeResult = std::result::Result<AgentDescriptor, String>;
+type ProbeWatch = watch::Receiver<Option<ProbeResult>>;
 
 /// How long to wait for an adapter's queued streaming updates to reach the
 /// event bus after the adapter returns.
@@ -89,6 +92,10 @@ pub struct Orchestrator {
     agents: AgentRegistry,
     models: ModelRegistry,
     adapters: BTreeMap<AgentId, Arc<dyn AgentAdapter>>,
+    /// Registered agents whose live capabilities have not been probed yet.
+    unprobed: Arc<Mutex<BTreeSet<AgentId>>>,
+    /// Active single-flight probes keyed by agent id.
+    in_flight_probes: Arc<Mutex<BTreeMap<AgentId, ProbeWatch>>>,
     breakers: CircuitBreakerRegistry,
     retry_policy: RetryPolicy,
     context_manager: Arc<dyn ContextManager>,
@@ -128,6 +135,8 @@ impl Orchestrator {
             agents: AgentRegistry::new(),
             models: ModelRegistry::new(),
             adapters: BTreeMap::new(),
+            unprobed: Arc::new(Mutex::new(BTreeSet::new())),
+            in_flight_probes: Arc::new(Mutex::new(BTreeMap::new())),
             breakers: CircuitBreakerRegistry::default(),
             retry_policy,
             context_manager: Arc::new(MinimalContextManager::new()),
@@ -160,6 +169,21 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Register an agent from its static configuration without probing it yet.
+    ///
+    /// The agent starts in [`cuma_core::HealthState::Unknown`] and is
+    /// interrogated lazily in the background or when routing/planning needs it.
+    pub async fn add_agent_lazy(&mut self, adapter: Arc<dyn AgentAdapter>) -> Result<()> {
+        let mut descriptor = adapter.describe().await?;
+        descriptor.health.state = cuma_core::HealthState::Unknown;
+        self.models.register_agent_models(&descriptor).await;
+        self.agents.register(descriptor).await;
+        let id = adapter.agent_id().clone();
+        self.adapters.insert(id.clone(), adapter);
+        self.unprobed.lock().await.insert(id);
+        Ok(())
+    }
+
     /// The adapter that reaches an agent, for operations outside a plan —
     /// capability re-negotiation and the sign-in journey.
     #[must_use]
@@ -169,35 +193,185 @@ impl Orchestrator {
 
     /// Re-interrogate an agent and update what the registry believes about it.
     ///
-    /// Called after a sign-in and when the operator asks for a re-probe. A
-    /// successful negotiation marks the agent healthy — a previous failure is
-    /// the very thing the operator just fixed — while a failed one records
-    /// why, so the interface shows the reason rather than a stale state.
+    /// Concurrent callers targeting the same agent share one in-flight probe
+    /// (single-flight coalescing). A successful negotiation marks the agent
+    /// healthy and publishes [`EventKind::AgentStatusChanged`], while a failed
+    /// one records the failure reason and marks it unavailable.
     pub async fn reprobe_agent(&self, id: &AgentId) -> Result<AgentDescriptor> {
-        let Some(adapter) = self.adapters.get(id) else {
+        struct ProbeCleanup<'a> {
+            in_flight: &'a Mutex<BTreeMap<AgentId, ProbeWatch>>,
+            id: &'a AgentId,
+            armed: bool,
+        }
+
+        impl Drop for ProbeCleanup<'_> {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.in_flight.try_lock()
+                {
+                    guard.remove(self.id);
+                }
+            }
+        }
+
+        let Some(adapter) = self.adapters.get(id).cloned() else {
             return Err(MetaAgentError::Configuration(format!(
                 "no agent named {id} is registered"
             )));
         };
-        match adapter.refresh().await {
-            Ok(descriptor) => {
+
+        let (leader_tx, existing_rx) = {
+            let mut in_flight = self.in_flight_probes.lock().await;
+            if let Some(rx) = in_flight.get(id) {
+                (None, Some(rx.clone()))
+            } else {
+                self.unprobed.lock().await.remove(id);
+                let (tx, rx) = watch::channel(None);
+                in_flight.insert(id.clone(), rx);
+                (Some(tx), None)
+            }
+        };
+
+        if let Some(mut rx) = existing_rx {
+            let _ = rx.wait_for(Option::is_some).await;
+            return match rx.borrow().clone() {
+                Some(Ok(descriptor)) => Ok(descriptor),
+                Some(Err(reason)) => Err(MetaAgentError::Other(reason)),
+                None => Err(MetaAgentError::Other(format!(
+                    "agent {id} capability probe stopped before completing"
+                ))),
+            };
+        }
+
+        let Some(tx) = leader_tx else {
+            return Err(MetaAgentError::Other(format!(
+                "agent {id} capability probe state became invalid"
+            )));
+        };
+
+        let mut cleanup = ProbeCleanup {
+            in_flight: &self.in_flight_probes,
+            id,
+            armed: true,
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = adapter.refresh().await;
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let mut failure_reason = None;
+        let result = match outcome {
+            Ok(mut descriptor) => {
+                descriptor.health.state = cuma_core::HealthState::Healthy;
+                descriptor.health.last_error = None;
                 self.models.register_agent_models(&descriptor).await;
                 self.agents.register(descriptor.clone()).await;
                 self.agents
                     .set_health(id, cuma_core::HealthState::Healthy, None)
                     .await;
+                tracing::info!(
+                    agent = %id,
+                    ms = elapsed_ms,
+                    ok = true,
+                    "agent capability negotiation"
+                );
+                self.events.publish(Event::session(
+                    SessionId::new("system"),
+                    EventKind::AgentStatusChanged {
+                        agent: id.clone(),
+                        state: cuma_core::HealthState::Healthy,
+                        error: None,
+                    },
+                ));
                 Ok(descriptor)
             }
             Err(err) => {
+                let protocol = self.agents.get(id).await.map(|a| a.protocol);
+                let reason = match protocol {
+                    Some(cuma_core::AgentProtocol::Acp) => {
+                        format!("ACP negotiation failed ({err})")
+                    }
+                    Some(cuma_core::AgentProtocol::A2A) => {
+                        format!("could not fetch the Agent Card ({err})")
+                    }
+                    _ => err.to_string(),
+                };
                 self.agents
                     .set_health(
                         id,
                         cuma_core::HealthState::Unavailable,
-                        Some(err.to_string()),
+                        Some(reason.clone()),
                     )
                     .await;
+                tracing::info!(
+                    agent = %id,
+                    ms = elapsed_ms,
+                    ok = false,
+                    "agent capability negotiation"
+                );
+                self.events.publish(Event::session(
+                    SessionId::new("system"),
+                    EventKind::AgentStatusChanged {
+                        agent: id.clone(),
+                        state: cuma_core::HealthState::Unavailable,
+                        error: Some(reason.clone()),
+                    },
+                ));
+                failure_reason = Some(reason);
                 Err(err)
             }
+        };
+
+        cleanup.armed = false;
+        self.in_flight_probes.lock().await.remove(id);
+        let shared = match &result {
+            Ok(descriptor) => Ok(descriptor.clone()),
+            Err(_) => Err(failure_reason.unwrap_or_else(|| "probe failed".to_owned())),
+        };
+        let _ = tx.send(Some(shared));
+        result
+    }
+
+    /// Negotiate every lazy-registered or currently probing agent concurrently.
+    ///
+    /// Returns a human-readable warning for every agent whose probe failed.
+    pub async fn probe_all_agents(&self) -> Vec<String> {
+        let mut ids: BTreeSet<AgentId> = self.unprobed.lock().await.iter().cloned().collect();
+        ids.extend(self.in_flight_probes.lock().await.keys().cloned());
+
+        if ids.is_empty() {
+            return Vec::new();
+        }
+
+        let results = futures::future::join_all(ids.into_iter().map(|id| async move {
+            let res = self.reprobe_agent(&id).await;
+            (id, res)
+        }))
+        .await;
+
+        let mut warnings = Vec::new();
+        for (id, result) in results {
+            if result.is_err() {
+                let reason = self
+                    .agents
+                    .get(&id)
+                    .await
+                    .and_then(|a| a.health.last_error)
+                    .unwrap_or_else(|| "probe failed".to_owned());
+                warnings.push(format!("{id}: {reason}"));
+            }
+        }
+        warnings
+    }
+
+    /// Wait for any lazy-registered or in-flight agent probes before making a
+    /// planning or routing decision.
+    pub async fn ensure_agents_probed(&self) {
+        let pending = !self.unprobed.lock().await.is_empty()
+            || !self.in_flight_probes.lock().await.is_empty();
+        if pending {
+            let _ = self.probe_all_agents().await;
         }
     }
 
@@ -518,6 +692,7 @@ impl Orchestrator {
 
     /// Produce a plan, seeded with what the registry can do and what memory knows.
     async fn plan(&self, goal: &str) -> Result<TaskGraph> {
+        self.ensure_agents_probed().await;
         let snapshot = self.agents.snapshot().await;
 
         let memories = match &self.memory {
@@ -1306,6 +1481,7 @@ impl Orchestrator {
         task: &Task,
         abandoned: &[(AgentId, Option<ModelId>)],
     ) -> Result<cuma_router::RoutingDecision> {
+        self.ensure_agents_probed().await;
         let snapshot = self.agents.snapshot().await;
         let history = self.history.lock().await.clone();
         let spent = self.usage.lock().await.spent_usd();
@@ -1602,5 +1778,136 @@ impl Orchestrator {
             totals.render_cost()
         ));
         summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ProbingMock {
+        inner: cuma_testkit::MockAgent,
+        refreshes: Arc<AtomicUsize>,
+        delay: std::time::Duration,
+        fail: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentAdapter for ProbingMock {
+        fn agent_id(&self) -> &AgentId {
+            self.inner.agent_id()
+        }
+
+        async fn describe(&self) -> Result<AgentDescriptor> {
+            self.inner.describe().await
+        }
+
+        async fn execute(
+            &self,
+            request: cuma_core::ports::ExecutionRequest,
+            updates: tokio::sync::mpsc::Sender<cuma_core::ports::ExecutionUpdate>,
+        ) -> Result<ExecutionOutcome> {
+            self.inner.execute(request, updates).await
+        }
+
+        async fn refresh(&self) -> Result<AgentDescriptor> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if let Some(reason) = &self.fail {
+                return Err(MetaAgentError::Other(reason.clone()));
+            }
+            let mut desc = self.inner.describe().await?;
+            desc.capabilities.insert(cuma_core::Capability::CodeEditing);
+            Ok(desc)
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_agents_start_unknown_and_settle_when_probed() {
+        let mut orchestrator = Orchestrator::new(
+            Config::default(),
+            Arc::new(cuma_planner::HeuristicPlanner::new()),
+            std::env::temp_dir(),
+        );
+        let mut events = orchestrator.events().subscribe();
+
+        let good_refreshes = Arc::new(AtomicUsize::new(0));
+        let down_refreshes = Arc::new(AtomicUsize::new(0));
+
+        orchestrator
+            .add_agent_lazy(Arc::new(ProbingMock {
+                inner: cuma_testkit::MockAgent::always("good", cuma_testkit::Behaviour::ok("ok")),
+                refreshes: Arc::clone(&good_refreshes),
+                delay: std::time::Duration::from_millis(20),
+                fail: None,
+            }))
+            .await
+            .unwrap();
+        orchestrator
+            .add_agent_lazy(Arc::new(ProbingMock {
+                inner: cuma_testkit::MockAgent::always("down", cuma_testkit::Behaviour::ok("ok")),
+                refreshes: Arc::clone(&down_refreshes),
+                delay: std::time::Duration::ZERO,
+                fail: Some("offline".to_owned()),
+            }))
+            .await
+            .unwrap();
+
+        let before = orchestrator.agents().snapshot().await;
+        assert_eq!(before.len(), 2);
+        assert!(
+            before
+                .all()
+                .iter()
+                .all(|a| a.health.state == cuma_core::HealthState::Unknown)
+        );
+        assert_eq!(good_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(down_refreshes.load(Ordering::SeqCst), 0);
+
+        let good_id = AgentId::new("good");
+        let (single, warnings) = tokio::join!(
+            orchestrator.reprobe_agent(&good_id),
+            orchestrator.probe_all_agents()
+        );
+        assert!(single.is_ok());
+        assert_eq!(
+            good_refreshes.load(Ordering::SeqCst),
+            1,
+            "concurrent callers on the same agent must share a single probe"
+        );
+        assert_eq!(down_refreshes.load(Ordering::SeqCst), 1);
+        assert!(warnings.iter().any(|w| w.starts_with("down:")));
+
+        let good = orchestrator
+            .agents()
+            .get(&AgentId::new("good"))
+            .await
+            .unwrap();
+        assert_eq!(good.health.state, cuma_core::HealthState::Healthy);
+        assert!(
+            good.capabilities
+                .contains(&cuma_core::Capability::CodeEditing)
+        );
+
+        let down = orchestrator
+            .agents()
+            .get(&AgentId::new("down"))
+            .await
+            .unwrap();
+        assert_eq!(down.health.state, cuma_core::HealthState::Unavailable);
+        assert!(down.health.last_error.as_deref() == Some("offline"));
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventKind::AgentStatusChanged { agent, state, .. } = event.kind {
+                seen.push((agent, state));
+            }
+        }
+        assert!(seen.contains(&(AgentId::new("good"), cuma_core::HealthState::Healthy)));
+        assert!(seen.contains(&(AgentId::new("down"), cuma_core::HealthState::Unavailable)));
     }
 }
